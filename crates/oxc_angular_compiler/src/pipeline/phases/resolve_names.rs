@@ -877,6 +877,20 @@ fn resolve_expression<'a>(
             );
         }
 
+        // `$safeNavigationMigration(...)` wrapper - resolve the wrapped expression. A listener's
+        // `handler_expression` and hoisted arrow-function bodies reach this function directly,
+        // not through the generic visitor, so the wrapper must be descended here.
+        IrExpression::SafeNavigationMigration(migration) => {
+            resolve_expression(
+                migration.expr.as_mut(),
+                scope,
+                root_xref,
+                saved_view,
+                allocator,
+                expressions,
+            );
+        }
+
         // ResolvedTemplateLiteral (created by ingest for template literals with inner expressions)
         // - resolve each inner expression so LexicalRead refs to @let vars and pipe args are resolved
         IrExpression::ResolvedTemplateLiteral(tl) => {
