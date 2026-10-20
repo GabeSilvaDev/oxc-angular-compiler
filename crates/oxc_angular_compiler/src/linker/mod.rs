@@ -41,6 +41,7 @@ use oxc_ast::ast::{
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
+use crate::AngularVersion;
 use crate::optimizer::Edit;
 use crate::pipeline::selector::{R3SelectorElement, parse_selector_to_r3_selector};
 
@@ -79,11 +80,33 @@ pub struct LinkResult {
     pub linked: bool,
 }
 
+/// Options for linking Angular partial declarations.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LinkOptions {
+    /// Angular version of the consuming application.
+    ///
+    /// Like Angular's own linker, which compiles partial templates with the
+    /// application's `@angular/compiler`, this selects version-dependent emit
+    /// such as the DOM security schema (`img|src` is sanitized before 22.2.2).
+    /// `None` assumes the latest Angular version.
+    pub angular_version: Option<AngularVersion>,
+}
+
 /// Link Angular partial declarations in a JavaScript file.
 ///
 /// Scans the code for `ɵɵngDeclare*` calls and replaces them with their
 /// fully compiled equivalents.
 pub fn link(allocator: &Allocator, code: &str, filename: &str) -> LinkResult {
+    link_with_options(allocator, code, filename, &LinkOptions::default())
+}
+
+/// Link Angular partial declarations in a JavaScript file with explicit [`LinkOptions`].
+pub fn link_with_options(
+    allocator: &Allocator,
+    code: &str,
+    filename: &str,
+    options: &LinkOptions,
+) -> LinkResult {
     // Quick check: if no declarations, return early. Match without the `ɵɵ` prefix because
     // minifiers may write it as `\u0275` escapes; the AST below has them decoded.
     if !code.contains("ngDeclare") {
@@ -101,7 +124,7 @@ pub fn link(allocator: &Allocator, code: &str, filename: &str) -> LinkResult {
     let mut edits: Vec<Edit> = Vec::new();
 
     // Walk all statements looking for ɵɵngDeclare* calls
-    collect_declaration_edits(&program, code, filename, &mut edits);
+    collect_declaration_edits(&program, code, filename, options, &mut edits);
 
     if edits.is_empty() {
         return LinkResult { code: code.to_string(), map: None, linked: false };
@@ -117,109 +140,116 @@ fn collect_declaration_edits(
     program: &Program<'_>,
     source: &str,
     filename: &str,
+    options: &LinkOptions,
     edits: &mut Vec<Edit>,
 ) {
     for stmt in &program.body {
-        walk_statement(stmt, source, filename, edits);
+        walk_statement(stmt, source, filename, options, edits);
     }
 }
 
 /// Walk a statement looking for ɵɵngDeclare* calls.
-fn walk_statement(stmt: &Statement<'_>, source: &str, filename: &str, edits: &mut Vec<Edit>) {
+fn walk_statement(
+    stmt: &Statement<'_>,
+    source: &str,
+    filename: &str,
+    options: &LinkOptions,
+    edits: &mut Vec<Edit>,
+) {
     match stmt {
         Statement::ExpressionStatement(expr_stmt) => {
-            walk_expression(&expr_stmt.expression, source, filename, edits);
+            walk_expression(&expr_stmt.expression, source, filename, options, edits);
         }
         Statement::ClassDeclaration(class_decl) => {
-            walk_class_body(&class_decl.body, source, filename, edits);
+            walk_class_body(&class_decl.body, source, filename, options, edits);
         }
         Statement::VariableDeclaration(var_decl) => {
             for decl in &var_decl.declarations {
                 if let Some(init) = &decl.init {
-                    walk_expression(init, source, filename, edits);
+                    walk_expression(init, source, filename, options, edits);
                 }
             }
         }
         Statement::ReturnStatement(ret) => {
             if let Some(ref arg) = ret.argument {
-                walk_expression(arg, source, filename, edits);
+                walk_expression(arg, source, filename, options, edits);
             }
         }
         Statement::BlockStatement(block) => {
             for stmt in &block.body {
-                walk_statement(stmt, source, filename, edits);
+                walk_statement(stmt, source, filename, options, edits);
             }
         }
         Statement::IfStatement(if_stmt) => {
-            walk_statement(&if_stmt.consequent, source, filename, edits);
+            walk_statement(&if_stmt.consequent, source, filename, options, edits);
             if let Some(ref alt) = if_stmt.alternate {
-                walk_statement(alt, source, filename, edits);
+                walk_statement(alt, source, filename, options, edits);
             }
         }
         Statement::ForStatement(for_stmt) => {
-            walk_statement(&for_stmt.body, source, filename, edits);
+            walk_statement(&for_stmt.body, source, filename, options, edits);
         }
         Statement::ForInStatement(for_in) => {
-            walk_statement(&for_in.body, source, filename, edits);
+            walk_statement(&for_in.body, source, filename, options, edits);
         }
         Statement::ForOfStatement(for_of) => {
-            walk_statement(&for_of.body, source, filename, edits);
+            walk_statement(&for_of.body, source, filename, options, edits);
         }
         Statement::WhileStatement(while_stmt) => {
-            walk_statement(&while_stmt.body, source, filename, edits);
+            walk_statement(&while_stmt.body, source, filename, options, edits);
         }
         Statement::DoWhileStatement(do_while) => {
-            walk_statement(&do_while.body, source, filename, edits);
+            walk_statement(&do_while.body, source, filename, options, edits);
         }
         Statement::TryStatement(try_stmt) => {
             for stmt in &try_stmt.block.body {
-                walk_statement(stmt, source, filename, edits);
+                walk_statement(stmt, source, filename, options, edits);
             }
             if let Some(ref handler) = try_stmt.handler {
                 for stmt in &handler.body.body {
-                    walk_statement(stmt, source, filename, edits);
+                    walk_statement(stmt, source, filename, options, edits);
                 }
             }
             if let Some(ref finalizer) = try_stmt.finalizer {
                 for stmt in &finalizer.body {
-                    walk_statement(stmt, source, filename, edits);
+                    walk_statement(stmt, source, filename, options, edits);
                 }
             }
         }
         Statement::SwitchStatement(switch_stmt) => {
             for case in &switch_stmt.cases {
                 for stmt in &case.consequent {
-                    walk_statement(stmt, source, filename, edits);
+                    walk_statement(stmt, source, filename, options, edits);
                 }
             }
         }
         Statement::LabeledStatement(labeled) => {
-            walk_statement(&labeled.body, source, filename, edits);
+            walk_statement(&labeled.body, source, filename, options, edits);
         }
         Statement::FunctionDeclaration(func_decl) => {
             if let Some(ref body) = func_decl.body {
                 for stmt in &body.statements {
-                    walk_statement(stmt, source, filename, edits);
+                    walk_statement(stmt, source, filename, options, edits);
                 }
             }
         }
         Statement::ExportDeclaration(export_decl) => {
-            walk_declaration(&export_decl.declaration, source, filename, edits);
+            walk_declaration(&export_decl.declaration, source, filename, options, edits);
         }
         Statement::ExportDefaultDeclaration(export_default) => match &export_default.declaration {
             oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class_decl) => {
-                walk_class_body(&class_decl.body, source, filename, edits);
+                walk_class_body(&class_decl.body, source, filename, options, edits);
             }
             oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(func_decl) => {
                 if let Some(ref body) = func_decl.body {
                     for stmt in &body.statements {
-                        walk_statement(stmt, source, filename, edits);
+                        walk_statement(stmt, source, filename, options, edits);
                     }
                 }
             }
             _ => {
                 if let Some(expr) = export_default.declaration.as_expression() {
-                    walk_expression(expr, source, filename, edits);
+                    walk_expression(expr, source, filename, options, edits);
                 }
             }
         },
@@ -232,24 +262,25 @@ fn walk_class_body(
     body: &oxc_ast::ast::ClassBody<'_>,
     source: &str,
     filename: &str,
+    options: &LinkOptions,
     edits: &mut Vec<Edit>,
 ) {
     for element in &body.body {
         if let oxc_ast::ast::ClassElement::PropertyDefinition(prop) = element
             && let Some(ref value) = prop.value
         {
-            walk_expression(value, source, filename, edits);
+            walk_expression(value, source, filename, options, edits);
         }
         if let oxc_ast::ast::ClassElement::StaticBlock(block) = element {
             for stmt in &block.body {
-                walk_statement(stmt, source, filename, edits);
+                walk_statement(stmt, source, filename, options, edits);
             }
         }
         if let oxc_ast::ast::ClassElement::MethodDefinition(method) = element
             && let Some(ref body) = method.value.body
         {
             for stmt in &body.statements {
-                walk_statement(stmt, source, filename, edits);
+                walk_statement(stmt, source, filename, options, edits);
             }
         }
     }
@@ -260,36 +291,43 @@ fn walk_declaration(
     decl: &oxc_ast::ast::Declaration<'_>,
     source: &str,
     filename: &str,
+    options: &LinkOptions,
     edits: &mut Vec<Edit>,
 ) {
     match decl {
         oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
             for d in &var_decl.declarations {
                 if let Some(init) = &d.init {
-                    walk_expression(init, source, filename, edits);
+                    walk_expression(init, source, filename, options, edits);
                 }
             }
         }
         oxc_ast::ast::Declaration::FunctionDeclaration(func_decl) => {
             if let Some(ref body) = func_decl.body {
                 for stmt in &body.statements {
-                    walk_statement(stmt, source, filename, edits);
+                    walk_statement(stmt, source, filename, options, edits);
                 }
             }
         }
         oxc_ast::ast::Declaration::ClassDeclaration(class_decl) => {
-            walk_class_body(&class_decl.body, source, filename, edits);
+            walk_class_body(&class_decl.body, source, filename, options, edits);
         }
         _ => {}
     }
 }
 
 /// Walk an expression looking for ɵɵngDeclare* calls.
-fn walk_expression(expr: &Expression<'_>, source: &str, filename: &str, edits: &mut Vec<Edit>) {
+fn walk_expression(
+    expr: &Expression<'_>,
+    source: &str,
+    filename: &str,
+    options: &LinkOptions,
+    edits: &mut Vec<Edit>,
+) {
     match expr {
         Expression::CallExpression(call) => {
             if let Some(name) = get_declare_name(call)
-                && let Some(edit) = link_declaration(name, call, source, filename)
+                && let Some(edit) = link_declaration(name, call, source, filename, options)
             {
                 edits.push(edit);
                 return;
@@ -299,46 +337,46 @@ fn walk_expression(expr: &Expression<'_>, source: &str, filename: &str, edits: &
                 if let Argument::SpreadElement(_) = arg {
                     continue;
                 }
-                walk_expression(arg.to_expression(), source, filename, edits);
+                walk_expression(arg.to_expression(), source, filename, options, edits);
             }
         }
         Expression::AssignmentExpression(assign) => {
-            walk_expression(&assign.right, source, filename, edits);
+            walk_expression(&assign.right, source, filename, options, edits);
         }
         Expression::SequenceExpression(seq) => {
             for expr in &seq.expressions {
-                walk_expression(expr, source, filename, edits);
+                walk_expression(expr, source, filename, options, edits);
             }
         }
         Expression::ConditionalExpression(cond) => {
-            walk_expression(&cond.consequent, source, filename, edits);
-            walk_expression(&cond.alternate, source, filename, edits);
+            walk_expression(&cond.consequent, source, filename, options, edits);
+            walk_expression(&cond.alternate, source, filename, options, edits);
         }
         Expression::LogicalExpression(logical) => {
-            walk_expression(&logical.left, source, filename, edits);
-            walk_expression(&logical.right, source, filename, edits);
+            walk_expression(&logical.left, source, filename, options, edits);
+            walk_expression(&logical.right, source, filename, options, edits);
         }
         Expression::ParenthesizedExpression(paren) => {
-            walk_expression(&paren.expression, source, filename, edits);
+            walk_expression(&paren.expression, source, filename, options, edits);
         }
         Expression::ArrowFunctionExpression(arrow) => {
             if let Some(body) = arrow.get_function_body() {
                 for stmt in &body.statements {
-                    walk_statement(stmt, source, filename, edits);
+                    walk_statement(stmt, source, filename, options, edits);
                 }
             } else if let Some(expr) = arrow.get_expression() {
-                walk_expression(expr, source, filename, edits);
+                walk_expression(expr, source, filename, options, edits);
             }
         }
         Expression::FunctionExpression(func) => {
             if let Some(body) = &func.body {
                 for stmt in &body.statements {
-                    walk_statement(stmt, source, filename, edits);
+                    walk_statement(stmt, source, filename, options, edits);
                 }
             }
         }
         Expression::ClassExpression(class_expr) => {
-            walk_class_body(&class_expr.body, source, filename, edits);
+            walk_class_body(&class_expr.body, source, filename, options, edits);
         }
         _ => {}
     }
@@ -917,6 +955,7 @@ fn link_declaration(
     call: &CallExpression<'_>,
     source: &str,
     filename: &str,
+    options: &LinkOptions,
 ) -> Option<Edit> {
     let meta = get_metadata_object(call)?;
     let ns = get_ng_import_namespace(call);
@@ -931,8 +970,8 @@ fn link_declaration(
         DECLARE_PIPE => link_pipe(meta, source, ns, type_name),
         DECLARE_CLASS_METADATA => link_class_metadata(meta, source, ns, type_name),
         DECLARE_CLASS_METADATA_ASYNC => link_class_metadata_async(meta, source, ns, type_name),
-        DECLARE_DIRECTIVE => link_directive(meta, source, ns, type_name),
-        DECLARE_COMPONENT => link_component(meta, source, filename, ns, type_name),
+        DECLARE_DIRECTIVE => link_directive(meta, source, ns, type_name, options),
+        DECLARE_COMPONENT => link_component(meta, source, filename, ns, type_name, options),
         _ => return None,
     };
 
@@ -1449,6 +1488,7 @@ fn link_directive(
     source: &str,
     ns: &str,
     type_name: &str,
+    options: &LinkOptions,
 ) -> Option<String> {
     let mut parts = vec![format!("type: {type_name}")];
 
@@ -1512,6 +1552,7 @@ fn link_directive(
             selector,
             0, // directives have no template, so pool starts at 0
             ns,
+            options.angular_version,
         ) {
             if host_output.host_vars > 0 {
                 parts.push(format!("hostVars: {}", host_output.host_vars));
@@ -1812,6 +1853,7 @@ fn link_component(
     filename: &str,
     ns: &str,
     type_name: &str,
+    options: &LinkOptions,
 ) -> Option<String> {
     // Extract template string - required for component linking
     let template = get_string_property(meta, "template")?;
@@ -1831,6 +1873,7 @@ fn link_component(
         filename,
         preserve_whitespaces,
         ns,
+        options.angular_version,
     )
     .ok()?;
 
@@ -1879,6 +1922,7 @@ fn link_component(
             selector,
             template_output.next_pool_index,
             ns,
+            options.angular_version,
         ) {
             if host_output.host_vars > 0 {
                 parts.push(format!("hostVars: {}", host_output.host_vars));
@@ -2102,8 +2146,9 @@ fn link_component(
         } else if cd.contains("OnPush") {
             // Emitted explicitly rather than left to the runtime default. The TS
             // compiler omits OnPush here, but it ships with the runtime it targets;
-            // this linker does not know the consumer's version and supports back to
-            // v19. Pre-v22 runtimes compute `onPush = changeDetection === OnPush`,
+            // this linker may not know the consumer's version
+            // (`LinkOptions.angular_version` is optional) and supports back to v19.
+            // Pre-v22 runtimes compute `onPush = changeDetection === OnPush`,
             // so an absent field reads as Default there and the component would
             // silently lose OnPush. `0` is correct on both.
             parts.push("changeDetection: 0".to_string());
@@ -2811,10 +2856,11 @@ MyComponent.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "
         let result = link(&allocator, code, "test.mjs");
         assert!(result.linked);
         // Emitted explicitly, even though the TS compiler omits OnPush. That
-        // compiler ships with the runtime it targets; this linker does not know
-        // the consumer's version and supports back to v19, where the runtime
-        // computes `onPush = changeDetection === OnPush` and so reads an absent
-        // field as Default. Omitting it would silently drop OnPush there.
+        // compiler ships with the runtime it targets; this linker may not know
+        // the consumer's version (`LinkOptions.angular_version` is optional) and
+        // supports back to v19, where the runtime computes
+        // `onPush = changeDetection === OnPush` and so reads an absent field as
+        // Default. Omitting it would silently drop OnPush there.
         assert!(
             result.code.contains("changeDetection: 0"),
             "ChangeDetectionStrategy.OnPush should be 0, got:\n{}",

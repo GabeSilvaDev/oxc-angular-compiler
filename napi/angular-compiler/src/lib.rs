@@ -2936,25 +2936,46 @@ pub struct LinkResult {
 ///
 /// * `code` - The JavaScript source code to link
 /// * `filename` - The filename (for source maps and error messages)
+/// * `options` - Linker options, such as the application's Angular version
 ///
 /// # Returns
 ///
 /// A `LinkResult` containing the linked code. If no partial declarations
 /// were found, the original code is returned with `linked: false`.
 #[napi]
-pub fn link_angular_package_sync(code: String, filename: String) -> LinkResult {
-    use oxc_angular_compiler::linker::link;
+pub fn link_angular_package_sync(
+    code: String,
+    filename: String,
+    options: Option<LinkOptions>,
+) -> LinkResult {
+    use oxc_angular_compiler::linker::{LinkOptions as RustLinkOptions, link_with_options};
 
     let allocator = Allocator::default();
-    let result = link(&allocator, &code, &filename);
+    let rust_options = RustLinkOptions {
+        angular_version: options.and_then(|o| o.angular_version).map(Into::into),
+    };
+    let result = link_with_options(&allocator, &code, &filename, &rust_options);
 
     LinkResult { code: result.code, map: result.map, linked: result.linked }
+}
+
+/// Options for linking Angular partial declarations.
+#[derive(Default)]
+#[napi(object)]
+pub struct LinkOptions {
+    /// Angular version of the consuming application.
+    ///
+    /// Selects version-dependent emit such as the DOM security schema, like
+    /// Angular's own linker does with the application's `@angular/compiler`.
+    /// When not set, assumes the latest Angular version.
+    pub angular_version: Option<AngularVersion>,
 }
 
 /// Async task for Angular linking.
 pub struct LinkAngularPackageTask {
     code: String,
     filename: String,
+    options: Option<LinkOptions>,
 }
 
 #[napi]
@@ -2966,6 +2987,7 @@ impl Task for LinkAngularPackageTask {
         Ok(link_angular_package_sync(
             std::mem::take(&mut self.code),
             std::mem::take(&mut self.filename),
+            self.options.take(),
         ))
     }
 
@@ -2979,6 +3001,10 @@ impl Task for LinkAngularPackageTask {
 /// This is the async version of `linkAngularPackageSync`. Use this when
 /// linking packages in a non-blocking context.
 #[napi]
-pub fn link_angular_package(code: String, filename: String) -> AsyncTask<LinkAngularPackageTask> {
-    AsyncTask::new(LinkAngularPackageTask { code, filename })
+pub fn link_angular_package(
+    code: String,
+    filename: String,
+    options: Option<LinkOptions>,
+) -> AsyncTask<LinkAngularPackageTask> {
+    AsyncTask::new(LinkAngularPackageTask { code, filename, options })
 }

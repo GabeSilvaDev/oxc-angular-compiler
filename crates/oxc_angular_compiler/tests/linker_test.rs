@@ -1,7 +1,8 @@
-//! Tests for Angular linker input/output key quoting.
+//! Tests for the Angular linker: key quoting and version-dependent emit.
 
 use oxc_allocator::Allocator;
-use oxc_angular_compiler::linker::link;
+use oxc_angular_compiler::AngularVersion;
+use oxc_angular_compiler::linker::{LinkOptions, link, link_with_options};
 
 /// Helper to build a ɵɵngDeclareDirective source with a given inputs block.
 fn make_directive_source(inputs_block: &str) -> String {
@@ -251,4 +252,136 @@ MyService.ɵfac = i0.ɵɵngDeclareFactory({ minVersion: "12.0.0", version: "20.0
     let result = link(&allocator, code, "test.mjs");
     assert!(result.linked);
     assert!(result.code.contains("ɵɵinvalidFactory"), "deps not invalid:\n{}", result.code);
+}
+
+/// A component with `[src]` bindings on `img`, `video` and `a` (control), plus a safe read.
+const SRC_BINDINGS_COMPONENT: &str = r#"
+import * as i0 from "@angular/core";
+class Media {
+}
+Media.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "21.0.0", type: Media, isStandalone: true, selector: "x-media", ngImport: i0, template: '<img [src]="url"><video [src]="url"></video><a [href]="url">{{ item?.label }}</a>' });
+"#;
+
+/// A directive binding `src` on its `img` host element.
+const SRC_HOST_DIRECTIVE: &str = r#"
+import * as i0 from "@angular/core";
+class ImgSrc {
+}
+ImgSrc.ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "21.0.0", type: ImgSrc, isStandalone: true, selector: "img[imgSrc]", host: { properties: { "src": "url" } }, ngImport: i0 });
+"#;
+
+/// A component whose host binding and template both read `item?.label`.
+const SAFE_NAV_HOST_COMPONENT: &str = r#"
+import * as i0 from "@angular/core";
+class Item {
+}
+Item.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "21.0.0", type: Item, isStandalone: true, selector: "x-item", host: { properties: { "title": "item?.label" } }, ngImport: i0, template: '<span>{{ item?.label }}</span>' });
+"#;
+
+/// A component whose `@if` block has a single namespaced root element.
+const SVG_BLOCK_ROOT_COMPONENT: &str = r#"
+import * as i0 from "@angular/core";
+class Shape {
+}
+Shape.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "21.0.0", type: Shape, isStandalone: true, selector: "x-shape", ngImport: i0, template: '@if (show) { <svg:rect></svg:rect> }' });
+"#;
+
+fn link_for_version(code: &str, version: Option<AngularVersion>) -> String {
+    let allocator = Allocator::default();
+    let options = LinkOptions { angular_version: version };
+    let result = link_with_options(&allocator, code, "test.mjs", &options);
+    assert!(result.linked);
+    result.code
+}
+
+/// Angular before 22.2.2 sanitizes `img|src` and `video|src` as URLs, and its runtime relies
+/// on that sanitizer to unwrap `SafeUrl`s. The linker must honor the application's version.
+#[test]
+fn test_link_sanitizes_img_video_src_before_22_2_2() {
+    for version in [AngularVersion::new(21, 2, 0), AngularVersion::new(22, 2, 1)] {
+        let code = link_for_version(SRC_BINDINGS_COMPONENT, Some(version));
+        assert_eq!(
+            code.matches(r#"ɵɵproperty("src",ctx.url,i0.ɵɵsanitizeUrl)"#).count(),
+            2,
+            "{version:?}: img and video src must be sanitized:\n{code}"
+        );
+        assert!(code.contains(r#"ɵɵproperty("href",ctx.url,i0.ɵɵsanitizeUrl)"#), "{code}");
+    }
+}
+
+/// Angular 22.2.2 removed `img|src` and `video|src` from the URL security context
+/// (angular/angular@439ff1bdf4). An unset version keeps assuming the latest Angular.
+#[test]
+fn test_link_does_not_sanitize_img_video_src_from_22_2_2() {
+    for version in [Some(AngularVersion::new(22, 2, 2)), None] {
+        let code = link_for_version(SRC_BINDINGS_COMPONENT, version);
+        assert_eq!(
+            code.matches(r#"ɵɵproperty("src",ctx.url)"#).count(),
+            2,
+            "{version:?}: img and video src must not be sanitized:\n{code}"
+        );
+        assert!(code.contains(r#"ɵɵproperty("href",ctx.url,i0.ɵɵsanitizeUrl)"#), "{code}");
+    }
+
+    let allocator = Allocator::default();
+    let default_link = link(&allocator, SRC_BINDINGS_COMPONENT, "test.mjs").code;
+    assert_eq!(default_link, link_for_version(SRC_BINDINGS_COMPONENT, None));
+}
+
+/// Checks that the application's version reaches the directive host path: before 22.2.2,
+/// `img|src` is in the URL schema, so the host binding must be sanitized.
+/// Only "sanitized" is asserted, not which sanitizer, and 22.2.2 is not asserted at all:
+/// Angular emits `ɵɵsanitizeUrlOrResourceUrl` here for both versions (concrete host security
+/// contexts, angular/angular@d06e3748b7), which OXC does not port yet.
+#[test]
+fn test_link_host_src_binding_respects_angular_version() {
+    let code = link_for_version(SRC_HOST_DIRECTIVE, Some(AngularVersion::new(22, 2, 1)));
+    assert!(
+        code.contains(r#"ɵɵdomProperty("src",ctx.url,i0.ɵɵsanitize"#),
+        "22.2.1 must reach the directive host path and sanitize `img|src`:\n{code}"
+    );
+}
+
+/// Component host bindings follow the application's version (`ɵɵhostProperty` before 20,
+/// `ɵɵdomProperty` from 20) but keep legacy `?.`, matching Angular's linker on a 21.0.0
+/// declaration with `@angular/compiler` 19.2.0 and 22.2.1.
+#[test]
+fn test_link_component_host_respects_angular_version() {
+    let v19 = link_for_version(SAFE_NAV_HOST_COMPONENT, Some(AngularVersion::new(19, 2, 0)));
+    assert!(
+        v19.contains(r#"ɵɵhostProperty("title",((ctx.item == null)? null: ctx.item.label))"#),
+        "19.2.0: component host must use ɵɵhostProperty with legacy `?.`:\n{v19}"
+    );
+    let v22 = link_for_version(SAFE_NAV_HOST_COMPONENT, Some(AngularVersion::new(22, 2, 1)));
+    assert!(
+        v22.contains(r#"ɵɵdomProperty("title",((ctx.item == null)? null: ctx.item.label))"#),
+        "22.2.1: component host must use ɵɵdomProperty with legacy `?.`:\n{v22}"
+    );
+}
+
+/// The application's version reaches template ingest: Angular 22.2.2 strips the namespace
+/// from a control-flow block's root tag (angular/angular@0244a1cb3), earlier versions keep it.
+#[test]
+fn test_link_block_root_tag_respects_angular_version() {
+    let before = link_for_version(SVG_BLOCK_ROOT_COMPONENT, Some(AngularVersion::new(22, 2, 1)));
+    assert!(
+        before.contains(r#"ɵɵconditionalCreate(0,Shape_Conditional_0_Template,1,0,":svg:rect")"#),
+        "22.2.1: block root tag must keep its namespace:\n{before}"
+    );
+    let after = link_for_version(SVG_BLOCK_ROOT_COMPONENT, Some(AngularVersion::new(22, 2, 2)));
+    assert!(
+        after.contains(r#"ɵɵconditionalCreate(0,Shape_Conditional_0_Template,1,0,"rect")"#),
+        "22.2.2: block root tag must drop its namespace:\n{after}"
+    );
+}
+
+/// Angular's linker derives `?.` semantics from the declaration's own `version`, so passing the
+/// application's version must not switch linked templates to native optional chaining.
+#[test]
+fn test_link_angular_version_keeps_legacy_safe_navigation() {
+    for version in [Some(AngularVersion::new(22, 2, 1)), None] {
+        let code = link_for_version(SRC_BINDINGS_COMPONENT, version);
+        assert!(code.contains("== null)? null: ctx.item.label"), "{version:?}:\n{code}");
+        assert!(!code.contains("ctx.item?.label"), "{version:?}:\n{code}");
+    }
 }

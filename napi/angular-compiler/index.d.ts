@@ -648,7 +648,11 @@ export interface InjectorNapiCompileResult {
  * This is the async version of `linkAngularPackageSync`. Use this when
  * linking packages in a non-blocking context.
  */
-export declare function linkAngularPackage(code: string, filename: string): Promise<LinkResult>
+export declare function linkAngularPackage(
+  code: string,
+  filename: string,
+  options?: LinkOptions | undefined | null,
+): Promise<LinkResult>
 
 /**
  * Link Angular partial declarations in a JavaScript file (sync).
@@ -664,13 +668,30 @@ export declare function linkAngularPackage(code: string, filename: string): Prom
  *
  * * `code` - The JavaScript source code to link
  * * `filename` - The filename (for source maps and error messages)
+ * * `options` - Linker options, such as the application's Angular version
  *
  * # Returns
  *
  * A `LinkResult` containing the linked code. If no partial declarations
  * were found, the original code is returned with `linked: false`.
  */
-export declare function linkAngularPackageSync(code: string, filename: string): LinkResult
+export declare function linkAngularPackageSync(
+  code: string,
+  filename: string,
+  options?: LinkOptions | undefined | null,
+): LinkResult
+
+/** Options for linking Angular partial declarations. */
+export interface LinkOptions {
+  /**
+   * Angular version of the consuming application.
+   *
+   * Selects version-dependent emit such as the DOM security schema, like
+   * Angular's own linker does with the application's `@angular/compiler`.
+   * When not set, assumes the latest Angular version.
+   */
+  angularVersion?: AngularVersion
+}
 
 /** Result of linking Angular partial declarations. */
 export interface LinkResult {

@@ -172,7 +172,7 @@ pub use dts::{
 pub use dts_inject::{DtsInjectDeclaration, inject_dts_declarations};
 
 // Re-export linker types
-pub use linker::{LinkResult, link};
+pub use linker::{LinkOptions, LinkResult, link, link_with_options};
 
 // Re-export optimizer types
 pub use optimizer::{OptimizeOptions, OptimizeResult, optimize};
