@@ -887,3 +887,122 @@ export class Parent {
     assert!(code.contains("import { LazyCmp }"), "{code}");
     assert_eager(code, "./lazy");
 }
+
+// ---------------------------------------------------------------------------
+// Cross-file selector lookup (`cross_file_elision.rs`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn namespace_member_does_not_select_an_unexported_class() {
+    // `NS.LazyCmp` is recorded as the barrel's `LazyCmp` export, but the
+    // top-level `LazyCmp` class is not exported. The `LazyCmp` the barrel
+    // exports comes from `./real` (`app-real`), which is used eagerly.
+    let dir = TempDir::new().unwrap();
+    create_test_file(
+        dir.path(),
+        "app/real.ts",
+        r#"
+import { Component } from '@angular/core';
+
+@Component({ selector: 'app-real', template: 'real' })
+export class LazyCmp {}
+"#,
+    );
+    create_test_file(
+        dir.path(),
+        "app/barrel.ts",
+        r#"
+import { Component } from '@angular/core';
+
+export * from './real';
+
+namespace NS {
+    export class LazyCmp {}
+}
+
+@Component({ selector: 'app-lazy', template: 'lazy' })
+class LazyCmp {}
+"#,
+    );
+    let result = transform(
+        &dir,
+        r#"
+import { Component } from '@angular/core';
+import { LazyCmp } from './barrel';
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    template: '<app-real/> @defer { <app-lazy/> }',
+})
+export class Parent {}
+"#,
+    );
+    assert_eager(&result.code, "./barrel");
+}
+
+#[test]
+fn class_exported_by_a_local_export_list_is_lazy_loaded() {
+    let dir = TempDir::new().unwrap();
+    create_test_file(
+        dir.path(),
+        "app/lazy.ts",
+        r#"
+import { Component } from '@angular/core';
+
+@Component({ selector: 'app-lazy', template: 'lazy' })
+class Impl {}
+
+export { Impl as LazyCmp };
+"#,
+    );
+    let result = transform(
+        &dir,
+        r#"
+import { Component } from '@angular/core';
+import { LazyCmp } from './lazy';
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    template: '@defer { <app-lazy/> }',
+})
+export class Parent {}
+"#,
+    );
+    assert_lazy(&result.code, "./lazy", "LazyCmp");
+}
+
+#[test]
+fn computed_selector_key_stays_eager() {
+    // The computed `[S]` key overrides `selector` with `app-b`, which is
+    // used eagerly.
+    let dir = TempDir::new().unwrap();
+    create_test_file(
+        dir.path(),
+        "app/lazy.ts",
+        r#"
+import { Component } from '@angular/core';
+
+const S = 'selector';
+
+@Component({ selector: 'app-a', [S]: 'app-b', template: 'lazy' })
+export class LazyCmp {}
+"#,
+    );
+    let result = transform(
+        &dir,
+        r#"
+import { Component } from '@angular/core';
+import { LazyCmp } from './lazy';
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    template: '<app-b/> @defer { <app-a/> }',
+})
+export class Parent {}
+"#,
+    );
+    assert_eager(&result.code, "./lazy");
+}
