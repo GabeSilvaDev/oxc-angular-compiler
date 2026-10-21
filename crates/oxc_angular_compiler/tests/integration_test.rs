@@ -798,11 +798,12 @@ export class Parent {}
     );
 }
 
-/// When the user lists a symbol only in `@Component.imports`, OXC must NOT
-/// auto-detect it as deferrable (that's the full-compilation behavior, which
-/// needs cross-file selector info OXC doesn't have). Issue #289's original
-/// repro form (`imports: [LazyCmp]` with `@defer`) therefore emits no
-/// resolver — the user must move the symbol to `deferredImports`.
+/// Without cross-file analysis, a symbol listed only in `@Component.imports`
+/// must NOT be auto-detected as deferrable: that full-compilation behavior
+/// needs the imported class's selector (see `defer_implicit_imports_test.rs`
+/// for the cross-file case, #313). Issue #289's original repro form
+/// (`imports: [LazyCmp]` with `@defer`) therefore emits no resolver here —
+/// the user must move the symbol to `deferredImports`.
 #[test]
 fn test_defer_with_only_imports_does_not_auto_detect() {
     let allocator = Allocator::default();

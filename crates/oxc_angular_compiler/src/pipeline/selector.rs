@@ -85,6 +85,51 @@ impl CssSelector {
         self.attrs.push(value.map(|v| v.to_lowercase()).unwrap_or_default());
     }
 
+    /// Whether this selector matches `element`, a selector describing a
+    /// template element the way Angular builds one for directive matching:
+    /// its tag name, its attributes as name/value pairs, and its `class`
+    /// attribute as class names.
+    ///
+    /// The element name must be equal when the selector has one (`*`, which a
+    /// selector made only of `:not(...)` gets, matches any element), every
+    /// class and attribute the selector names must be present, an attribute
+    /// value in the selector must be equal (an empty one matches any value),
+    /// and none of the `:not(...)` selectors may match. An empty selector (`*`,
+    /// or the part after a trailing comma) matches nothing, because
+    /// `_addSelectable` registers nothing for it.
+    ///
+    /// Ported from the matching half of Angular's `SelectorMatcher` in
+    /// `directive_matching.ts`.
+    pub fn matches(&self, element: &CssSelector) -> bool {
+        if self.element.is_none()
+            && self.class_names.is_empty()
+            && self.attrs.is_empty()
+            && self.not_selectors.is_empty()
+        {
+            return false;
+        }
+        if let Some(name) = &self.element
+            && name != "*"
+            && element.element.as_deref() != Some(name.as_str())
+        {
+            return false;
+        }
+        if !self.class_names.iter().all(|class| element.class_names.contains(class)) {
+            return false;
+        }
+        let has_attribute = |name: &str, value: &str| {
+            element.attrs.chunks(2).any(|pair| {
+                pair[0] == name
+                    && (value.is_empty() || pair.get(1).map(String::as_str) == Some(value))
+            })
+        };
+        if !self.attrs.chunks(2).all(|pair| has_attribute(&pair[0], pair.get(1).map_or("", |v| v)))
+        {
+            return false;
+        }
+        !self.not_selectors.iter().any(|not| not.matches(element))
+    }
+
     /// Parse a CSS selector string into a list of CssSelectors.
     ///
     /// Handles comma-separated selectors, element names, classes, attributes, and :not().
@@ -593,5 +638,68 @@ mod tests {
         assert_eq!(selectors.len(), 1);
         assert_eq!(selectors[0].element, Some("span".to_string()));
         assert_eq!(selectors[0].attrs, vec!["bitBadge", ""]);
+    }
+
+    fn element(name: &str, attrs: &[(&str, &str)], classes: &[&str]) -> CssSelector {
+        let mut element = CssSelector::new();
+        element.set_element(name);
+        for (attr, value) in attrs {
+            element.add_attribute(attr, Some(value));
+        }
+        for class in classes {
+            element.add_class_name(class);
+        }
+        element
+    }
+
+    fn matches(selector: &str, element: &CssSelector) -> bool {
+        CssSelector::parse(selector).iter().any(|s| s.matches(element))
+    }
+
+    #[test]
+    fn test_matches_element_name() {
+        assert!(matches("app-lazy", &element("app-lazy", &[], &[])));
+        assert!(!matches("app-lazy", &element("app-other", &[], &[])));
+    }
+
+    #[test]
+    fn test_matches_attribute_with_and_without_value() {
+        let button = element("button", &[("appTooltip", ""), ("type", "Submit")], &[]);
+        assert!(matches("[appTooltip]", &button));
+        assert!(matches("button[type=submit]", &button));
+        assert!(!matches("button[type=reset]", &button));
+        assert!(!matches("[appOther]", &button));
+    }
+
+    #[test]
+    fn test_matches_classes() {
+        let div = element("div", &[], &["card", "wide"]);
+        assert!(matches(".card", &div));
+        assert!(matches("div.card.wide", &div));
+        assert!(!matches(".narrow", &div));
+    }
+
+    #[test]
+    fn test_matches_not_and_selector_lists() {
+        let input = element("input", &[("type", "checkbox")], &[]);
+        assert!(!matches("input:not([type=checkbox])", &input));
+        assert!(matches("input:not([type=radio])", &input));
+        assert!(matches("textarea, input[type=checkbox]", &input));
+    }
+
+    #[test]
+    fn test_matches_not_only_selector_matches_any_element() {
+        assert!(matches(":not(.plain)", &element("span", &[], &[])));
+        assert!(!matches(":not(.plain)", &element("span", &[], &["plain"])));
+        assert!(matches("*:not([appDep])", &element("div", &[], &[])));
+    }
+
+    #[test]
+    fn test_matches_empty_selector_matches_nothing() {
+        let span = element("span", &[("appDep", "")], &["card"]);
+        assert!(!matches("", &span));
+        assert!(!matches("*", &span));
+        assert!(!matches("[appOther],", &span));
+        assert!(matches("[appDep],", &span));
     }
 }
