@@ -90,15 +90,26 @@ impl CssSelector {
     /// its tag name, its attributes as name/value pairs, and its `class`
     /// attribute as class names.
     ///
-    /// The element name must be equal when the selector has one, every class
-    /// and attribute the selector names must be present, an attribute value in
-    /// the selector must be equal (an empty one matches any value), and none
-    /// of the `:not(...)` selectors may match.
+    /// The element name must be equal when the selector has one (`*`, which a
+    /// selector made only of `:not(...)` gets, matches any element), every
+    /// class and attribute the selector names must be present, an attribute
+    /// value in the selector must be equal (an empty one matches any value),
+    /// and none of the `:not(...)` selectors may match. An empty selector (`*`,
+    /// or the part after a trailing comma) matches nothing, because
+    /// `_addSelectable` registers nothing for it.
     ///
     /// Ported from the matching half of Angular's `SelectorMatcher` in
     /// `directive_matching.ts`.
     pub fn matches(&self, element: &CssSelector) -> bool {
+        if self.element.is_none()
+            && self.class_names.is_empty()
+            && self.attrs.is_empty()
+            && self.not_selectors.is_empty()
+        {
+            return false;
+        }
         if let Some(name) = &self.element
+            && name != "*"
             && element.element.as_deref() != Some(name.as_str())
         {
             return false;
@@ -674,5 +685,21 @@ mod tests {
         assert!(!matches("input:not([type=checkbox])", &input));
         assert!(matches("input:not([type=radio])", &input));
         assert!(matches("textarea, input[type=checkbox]", &input));
+    }
+
+    #[test]
+    fn test_matches_not_only_selector_matches_any_element() {
+        assert!(matches(":not(.plain)", &element("span", &[], &[])));
+        assert!(!matches(":not(.plain)", &element("span", &[], &["plain"])));
+        assert!(matches("*:not([appDep])", &element("div", &[], &[])));
+    }
+
+    #[test]
+    fn test_matches_empty_selector_matches_nothing() {
+        let span = element("span", &[("appDep", "")], &["card"]);
+        assert!(!matches("", &span));
+        assert!(!matches("*", &span));
+        assert!(!matches("[appOther],", &span));
+        assert!(matches("[appDep],", &span));
     }
 }

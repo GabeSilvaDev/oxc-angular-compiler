@@ -46,7 +46,9 @@ use crate::ast::r3::{
 use crate::class_metadata::{
     R3DeferPerComponentDependency, compile_component_metadata_async_resolver,
 };
+use crate::i18n::serializer::is_i18n_attribute;
 use crate::output::ast::OutputExpression;
+use crate::parser::html::split_ns_name;
 use crate::pipeline::selector::CssSelector;
 use oxc_str::Ident;
 
@@ -230,7 +232,10 @@ pub(super) fn implicitly_deferred_imports<'a>(
             for child in &block.children {
                 child.visit(self);
             }
-            self.in_defer = false;
+            // `@placeholder`, `@loading` and `@error` render before the chunk
+            // loads, so they are eager unless an outer `@defer` holds them
+            // (`visitDeferredBlock` in t2_binder's `DirectiveBinder`).
+            self.in_defer = outer;
             if let Some(placeholder) = &block.placeholder {
                 self.visit_deferred_block_placeholder(placeholder);
             }
@@ -240,7 +245,6 @@ pub(super) fn implicitly_deferred_imports<'a>(
             if let Some(error) = &block.error {
                 self.visit_deferred_block_error(error);
             }
-            self.in_defer = outer;
         }
 
         fn visit_component(&mut self, _component: &R3Component<'a>) {
@@ -267,42 +271,58 @@ pub(super) fn implicitly_deferred_imports<'a>(
         .iter()
         .enumerate()
         .filter(|(index, _)| matcher.deferred[*index] && !matcher.eager[*index])
-        .map(|(_, (name, _))| name.clone())
+        .map(|(_, (name, _))| *name)
         .collect()
 }
 
 /// An element as Angular matches directives against it
-/// (`getAttrsForDirectiveMatching` in `packages/compiler/src/render3/view/util.ts`):
-/// its static attributes with their values, the names of its property and
-/// two-way bindings and of its outputs, and its `class` attribute as classes.
+/// (`createCssSelectorFromNode` and `getAttrsForDirectiveMatching` in
+/// `packages/compiler/src/render3/view/util.ts`): its static attributes with
+/// their values, the names of its property and two-way bindings and of its
+/// outputs, and its `class` attribute as classes. A binding replaces the value
+/// of a static attribute with the same name, and namespace prefixes
+/// (`:svg:`, `:xlink:`) are dropped.
 fn element_selector(
     name: &str,
     attributes: &[R3TextAttribute<'_>],
     inputs: &[R3BoundAttribute<'_>],
     outputs: &[R3BoundEvent<'_>],
 ) -> CssSelector {
-    let mut selector = CssSelector::new();
-    selector.set_element(name);
+    let mut attrs = std::vec::Vec::new();
     for attribute in attributes {
-        if attribute.name.starts_with("i18n") {
-            continue;
-        }
-        selector.add_attribute(&attribute.name, Some(&attribute.value));
-        if attribute.name == "class" {
-            for class in attribute.value.split_whitespace() {
-                selector.add_class_name(class);
-            }
+        if !is_i18n_attribute(&attribute.name) {
+            set_attribute(&mut attrs, &attribute.name, &attribute.value);
         }
     }
     for input in inputs {
         if matches!(input.binding_type, BindingType::Property | BindingType::TwoWay) {
-            selector.add_attribute(&input.name, None);
+            set_attribute(&mut attrs, &input.name, "");
         }
     }
     for output in outputs {
-        selector.add_attribute(&output.name, None);
+        set_attribute(&mut attrs, &output.name, "");
+    }
+
+    let mut selector = CssSelector::new();
+    selector.set_element(split_ns_name(name).1);
+    for (name, value) in attrs {
+        selector.add_attribute(split_ns_name(name).1, Some(value));
+        if name.eq_ignore_ascii_case("class") {
+            for class in value.split_whitespace() {
+                selector.add_class_name(class);
+            }
+        }
     }
     selector
+}
+
+/// Sets `name` to `value` in `attrs`, a name/value map kept in insertion order
+/// like the object `getAttrsForDirectiveMatching` builds.
+fn set_attribute<'s>(attrs: &mut std::vec::Vec<(&'s str, &'s str)>, name: &'s str, value: &'s str) {
+    match attrs.iter_mut().find(|(existing, _)| *existing == name) {
+        Some(entry) => entry.1 = value,
+        None => attrs.push((name, value)),
+    }
 }
 
 /// A template as Angular matches directives against it: an `<ng-template>`
@@ -324,7 +344,7 @@ fn template_selector(template: &R3Template<'_>) -> CssSelector {
                     R3TemplateAttr::Bound(bound) => &bound.name,
                     R3TemplateAttr::Text(text) => &text.name,
                 };
-                selector.add_attribute(name, None);
+                selector.add_attribute(split_ns_name(name).1, None);
             }
             selector
         }
