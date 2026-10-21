@@ -3242,6 +3242,55 @@ pub fn transform_angular_file(
         }
     }
 
+    // The imports a `jit: true` class's downleveled output keeps live, found
+    // before any class compiles so `@defer` leaves them alone whichever class
+    // comes first (#313).
+    for stmt in &parser_ret.program.body {
+        let class = match stmt {
+            Statement::ClassDeclaration(class) => class.as_ref(),
+            Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+                ExportDefaultDeclarationKind::ClassDeclaration(class) => class.as_ref(),
+                _ => continue,
+            },
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::ClassDeclaration(class) => class.as_ref(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if find_jit_forced_decorator(class, &string_consts).is_none() {
+            continue;
+        }
+
+        // Identifiers used only in decorator positions (member,
+        // `declare` member, and param decorators) survive in the
+        // emitted __decorate / propDecorators calls, so their imports
+        // must be kept — the same result TypeScript's elision
+        // produces on ngtsc's rewritten AST.
+        for name in collect_decorator_identifiers(class) {
+            import_elision_mut.preserve(name);
+        }
+
+        // Identifiers used only in constructor parameters (types,
+        // param decorators) survive in the emitted ctorParameters /
+        // __param, so their imports must be kept — the same result
+        // TypeScript's elision produces on ngtsc's rewritten AST.
+        let mut param_idents = JitCtorParamIdentifiers::default();
+        for element in &class.body.body {
+            if let oxc_ast::ast::ClassElement::MethodDefinition(method) = element
+                && method.kind == oxc_ast::ast::MethodDefinitionKind::Constructor
+            {
+                oxc_ast_visit::Visit::visit_formal_parameters(
+                    &mut param_idents,
+                    &method.value.params,
+                );
+            }
+        }
+        for name in param_idents.0 {
+            import_elision_mut.preserve(name);
+        }
+    }
+
     // 2. Walk AST to find @Component decorated classes and extract metadata
     for stmt in &parser_ret.program.body {
         let (class, stmt_start) = match stmt {
@@ -3398,34 +3447,6 @@ pub fn transform_angular_file(
                     &mut jit_edits,
                 );
                 jit_classes.push(info);
-
-                // Identifiers used only in decorator positions (member,
-                // `declare` member, and param decorators) survive in the
-                // emitted __decorate / propDecorators calls, so their imports
-                // must be kept — the same result TypeScript's elision
-                // produces on ngtsc's rewritten AST.
-                for name in collect_decorator_identifiers(class) {
-                    import_elision_mut.preserve(name);
-                }
-
-                // Identifiers used only in constructor parameters (types,
-                // param decorators) survive in the emitted ctorParameters /
-                // __param, so their imports must be kept — the same result
-                // TypeScript's elision produces on ngtsc's rewritten AST.
-                let mut param_idents = JitCtorParamIdentifiers::default();
-                for element in &class.body.body {
-                    if let oxc_ast::ast::ClassElement::MethodDefinition(method) = element
-                        && method.kind == oxc_ast::ast::MethodDefinitionKind::Constructor
-                    {
-                        oxc_ast_visit::Visit::visit_formal_parameters(
-                            &mut param_idents,
-                            &method.value.params,
-                        );
-                    }
-                }
-                for name in param_idents.0 {
-                    import_elision_mut.preserve(&name);
-                }
                 continue;
             }
 
@@ -3516,10 +3537,11 @@ pub fn transform_angular_file(
 
                     // The selector of the standalone component or directive an
                     // `imports` entry refers to, when `@defer` may lazy-load it
-                    // (#313): its import is referenced nowhere else in this file,
-                    // so the static import can go, and cross-file analysis can
-                    // read the selector. Watched files are only reported with
-                    // `resolve_imported_values`, so it is required here too.
+                    // (#313): its import is referenced nowhere else in this file
+                    // or in the compiled output, so the static import can go, and
+                    // cross-file analysis can read the selector. Watched files
+                    // are only reported with `resolve_imported_values`, so it is
+                    // required here too.
                     #[cfg(feature = "cross_file_elision")]
                     let deferrable_selector = cross_file_analyzer
                         .as_ref()
@@ -3528,7 +3550,9 @@ pub fn transform_angular_file(
                             let import_map = &import_map;
                             let import_elision = &import_elision_mut;
                             move |local: &str| -> Option<String> {
-                                if import_elision.value_reference_count(local)? != 1 {
+                                if import_elision.value_reference_count(local)? != 1
+                                    || import_elision.is_kept_by_output(local)
+                                {
                                     return None;
                                 }
                                 let info = import_map.get(&Ident::from(local))?;
@@ -3567,6 +3591,7 @@ pub fn transform_angular_file(
                         &import_map,
                         resolved_resources,
                         deferrable_selector,
+                        &import_elision_mut,
                     ) {
                         Ok(compilation_result) => {
                             // Update the shared pool index for the next component
@@ -4931,6 +4956,7 @@ fn compile_component_full<'a>(
     import_map: &ImportMap<'a>,
     resolved_resources: Option<&ResolvedResources>,
     deferrable_selector: Option<DeferrableSelector<'_>>,
+    import_elision: &ImportElisionAnalyzer<'_>,
 ) -> Result<FullCompilationResult, Vec<OxcDiagnostic>> {
     use oxc_allocator::FromIn;
 
@@ -5084,11 +5110,26 @@ fn compile_component_full<'a>(
             .iter()
             .filter_map(|name| {
                 let selector = deferrable_selector(name.as_str())?;
-                Some((name.clone(), crate::pipeline::selector::CssSelector::parse(&selector)))
+                Some((*name, crate::pipeline::selector::CssSelector::parse(&selector)))
             })
             .collect();
         let deferred =
             super::defer_resolver::implicitly_deferred_imports(&r3_result.nodes, &candidates);
+        // ngc's `DeferredSymbolTracker.canDefer`: an import declaration goes
+        // only when every non-`type` specifier in it is deferred, or the
+        // static import would stay and nothing would be split off. An
+        // explicit `deferredImports` entry doesn't count: OXC keeps its
+        // static import.
+        let deferred: std::vec::Vec<_> = deferred
+            .iter()
+            .copied()
+            .filter(|name| {
+                import_elision
+                    .declaration_specifiers(name)
+                    .iter()
+                    .all(|specifier| deferred.contains(specifier))
+            })
+            .collect();
         if !deferred.is_empty() {
             let is_deferred = |name: &str| deferred.iter().any(|d| d.as_str() == name);
             metadata.imports.retain(|name| !is_deferred(name.as_str()));

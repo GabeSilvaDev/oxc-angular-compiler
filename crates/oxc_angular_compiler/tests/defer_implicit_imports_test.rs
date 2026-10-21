@@ -569,3 +569,321 @@ export class Parent {}
     );
     assert_lazy(&result.code, "./lazy", "LazyCmp");
 }
+
+// --- Import removal: names other emitted code needs, and ngc's
+// per-declaration `canDefer` rule ---
+
+/// `app/cmps.ts` with two standalone components, `app-lazy` and `app-eager`,
+/// a `TOKEN` value and a `CmpOptions` interface.
+fn two_cmps(dir: &TempDir) {
+    create_test_file(
+        dir.path(),
+        "app/cmps.ts",
+        r#"
+import { Component, InjectionToken } from '@angular/core';
+
+@Component({ selector: 'app-lazy', template: 'lazy' })
+export class LazyCmp {}
+
+@Component({ selector: 'app-eager', template: 'eager' })
+export class EagerCmp {}
+
+export const TOKEN = new InjectionToken<string>('token');
+
+export interface CmpOptions {}
+"#,
+    );
+}
+
+/// A parent deferring `LazyCmp` next to a `jit: true` class that injects it.
+fn jit_sibling_source(jit_first: bool) -> String {
+    let jit = r#"
+@Component({ selector: 'app-jit', template: '', jit: true })
+export class JitCmp {
+    constructor(lazy: LazyCmp) {}
+}
+"#;
+    let parent = r#"
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    template: '@defer { <app-lazy/> }',
+})
+export class Parent {}
+"#;
+    let (first, second) = if jit_first { (jit, parent) } else { (parent, jit) };
+    format!(
+        "import {{ Component }} from '@angular/core';\nimport {{ LazyCmp }} from './lazy';\n{first}{second}"
+    )
+}
+
+#[test]
+fn jit_sibling_ctor_parameter_keeps_import_eager_when_declared_first() {
+    let dir = TempDir::new().unwrap();
+    lazy_cmp(&dir);
+    let result = transform(&dir, &jit_sibling_source(true));
+    let code = &result.code;
+    assert!(compact(code).contains("{type:LazyCmp}"), "{code}");
+    assert!(code.contains("import { LazyCmp }"), "{code}");
+    assert_eager(code, "./lazy");
+}
+
+#[test]
+fn jit_sibling_ctor_parameter_keeps_import_eager_when_declared_last() {
+    let dir = TempDir::new().unwrap();
+    lazy_cmp(&dir);
+    let result = transform(&dir, &jit_sibling_source(false));
+    let code = &result.code;
+    assert!(compact(code).contains("{type:LazyCmp}"), "{code}");
+    assert!(code.contains("import { LazyCmp }"), "{code}");
+    assert_eager(code, "./lazy");
+}
+
+#[test]
+fn default_import_in_sibling_ctor_metadata_stays_eager() {
+    let dir = TempDir::new().unwrap();
+    create_test_file(
+        dir.path(),
+        "app/lazy.ts",
+        r#"
+import { Component } from '@angular/core';
+
+@Component({ selector: 'app-lazy', template: 'lazy' })
+export default class LazyCmp {}
+"#,
+    );
+    let result = transform(
+        &dir,
+        r#"
+import { Component, Injectable } from '@angular/core';
+import LazyCmp from './lazy';
+
+@Injectable()
+export class Svc {
+    constructor(lazy: LazyCmp) {}
+}
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    template: '@defer { <app-lazy/> }',
+})
+export class Parent {}
+"#,
+    );
+    let code = &result.code;
+    assert!(compact(code).contains("{type:LazyCmp}"), "{code}");
+    assert!(code.contains("import LazyCmp from"), "{code}");
+    assert_eager(code, "./lazy");
+}
+
+#[test]
+fn deferred_component_injected_by_a_sibling_uses_a_namespace_import() {
+    let dir = TempDir::new().unwrap();
+    lazy_cmp(&dir);
+    let result = transform(
+        &dir,
+        r#"
+import { Component, Injectable } from '@angular/core';
+import { LazyCmp } from './lazy';
+
+@Injectable()
+export class Svc {
+    constructor(lazy: LazyCmp) {}
+}
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    template: '@defer { <app-lazy/> }',
+})
+export class Parent {}
+"#,
+    );
+    let code = &result.code;
+    // Like ngc: the token goes through a namespace import, so the removed
+    // named import leaves no dangling reference.
+    assert_lazy(code, "./lazy", "LazyCmp");
+    assert!(!code.contains("import { LazyCmp }"), "{code}");
+    assert!(code.contains("import * as i1 from './lazy'"), "{code}");
+    assert!(compact(code).contains("ɵɵinject(i1.LazyCmp)"), "{code}");
+}
+
+#[test]
+fn sibling_specifier_used_eagerly_keeps_the_declaration_eager() {
+    let dir = TempDir::new().unwrap();
+    two_cmps(&dir);
+    let result = transform(
+        &dir,
+        r#"
+import { Component } from '@angular/core';
+import { LazyCmp, EagerCmp } from './cmps';
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp, EagerCmp],
+    template: '<app-eager/> @defer { <app-lazy/> }',
+})
+export class Parent {}
+"#,
+    );
+    let code = &result.code;
+    assert_eager(code, "./cmps");
+    assert!(code.contains("import { LazyCmp, EagerCmp }"), "{code}");
+    assert!(
+        compact(code).contains("ɵɵgetComponentDepsFactory(Parent,[LazyCmp,EagerCmp])"),
+        "{code}"
+    );
+}
+
+#[test]
+fn sibling_value_specifier_keeps_the_declaration_eager() {
+    let dir = TempDir::new().unwrap();
+    two_cmps(&dir);
+    let result = transform(
+        &dir,
+        r#"
+import { Component, inject } from '@angular/core';
+import { LazyCmp, TOKEN } from './cmps';
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    template: '@defer { <app-lazy/> }',
+})
+export class Parent {
+    token = inject(TOKEN);
+}
+"#,
+    );
+    let code = &result.code;
+    assert_eager(code, "./cmps");
+    assert!(code.contains("import { LazyCmp, TOKEN }"), "{code}");
+}
+
+#[test]
+fn inline_type_specifier_does_not_block_deferral() {
+    let dir = TempDir::new().unwrap();
+    two_cmps(&dir);
+    let result = transform(
+        &dir,
+        r#"
+import { Component } from '@angular/core';
+import { type EagerCmp, LazyCmp } from './cmps';
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    template: '@defer { <app-lazy/> }',
+})
+export class Parent {
+    other?: EagerCmp;
+}
+"#,
+    );
+    let code = &result.code;
+    assert_lazy(code, "./cmps", "LazyCmp");
+    assert!(!code.contains("from \"./cmps\""), "{code}");
+}
+
+#[test]
+fn all_specifiers_deferred_removes_the_declaration() {
+    let dir = TempDir::new().unwrap();
+    two_cmps(&dir);
+    let result = transform(
+        &dir,
+        r#"
+import { Component } from '@angular/core';
+import { LazyCmp, EagerCmp } from './cmps';
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp, EagerCmp],
+    template: '@defer { <app-lazy/> <app-eager/> }',
+})
+export class Parent {}
+"#,
+    );
+    let code = &result.code;
+    assert_lazy(code, "./cmps", "LazyCmp");
+    assert_lazy(code, "./cmps", "EagerCmp");
+    assert!(compact(code).contains("ɵɵgetComponentDepsFactory(Parent,[])"), "{code}");
+    assert!(!code.contains("from \"./cmps\""), "{code}");
+}
+
+#[test]
+fn sibling_specifier_in_deferred_imports_keeps_the_declaration_eager() {
+    // The explicit entry's static import stays, so the declaration does too.
+    let dir = TempDir::new().unwrap();
+    two_cmps(&dir);
+    let result = transform(
+        &dir,
+        r#"
+import { Component } from '@angular/core';
+import { LazyCmp, EagerCmp } from './cmps';
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    deferredImports: [EagerCmp],
+    template: '@defer { <app-lazy/> <app-eager/> }',
+})
+export class Parent {}
+"#,
+    );
+    let code = &result.code;
+    assert!(code.contains("import { LazyCmp, EagerCmp }"), "{code}");
+    assert!(compact(code).contains("ɵɵgetComponentDepsFactory(Parent,[LazyCmp])"), "{code}");
+    assert!(!code.contains("m.LazyCmp"), "{code}");
+}
+
+#[test]
+fn sibling_interface_without_type_keeps_the_declaration_eager() {
+    // Like ngc, which can't tell an interface from a value here (`AssumeEager`).
+    let dir = TempDir::new().unwrap();
+    two_cmps(&dir);
+    let result = transform(
+        &dir,
+        r#"
+import { Component } from '@angular/core';
+import { LazyCmp, CmpOptions } from './cmps';
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    template: '@defer { <app-lazy/> }',
+})
+export class Parent {
+    options?: CmpOptions;
+}
+"#,
+    );
+    let code = &result.code;
+    assert_eager(code, "./cmps");
+    assert!(compact(code).contains("ɵɵgetComponentDepsFactory(Parent,[LazyCmp])"), "{code}");
+}
+
+#[test]
+fn computed_type_key_keeps_import_eager() {
+    let dir = TempDir::new().unwrap();
+    lazy_cmp(&dir);
+    let result = transform(
+        &dir,
+        r#"
+import { Component } from '@angular/core';
+import { LazyCmp } from './lazy';
+
+@Component({
+    selector: 'app-parent',
+    imports: [LazyCmp],
+    template: '@defer { <app-lazy/> }',
+})
+export class Parent {
+    keyed?: { [LazyCmp]: string };
+}
+"#,
+    );
+    let code = &result.code;
+    assert!(code.contains("import { LazyCmp }"), "{code}");
+    assert_eager(code, "./lazy");
+}

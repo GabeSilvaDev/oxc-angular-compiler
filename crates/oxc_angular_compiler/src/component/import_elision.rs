@@ -64,6 +64,14 @@ pub struct ImportElisionAnalyzer<'a> {
     /// Number of value (non-type) references to each named or default import
     /// specifier, by local name.
     value_reference_counts: FxHashMap<Ident<'a>, usize>,
+    /// Imports the compiled output references as values although the source
+    /// doesn't (see [`Self::preserve`] and the post-passes in
+    /// [`Self::analyze`]), so `@defer` can't remove them.
+    kept_by_output: FxHashSet<Ident<'a>>,
+    /// The non-`type` specifiers of each import declaration, by local name.
+    declaration_specifiers: Vec<Vec<Ident<'a>>>,
+    /// Index into `declaration_specifiers` of each non-`type` specifier.
+    declaration_of: FxHashMap<Ident<'a>, usize>,
 }
 
 impl<'a> ImportElisionAnalyzer<'a> {
@@ -86,6 +94,8 @@ impl<'a> ImportElisionAnalyzer<'a> {
 
         let mut type_only_specifiers = FxHashSet::default();
         let mut value_reference_counts = FxHashMap::default();
+        let mut declaration_specifiers = Vec::new();
+        let mut declaration_of = FxHashMap::default();
 
         // First, collect all symbols that are used ONLY in constructor parameter decorators.
         // These should be elided because Angular removes these decorators during compilation.
@@ -121,6 +131,8 @@ impl<'a> ImportElisionAnalyzer<'a> {
                 continue;
             };
 
+            let declaration = declaration_specifiers.len();
+            declaration_specifiers.push(Vec::new());
             for specifier in specifiers {
                 match specifier {
                     ImportDeclarationSpecifier::ImportSpecifier(spec) => {
@@ -131,10 +143,8 @@ impl<'a> ImportElisionAnalyzer<'a> {
                         }
 
                         let name: Ident<'a> = spec.local.name.clone().into();
-                        value_reference_counts.insert(
-                            name.clone(),
-                            Self::value_reference_count_of(&spec.local, semantic),
-                        );
+                        value_reference_counts
+                            .insert(name, Self::value_reference_count_of(&spec.local, semantic));
 
                         // Check if this import has only type references
                         if Self::is_type_only_import(&spec.local, semantic) {
@@ -147,10 +157,8 @@ impl<'a> ImportElisionAnalyzer<'a> {
                     }
                     ImportDeclarationSpecifier::ImportDefaultSpecifier(spec) => {
                         let name: Ident<'a> = spec.local.name.clone().into();
-                        value_reference_counts.insert(
-                            name.clone(),
-                            Self::value_reference_count_of(&spec.local, semantic),
-                        );
+                        value_reference_counts
+                            .insert(name, Self::value_reference_count_of(&spec.local, semantic));
 
                         if Self::is_type_only_import(&spec.local, semantic) {
                             type_only_specifiers.insert(name.clone());
@@ -165,6 +173,9 @@ impl<'a> ImportElisionAnalyzer<'a> {
                         }
                     }
                 }
+                let name = specifier.local().name;
+                declaration_specifiers[declaration].push(name);
+                declaration_of.insert(name, declaration);
             }
         }
 
@@ -176,6 +187,7 @@ impl<'a> ImportElisionAnalyzer<'a> {
         for name in &computed_key_idents {
             type_only_specifiers.remove(name);
         }
+        let mut kept_by_output = computed_key_idents;
 
         // Post-pass: when class metadata is emitted, a default import used as a
         // bare ctor-param type reference is emitted into the metadata's
@@ -188,9 +200,16 @@ impl<'a> ImportElisionAnalyzer<'a> {
             for name in &ctor_type_names {
                 type_only_specifiers.remove(name);
             }
+            kept_by_output.extend(ctor_type_names);
         }
 
-        Self { type_only_specifiers, value_reference_counts }
+        Self {
+            type_only_specifiers,
+            value_reference_counts,
+            kept_by_output,
+            declaration_specifiers,
+            declaration_of,
+        }
     }
 
     /// Local names of **default imports** that a decorated class's constructor
@@ -877,14 +896,31 @@ impl<'a> ImportElisionAnalyzer<'a> {
 
     /// How many value (non-type) references the source makes to the named or
     /// default import `name`, or `None` for a name no such import binds.
-    pub fn value_reference_count(&self, name: &str) -> Option<usize> {
+    pub(crate) fn value_reference_count(&self, name: &str) -> Option<usize> {
         self.value_reference_counts.get(&Ident::from(name)).copied()
+    }
+
+    /// Whether the compiled output references `name` as a value although the
+    /// source doesn't, like a `jit: true` class's `ctorParameters`.
+    pub(crate) fn is_kept_by_output(&self, name: &str) -> bool {
+        self.kept_by_output.contains(&Ident::from(name))
+    }
+
+    /// The local names of every non-`type` specifier in the import
+    /// declaration that binds `name`, `name` included (empty if none does).
+    pub(crate) fn declaration_specifiers(&self, name: &str) -> &[Ident<'a>] {
+        self.declaration_of
+            .get(&Ident::from(name))
+            .map_or(&[], |&declaration| &self.declaration_specifiers[declaration])
     }
 
     /// Remove `name`'s import: the compiled output no longer references it,
     /// such as a component that `@defer` now loads with a dynamic `import()`.
-    pub fn elide(&mut self, name: Ident<'a>) {
-        self.type_only_specifiers.insert(name);
+    /// A name the output still needs (see [`Self::is_kept_by_output`]) stays.
+    pub(crate) fn elide(&mut self, name: Ident<'a>) {
+        if !self.kept_by_output.contains(&name) {
+            self.type_only_specifiers.insert(name);
+        }
     }
 
     /// Check if a specifier name should be elided (removed).
@@ -903,6 +939,7 @@ impl<'a> ImportElisionAnalyzer<'a> {
     /// transforms, on the rewritten AST.
     pub fn preserve(&mut self, name: &'a str) {
         self.type_only_specifiers.remove(&Ident::from(name));
+        self.kept_by_output.insert(Ident::from(name));
     }
 
     /// Get the set of type-only specifier names.
