@@ -201,6 +201,24 @@ impl AngularVersion {
         false
     }
 
+    /// Check if this version has the `ɵɵenableIncrementalHydrationRuntime`
+    /// instruction (v22.0.0-next.11+).
+    ///
+    /// From that release `withIncrementalHydration()` alone no longer turns
+    /// incremental hydration on: a compiled template must also call the
+    /// instruction, so every view with a `hydrate` trigger emits it. Earlier
+    /// runtimes don't export it and turn the feature on from the provider
+    /// alone.
+    pub fn supports_incremental_hydration_runtime(&self) -> bool {
+        if self.major == 22 && self.minor == 0 && self.patch == 0 {
+            return match self.prerelease {
+                None => true,
+                Some(prerelease) => prerelease >= Prerelease::Next(11),
+            };
+        }
+        self.is_at_least(22, 0, 0)
+    }
+
     /// Check if this version is `major.minor.patch` or newer.
     ///
     /// Compares the release triple only: a prerelease of `22.3.0` counts as
@@ -890,6 +908,32 @@ mod tests {
         ] {
             assert!(!version.drops_img_video_src_url_context(), "{version:?}");
             assert!(!version.strips_namespaced_block_tag(), "{version:?}");
+        }
+    }
+
+    #[test]
+    fn incremental_hydration_runtime_starts_at_22_0_0_next_11() {
+        let parse = |s| AngularVersion::parse(s).unwrap();
+
+        for version in [
+            parse("22.0.0-next.11"),
+            parse("22.0.0-rc.0"),
+            parse("22.0.0"),
+            parse("22.1.0-next.0"),
+            parse("23.0.0"),
+            AngularVersion::new(u32::MAX, 0, 0),
+        ] {
+            assert!(version.supports_incremental_hydration_runtime(), "{version:?}");
+        }
+
+        for version in [
+            parse("21.2.25"),
+            parse("22.0.0-next.0"),
+            parse("22.0.0-next.10"),
+            // Unknown tags parse to `Other`, below `next`.
+            parse("22.0.0-beta.1"),
+        ] {
+            assert!(!version.supports_incremental_hydration_runtime(), "{version:?}");
         }
     }
 }

@@ -27,8 +27,6 @@ const CUSTOM_DECORATOR =
   'the reference ngtsc compile leaves a class with a non-Angular decorator uncompiled, so only Oxc emits ɵfac/ɵcmp'
 const CHANGE_DETECTION_V22 =
   'changeDetection is omitted for OnPush, which is the runtime default from v22, where Angular emits it explicitly'
-const INCREMENTAL_HYDRATION =
-  'ɵɵenableIncrementalHydrationRuntime is not emitted for a `hydrate` trigger'
 const SELECTOR_WHITESPACE =
   'runs of whitespace inside shimmed selectors are collapsed where Angular keeps them'
 const INJECTABLE_FACTORY_WRAPPER =
@@ -94,22 +92,6 @@ export const KNOWN_DIFFERENCES: Record<string, KnownDifference> = {
   'component-meta/change-detection-onpush': {
     fields: ['ChangeDetectionOnPushComponent.ɵcmp'],
     reasons: [CHANGE_DETECTION_V22],
-  },
-  'defer/defer-hydrate-idle': {
-    fields: ['DeferHydrateIdleComponent.ɵcmp'],
-    reasons: [INCREMENTAL_HYDRATION],
-  },
-  'defer/defer-hydrate-interaction': {
-    fields: ['DeferHydrateInteractionComponent.ɵcmp'],
-    reasons: [INCREMENTAL_HYDRATION],
-  },
-  'defer/defer-hydrate-never': {
-    fields: ['DeferHydrateNeverComponent.ɵcmp'],
-    reasons: [INCREMENTAL_HYDRATION],
-  },
-  'defer/defer-hydrate-viewport': {
-    fields: ['DeferHydrateViewportComponent.ɵcmp'],
-    reasons: [INCREMENTAL_HYDRATION],
   },
   'edge-cases/aliased-injectable': {
     fields: ['AliasedService.ɵfac'],

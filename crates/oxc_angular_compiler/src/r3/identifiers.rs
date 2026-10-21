@@ -476,6 +476,10 @@ impl Identifiers {
     /// Enable timer scheduling for defer.
     pub const DEFER_ENABLE_TIMER_SCHEDULING: &'static str = "ɵɵdeferEnableTimerScheduling";
 
+    /// Activate the incremental hydration runtime.
+    pub const ENABLE_INCREMENTAL_HYDRATION_RUNTIME: &'static str =
+        "ɵɵenableIncrementalHydrationRuntime";
+
     // ========================================================================
     // Control Flow Instructions
     // ========================================================================

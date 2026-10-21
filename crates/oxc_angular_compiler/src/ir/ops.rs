@@ -168,6 +168,8 @@ pub enum CreateOp<'a> {
     Defer(DeferOp<'a>),
     /// Defer trigger.
     DeferOn(DeferOnOp<'a>),
+    /// Activate the incremental hydration runtime.
+    EnableIncrementalHydrationRuntime(EnableIncrementalHydrationRuntimeOp<'a>),
     /// An i18n message.
     I18nMessage(I18nMessageOp<'a>),
     /// Change namespace.
@@ -231,6 +233,9 @@ impl<'a> Op for CreateOp<'a> {
             CreateOp::Pipe(_) => OpKind::Pipe,
             CreateOp::Defer(_) => OpKind::Defer,
             CreateOp::DeferOn(_) => OpKind::DeferOn,
+            CreateOp::EnableIncrementalHydrationRuntime(_) => {
+                OpKind::EnableIncrementalHydrationRuntime
+            }
             CreateOp::I18nMessage(_) => OpKind::I18nMessage,
             CreateOp::Namespace(_) => OpKind::Namespace,
             CreateOp::ProjectionDef(_) => OpKind::ProjectionDef,
@@ -276,6 +281,7 @@ impl<'a> Op for CreateOp<'a> {
             CreateOp::Pipe(op) => op.base.prev,
             CreateOp::Defer(op) => op.base.prev,
             CreateOp::DeferOn(op) => op.base.prev,
+            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.prev,
             CreateOp::I18nMessage(op) => op.base.prev,
             CreateOp::Namespace(op) => op.base.prev,
             CreateOp::ProjectionDef(op) => op.base.prev,
@@ -321,6 +327,7 @@ impl<'a> Op for CreateOp<'a> {
             CreateOp::Pipe(op) => op.base.next,
             CreateOp::Defer(op) => op.base.next,
             CreateOp::DeferOn(op) => op.base.next,
+            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.next,
             CreateOp::I18nMessage(op) => op.base.next,
             CreateOp::Namespace(op) => op.base.next,
             CreateOp::ProjectionDef(op) => op.base.next,
@@ -366,6 +373,7 @@ impl<'a> Op for CreateOp<'a> {
             CreateOp::Pipe(op) => op.base.prev = prev,
             CreateOp::Defer(op) => op.base.prev = prev,
             CreateOp::DeferOn(op) => op.base.prev = prev,
+            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.prev = prev,
             CreateOp::I18nMessage(op) => op.base.prev = prev,
             CreateOp::Namespace(op) => op.base.prev = prev,
             CreateOp::ProjectionDef(op) => op.base.prev = prev,
@@ -411,6 +419,7 @@ impl<'a> Op for CreateOp<'a> {
             CreateOp::Pipe(op) => op.base.next = next,
             CreateOp::Defer(op) => op.base.next = next,
             CreateOp::DeferOn(op) => op.base.next = next,
+            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.next = next,
             CreateOp::I18nMessage(op) => op.base.next = next,
             CreateOp::Namespace(op) => op.base.next = next,
             CreateOp::ProjectionDef(op) => op.base.next = next,
@@ -1080,6 +1089,16 @@ pub struct DeferOnOp<'a> {
     pub delay: Option<f64>,
     /// Viewport options (for viewport trigger).
     pub options: Option<Box<'a, IrExpression<'a>>>,
+}
+
+/// Activate the incremental hydration runtime.
+///
+/// Corresponds to the ɵɵenableIncrementalHydrationRuntime() instruction, emitted
+/// once per view before its first `@defer` block with hydrate triggers.
+#[derive(Debug)]
+pub struct EnableIncrementalHydrationRuntimeOp<'a> {
+    /// Common operation metadata.
+    pub base: CreateOpBase<'a>,
 }
 
 /// Defer with condition (update-time operation).

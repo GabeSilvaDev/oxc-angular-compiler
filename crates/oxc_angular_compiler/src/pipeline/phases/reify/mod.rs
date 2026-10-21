@@ -858,6 +858,9 @@ fn reify_create_op<'a>(
                 proj_def.def.as_ref(),
             ))
         }
+        CreateOp::EnableIncrementalHydrationRuntime(_) => {
+            Some(create_enable_incremental_hydration_runtime_stmt(allocator, core_namespace))
+        }
         CreateOp::DisableBindings(_) => {
             // Emit disableBindings instruction
             Some(create_disable_bindings_stmt(allocator, core_namespace))
