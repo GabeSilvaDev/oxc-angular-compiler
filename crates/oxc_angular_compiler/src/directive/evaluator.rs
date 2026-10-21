@@ -12,7 +12,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
-use oxc_ast::StaticPropertyName;
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, ArrowFunctionBody, ArrowFunctionExpression,
     BinaryExpression, BindingPattern, BlockStatement, CallExpression, CatchClause, ChainElement,
@@ -38,6 +37,7 @@ use oxc_syntax::operator::{BinaryOperator, LogicalOperator, UnaryOperator};
 use oxc_syntax::scope::ScopeFlags;
 
 use crate::output::emitter::format_number_like_js;
+use crate::util::lone_surrogate::{encode_utf16, js_str_to_str};
 
 /// Everything declared at the top level of a file that the evaluator can resolve.
 #[derive(Default)]
@@ -1642,45 +1642,17 @@ pub(crate) struct Evaluator<'s, 'a> {
     /// reference dynamic (ngtsc overflows its stack on those).
     variables: RefCell<HashMap<Slot<'a>, Option<(Value<'a>, u32)>>>,
     fuel: Cell<u32>,
-    /// Set once a string with a lone surrogate (`'\uD800'`) is read: it has
-    /// no `&str` form and evaluates as dynamic.
-    lone_surrogate: Cell<bool>,
 }
 
 impl<'s, 'a> Evaluator<'s, 'a> {
     pub(crate) fn new(consts: &'s super::StringConsts<'a>) -> Self {
-        Self {
-            consts,
-            variables: RefCell::default(),
-            fuel: Cell::new(FUEL),
-            lone_surrogate: Cell::new(false),
-        }
+        Self { consts, variables: RefCell::default(), fuel: Cell::new(FUEL) }
     }
 
-    /// Whether evaluating `expr` reads a string with a lone surrogate
-    /// (`'\uD800'`), directly or through a `const`. Such a string evaluates
-    /// as dynamic; a reader that takes a dynamic value as absent (an input's
-    /// `alias`) reports it instead, so a string the source gives is never
-    /// silently replaced.
-    pub(crate) fn reads_lone_surrogate(
-        consts: &'s super::StringConsts<'a>,
-        expr: &'a Expression<'a>,
-    ) -> bool {
-        // A fresh evaluator, whose cache can't hold the `const` already.
-        let evaluator = Evaluator::new(consts);
-        evaluator.evaluate(expr);
-        evaluator.lone_surrogate.get()
-    }
-
-    /// A string value, or dynamic for one with a lone surrogate.
+    /// A string value; a lone surrogate (`'\uD800'`) is stored as
+    /// [`crate::util::lone_surrogate`] describes.
     fn string(&self, value: JSStr<'_>) -> Value<'a> {
-        match value.as_str() {
-            Some(value) => Value::String(value.to_string()),
-            None => {
-                self.lone_surrogate.set(true);
-                Value::Dynamic
-            }
-        }
+        Value::String(js_str_to_str(value).into_owned())
     }
 
     pub(crate) fn evaluate(&self, expr: &'a Expression<'a>) -> Value<'a> {
@@ -1861,11 +1833,7 @@ impl<'s, 'a> Evaluator<'s, 'a> {
         let mut out = String::new();
         for (i, quasi) in tpl.quasis.iter().enumerate() {
             let Some(cooked) = quasi.value.cooked else { return Value::Dynamic };
-            let Some(cooked) = cooked.as_str() else {
-                self.lone_surrogate.set(true);
-                return Value::Dynamic;
-            };
-            out.push_str(cooked);
+            out.push_str(&js_str_to_str(cooked));
             if let Some(e) = tpl.expressions.get(i) {
                 match literal(self.eval(e, depth, frame)) {
                     Value::Dynamic => return Value::Dynamic,
@@ -2825,7 +2793,7 @@ pub(crate) fn transform_error<'a>(
                     && el
                         .property_key()
                         .and_then(PropertyKey::static_name)
-                        .is_some_and(|n| n == conflicting.as_str())
+                        .is_some_and(|n| js_str_to_str(n.as_js_str()) == conflicting.as_str())
             })
             .then(|| {
                 (
@@ -3558,7 +3526,7 @@ fn binary<'a>(operator: BinaryOperator, left: &Value<'a>, right: &Value<'a>) -> 
 /// `a < b` (or `a <= b`): strings compare by UTF-16 code units, anything else as numbers.
 fn compare(a: &Value<'_>, b: &Value<'_>, or_equal: bool) -> bool {
     let ordering = match (a, b) {
-        (Value::String(a), Value::String(b)) => Some(a.encode_utf16().cmp(b.encode_utf16())),
+        (Value::String(a), Value::String(b)) => Some(encode_utf16(a).cmp(encode_utf16(b))),
         _ => to_number(a).partial_cmp(&to_number(b)),
     };
     ordering.is_some_and(|o| o.is_lt() || (or_equal && o.is_eq()))
@@ -3569,7 +3537,8 @@ fn strict_equals(a: &Value<'_>, b: &Value<'_>) -> bool {
         (Value::Null, Value::Null) | (Value::Undefined, Value::Undefined) => true,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Number(a), Value::Number(b)) => a == b,
-        (Value::String(a), Value::String(b)) => a == b,
+        // By code units: `'\uD800' + '\uDC00'` is `'😀'`.
+        (Value::String(a), Value::String(b)) => encode_utf16(a).eq(encode_utf16(b)),
         _ => false,
     }
 }
@@ -3651,14 +3620,14 @@ pub fn input_transform_types<'a>(
             ClassElement::MethodDefinition(m) => (&m.key, &m.decorators),
             _ => continue,
         };
-        let Some(name) = key.static_name().and_then(StaticPropertyName::into_cow_str) else {
-            continue;
-        };
+        // Named like the input, whose lone surrogates (`'\uD800'`) are stored
+        // as [`crate::util::lone_surrogate`] describes.
+        let Some(name) = key.static_name() else { continue };
         if let Some(options) =
             super::property_decorators::input_decorator_options(decorators, consts)
             && let Some(transform) = evaluator.evaluate(options).prop("transform")
         {
-            record(name.to_string(), &transform.value);
+            record(js_str_to_str(name.as_js_str()).into_owned(), &transform.value);
         }
     }
 
