@@ -80,10 +80,10 @@ struct Inner {
     /// Memoized per-export value evaluations: `(file, local_name)` -> value.
     /// `None` means evaluated-but-opaque.
     value_memo: RefCell<FxHashMap<(String, String), Option<crate::directive::StaticValue>>>,
-    /// Memoized standalone class selectors: `(file, local_name,
+    /// Memoized standalone class selectors: `(file, exported_name, local_name,
     /// implicit_standalone)` -> selector (see
     /// [`Self::standalone_directive_selector`]).
-    selector_memo: RefCell<FxHashMap<(String, String, bool), Option<String>>>,
+    selector_memo: RefCell<FxHashMap<(String, String, String, bool), Option<String>>>,
     /// Exports whose evaluation is in progress (circular `const` chains —
     /// `a.A = b.B; b.B = a.A` — resolve the cycle edge to opaque, like
     /// `analyzing` does for files).
@@ -120,12 +120,13 @@ impl ImportValueResolver for CrossFileResolver {
 }
 
 /// The selector of the class `local` declares in `source` (the text of
-/// `file_path`; `"default"` for `export default class`), when it is a
-/// standalone `@Component` or `@Directive` whose `selector` and `standalone`
-/// are literals.
+/// `file_path`; `"default"` for `export default class`) and exports as
+/// `exported`, when it is a standalone `@Component` or `@Directive` whose
+/// `selector` and `standalone` are literals.
 fn standalone_class_selector(
     file_path: &str,
     source: &str,
+    exported: &str,
     local: &str,
     implicit_standalone: bool,
 ) -> Option<String> {
@@ -134,14 +135,18 @@ fn standalone_class_selector(
     let parser_ret = Parser::new(&allocator, source, source_type).parse();
     let program = &parser_ret.program;
 
-    // A plain `class Local` must be exported by a local `export { Local }`:
-    // the export map also records namespace members, which can share the name
-    // of a top-level class the file doesn't export.
+    // A plain `class Local` must be exported as `exported` by a local
+    // `export { Local as exported }`: the export map also records namespace
+    // members, which can share the name of a top-level class the file doesn't
+    // export (or exports under another name).
     let exported_locally = program.body.iter().any(|stmt| match stmt {
-        Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => decl
-            .specifiers
-            .iter()
-            .any(|spec| !spec.export_kind.is_type() && spec.local.name() == local),
+        Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
+            decl.specifiers.iter().any(|spec| {
+                !spec.export_kind.is_type()
+                    && spec.local.name() == local
+                    && spec.exported.name() == exported
+            })
+        }
         _ => false,
     });
     let is_local = |class: &Class| class.id.as_ref().is_some_and(|id| id.name == local);
@@ -472,6 +477,7 @@ impl Inner {
                 None => {
                     return self.class_selector(
                         &file,
+                        &name,
                         info.value_local.as_deref()?,
                         implicit_standalone,
                     );
@@ -488,15 +494,17 @@ impl Inner {
         None
     }
 
-    /// [`standalone_class_selector`] memoized per `(file, local)`, reading the
-    /// source `analyze_file` kept instead of the file again.
+    /// [`standalone_class_selector`] memoized per `(file, exported, local)`,
+    /// reading the source `analyze_file` kept instead of the file again.
     fn class_selector(
         &self,
         file_path: &str,
+        exported: &str,
         local: &str,
         implicit_standalone: bool,
     ) -> Option<String> {
-        let key = (file_path.to_string(), local.to_string(), implicit_standalone);
+        let key =
+            (file_path.to_string(), exported.to_string(), local.to_string(), implicit_standalone);
         if let Some(cached) = self.selector_memo.borrow().get(&key) {
             return cached.clone();
         }
@@ -509,7 +517,7 @@ impl Inner {
             .cloned()
             .or_else(|| std::fs::read_to_string(file_path).ok());
         let selector = source.and_then(|source| {
-            standalone_class_selector(file_path, &source, local, implicit_standalone)
+            standalone_class_selector(file_path, &source, exported, local, implicit_standalone)
         });
         self.selector_memo.borrow_mut().insert(key, selector.clone());
         selector

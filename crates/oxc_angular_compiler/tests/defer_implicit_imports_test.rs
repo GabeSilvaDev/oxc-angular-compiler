@@ -895,38 +895,44 @@ export class Parent {
 #[test]
 fn namespace_member_does_not_select_an_unexported_class() {
     // `NS.LazyCmp` is recorded as the barrel's `LazyCmp` export, but the
-    // top-level `LazyCmp` class is not exported. The `LazyCmp` the barrel
-    // exports comes from `./real` (`app-real`), which is used eagerly.
-    let dir = TempDir::new().unwrap();
-    create_test_file(
-        dir.path(),
-        "app/real.ts",
-        r#"
+    // top-level `LazyCmp` class is not exported as `LazyCmp` (at most under
+    // another name). The `LazyCmp` the barrel exports comes from `./real`
+    // (`app-real`), which is used eagerly.
+    for export_list in ["", "export { LazyCmp as Alias };"] {
+        let dir = TempDir::new().unwrap();
+        create_test_file(
+            dir.path(),
+            "app/real.ts",
+            r#"
 import { Component } from '@angular/core';
 
 @Component({ selector: 'app-real', template: 'real' })
 export class LazyCmp {}
 "#,
-    );
-    create_test_file(
-        dir.path(),
-        "app/barrel.ts",
-        r#"
-import { Component } from '@angular/core';
+        );
+        create_test_file(
+            dir.path(),
+            "app/barrel.ts",
+            &format!(
+                r#"
+import {{ Component }} from '@angular/core';
 
 export * from './real';
 
-namespace NS {
-    export class LazyCmp {}
-}
+namespace NS {{
+    export class LazyCmp {{}}
+}}
 
-@Component({ selector: 'app-lazy', template: 'lazy' })
-class LazyCmp {}
-"#,
-    );
-    let result = transform(
-        &dir,
-        r#"
+@Component({{ selector: 'app-lazy', template: 'lazy' }})
+class LazyCmp {{}}
+
+{export_list}
+"#
+            ),
+        );
+        let result = transform(
+            &dir,
+            r#"
 import { Component } from '@angular/core';
 import { LazyCmp } from './barrel';
 
@@ -937,8 +943,9 @@ import { LazyCmp } from './barrel';
 })
 export class Parent {}
 "#,
-    );
-    assert_eager(&result.code, "./barrel");
+        );
+        assert_eager(&result.code, "./barrel");
+    }
 }
 
 #[test]
