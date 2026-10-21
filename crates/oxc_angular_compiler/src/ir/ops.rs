@@ -168,14 +168,14 @@ pub enum CreateOp<'a> {
     Defer(DeferOp<'a>),
     /// Defer trigger.
     DeferOn(DeferOnOp<'a>),
+    /// Activate the incremental hydration runtime.
+    EnableIncrementalHydrationRuntime(EnableIncrementalHydrationRuntimeOp<'a>),
     /// An i18n message.
     I18nMessage(I18nMessageOp<'a>),
     /// Change namespace.
     Namespace(NamespaceOp<'a>),
     /// Configure content projection.
     ProjectionDef(ProjectionDefOp<'a>),
-    /// Activate the incremental hydration runtime.
-    EnableIncrementalHydrationRuntime(EnableIncrementalHydrationRuntimeOp<'a>),
     /// Create a content projection slot.
     Projection(ProjectionOp<'a>),
     /// Create a repeater instruction.
@@ -233,12 +233,12 @@ impl<'a> Op for CreateOp<'a> {
             CreateOp::Pipe(_) => OpKind::Pipe,
             CreateOp::Defer(_) => OpKind::Defer,
             CreateOp::DeferOn(_) => OpKind::DeferOn,
-            CreateOp::I18nMessage(_) => OpKind::I18nMessage,
-            CreateOp::Namespace(_) => OpKind::Namespace,
-            CreateOp::ProjectionDef(_) => OpKind::ProjectionDef,
             CreateOp::EnableIncrementalHydrationRuntime(_) => {
                 OpKind::EnableIncrementalHydrationRuntime
             }
+            CreateOp::I18nMessage(_) => OpKind::I18nMessage,
+            CreateOp::Namespace(_) => OpKind::Namespace,
+            CreateOp::ProjectionDef(_) => OpKind::ProjectionDef,
             CreateOp::Projection(_) => OpKind::Projection,
             CreateOp::RepeaterCreate(_) => OpKind::RepeaterCreate,
             CreateOp::DeclareLet(_) => OpKind::DeclareLet,
@@ -281,10 +281,10 @@ impl<'a> Op for CreateOp<'a> {
             CreateOp::Pipe(op) => op.base.prev,
             CreateOp::Defer(op) => op.base.prev,
             CreateOp::DeferOn(op) => op.base.prev,
+            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.prev,
             CreateOp::I18nMessage(op) => op.base.prev,
             CreateOp::Namespace(op) => op.base.prev,
             CreateOp::ProjectionDef(op) => op.base.prev,
-            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.prev,
             CreateOp::Projection(op) => op.base.prev,
             CreateOp::RepeaterCreate(op) => op.base.prev,
             CreateOp::DeclareLet(op) => op.base.prev,
@@ -327,10 +327,10 @@ impl<'a> Op for CreateOp<'a> {
             CreateOp::Pipe(op) => op.base.next,
             CreateOp::Defer(op) => op.base.next,
             CreateOp::DeferOn(op) => op.base.next,
+            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.next,
             CreateOp::I18nMessage(op) => op.base.next,
             CreateOp::Namespace(op) => op.base.next,
             CreateOp::ProjectionDef(op) => op.base.next,
-            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.next,
             CreateOp::Projection(op) => op.base.next,
             CreateOp::RepeaterCreate(op) => op.base.next,
             CreateOp::DeclareLet(op) => op.base.next,
@@ -373,10 +373,10 @@ impl<'a> Op for CreateOp<'a> {
             CreateOp::Pipe(op) => op.base.prev = prev,
             CreateOp::Defer(op) => op.base.prev = prev,
             CreateOp::DeferOn(op) => op.base.prev = prev,
+            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.prev = prev,
             CreateOp::I18nMessage(op) => op.base.prev = prev,
             CreateOp::Namespace(op) => op.base.prev = prev,
             CreateOp::ProjectionDef(op) => op.base.prev = prev,
-            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.prev = prev,
             CreateOp::Projection(op) => op.base.prev = prev,
             CreateOp::RepeaterCreate(op) => op.base.prev = prev,
             CreateOp::DeclareLet(op) => op.base.prev = prev,
@@ -419,10 +419,10 @@ impl<'a> Op for CreateOp<'a> {
             CreateOp::Pipe(op) => op.base.next = next,
             CreateOp::Defer(op) => op.base.next = next,
             CreateOp::DeferOn(op) => op.base.next = next,
+            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.next = next,
             CreateOp::I18nMessage(op) => op.base.next = next,
             CreateOp::Namespace(op) => op.base.next = next,
             CreateOp::ProjectionDef(op) => op.base.next = next,
-            CreateOp::EnableIncrementalHydrationRuntime(op) => op.base.next = next,
             CreateOp::Projection(op) => op.base.next = next,
             CreateOp::RepeaterCreate(op) => op.base.next = next,
             CreateOp::DeclareLet(op) => op.base.next = next,
@@ -1091,6 +1091,16 @@ pub struct DeferOnOp<'a> {
     pub options: Option<Box<'a, IrExpression<'a>>>,
 }
 
+/// Activate the incremental hydration runtime.
+///
+/// Corresponds to the ɵɵenableIncrementalHydrationRuntime() instruction, emitted
+/// once per view before its first `@defer` block with hydrate triggers.
+#[derive(Debug)]
+pub struct EnableIncrementalHydrationRuntimeOp<'a> {
+    /// Common operation metadata.
+    pub base: CreateOpBase<'a>,
+}
+
 /// Defer with condition (update-time operation).
 ///
 /// This operation evaluates a user-provided condition expression during
@@ -1166,16 +1176,6 @@ pub struct ProjectionDefOp<'a> {
     /// The projection def expression in R3 format.
     /// None means default single-wildcard projection (no argument to projectionDef).
     pub def: Option<crate::output::ast::OutputExpression<'a>>,
-}
-
-/// Activate the incremental hydration runtime.
-///
-/// Corresponds to the ɵɵenableIncrementalHydrationRuntime() instruction, emitted
-/// once per view before its first `@defer` block with hydrate triggers.
-#[derive(Debug)]
-pub struct EnableIncrementalHydrationRuntimeOp<'a> {
-    /// Common operation metadata.
-    pub base: CreateOpBase<'a>,
 }
 
 /// Create a content projection slot.

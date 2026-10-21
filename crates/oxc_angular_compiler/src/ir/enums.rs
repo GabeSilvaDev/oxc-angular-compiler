@@ -88,6 +88,8 @@ pub enum OpKind {
     DeferOn,
     /// Control @defer with a custom condition.
     DeferWhen,
+    /// Activate the incremental hydration runtime.
+    EnableIncrementalHydrationRuntime,
 
     // I18n operations
     /// An i18n message for consts array.
@@ -102,8 +104,6 @@ pub enum OpKind {
     // Projection operations
     /// Configure content projection.
     ProjectionDef,
-    /// Activate the incremental hydration runtime.
-    EnableIncrementalHydrationRuntime,
     /// Create a content projection slot.
     Projection,
 

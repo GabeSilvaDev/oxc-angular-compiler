@@ -20,15 +20,22 @@ pub fn insert_incremental_hydration_runtime(job: &mut ComponentCompilationJob<'_
     for view in job.all_views_mut() {
         let mut cursor = view.create.cursor_front();
         loop {
-            let is_hydrating_defer = matches!(
-                cursor.current(),
-                Some(CreateOp::Defer(defer)) if defer
-                    .flags
-                    .is_some_and(|flags| flags & TDeferDetailsFlags::HAS_HYDRATE_TRIGGERS.bits() != 0)
-            );
-            if is_hydrating_defer {
+            // The new op takes the defer block's source span, as in Angular.
+            let hydrating_defer_span = match cursor.current() {
+                Some(CreateOp::Defer(defer))
+                    if defer.flags.is_some_and(|flags| {
+                        flags & TDeferDetailsFlags::HAS_HYDRATE_TRIGGERS.bits() != 0
+                    }) =>
+                {
+                    Some(defer.base.source_span)
+                }
+                _ => None,
+            };
+            if let Some(source_span) = hydrating_defer_span {
                 cursor.insert_before(CreateOp::EnableIncrementalHydrationRuntime(
-                    EnableIncrementalHydrationRuntimeOp { base: CreateOpBase::default() },
+                    EnableIncrementalHydrationRuntimeOp {
+                        base: CreateOpBase { source_span, ..Default::default() },
+                    },
                 ));
                 break;
             }

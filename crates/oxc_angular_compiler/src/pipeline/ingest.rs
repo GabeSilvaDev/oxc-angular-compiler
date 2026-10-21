@@ -31,7 +31,7 @@ use crate::ast::r3::{
     R3TextAttribute, SecurityContext,
 };
 use crate::ir::enums::{
-    BindingKind, DeferOpModifierKind, DeferTriggerKind, Namespace, TemplateKind,
+    BindingKind, DeferOpModifierKind, DeferTriggerKind, Namespace, TDeferDetailsFlags, TemplateKind,
 };
 use crate::ir::expression::{
     BinaryExpr, ConditionalCaseExpr, EmptyExpr, IrBinaryOperator, IrExpression, LexicalReadExpr,
@@ -3314,8 +3314,7 @@ fn ingest_defer_block<'a>(
     // Calculate flags based on whether hydrate triggers exist.
     // Matches Angular's calcDeferBlockFlags function in ingest.ts
     let flags = if defer_block.hydrate_triggers.has_any() {
-        // TDeferDetailsFlags.HasHydrateTriggers = 1
-        Some(1u32)
+        Some(TDeferDetailsFlags::HAS_HYDRATE_TRIGGERS.bits())
     } else {
         None
     };

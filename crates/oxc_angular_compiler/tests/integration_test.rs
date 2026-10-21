@@ -929,23 +929,50 @@ fn test_hydrate_never_mutual_exclusivity() {
     );
 }
 
+/// The statement that follows each `ɵɵenableIncrementalHydrationRuntime()` call.
+fn after_hydration_runtime_calls(js: &str) -> Vec<&str> {
+    js.split("i0.ɵɵenableIncrementalHydrationRuntime();")
+        .skip(1)
+        .map(|rest| rest.trim_start().split(';').next().unwrap())
+        .collect()
+}
+
+/// The body of the generated template function `name`.
+fn template_function<'a>(js: &'a str, name: &str) -> &'a str {
+    let start = js.find(&format!("function {name}(")).unwrap_or_else(|| panic!("{name}:\n{js}"));
+    let body = &js[start + 1..];
+    &js[start..start + 1 + body.find("function ").unwrap_or(body.len())]
+}
+
 #[test]
 fn test_hydrate_trigger_enables_incremental_hydration_runtime() {
     let js = compile_template_to_js(
         r"@defer (on idle) {a} @defer (hydrate on hover) {b} @defer (hydrate never) {c}",
         "TestComponent",
     );
+    // One call per view, right before the first defer block with hydrate triggers.
     assert_eq!(
-        js.matches("ɵɵenableIncrementalHydrationRuntime()").count(),
-        1,
-        "One activation call per view. Output:\n{js}"
+        after_hydration_runtime_calls(&js),
+        ["i0.ɵɵdefer(4,3,null,null,null,null,null,null,null,1)"],
+        "Output:\n{js}"
     );
-    let enable = js.find("ɵɵenableIncrementalHydrationRuntime()").unwrap();
-    let hydrating_defer = js.find("ɵɵdefer(4,").unwrap();
-    assert!(
-        js[..enable].contains("ɵɵdefer(1,") && enable < hydrating_defer,
-        "The call goes right before the first defer with hydrate triggers. Output:\n{js}"
-    );
+}
+
+#[test]
+fn test_hydrate_trigger_kinds_enable_incremental_hydration_runtime() {
+    for template in [
+        r"@defer (hydrate never) {a}",
+        r"@defer (hydrate when cond) {a}",
+        r"@defer (hydrate on timer(1s)) {a}",
+        r"<div i18n>Hello @defer (hydrate on idle) {x}</div>",
+    ] {
+        let js = compile_template_to_js(template, "TestComponent");
+        let calls = after_hydration_runtime_calls(&js);
+        assert!(
+            calls.len() == 1 && calls[0].starts_with("i0.ɵɵdefer("),
+            "{template}\nOutput:\n{js}"
+        );
+    }
 }
 
 #[test]
@@ -954,11 +981,17 @@ fn test_hydrate_trigger_in_embedded_view_enables_runtime_in_that_view() {
         r"@defer (hydrate on idle) {a} @if (x) { @defer (hydrate on hover) {b} }",
         "TestComponent",
     );
-    assert_eq!(
-        js.matches("ɵɵenableIncrementalHydrationRuntime()").count(),
-        2,
-        "Each view with a hydrating defer block gets its own call. Output:\n{js}"
-    );
+    assert_eq!(after_hydration_runtime_calls(&js).len(), 2, "Output:\n{js}");
+    for (view, defer) in [
+        ("TestComponent_Conditional_3_Template", "i0.ɵɵdefer(2,"),
+        ("TestComponent_Template", "i0.ɵɵdefer(1,"),
+    ] {
+        let calls = after_hydration_runtime_calls(template_function(&js, view));
+        assert!(
+            calls.len() == 1 && calls[0].starts_with(defer),
+            "{view} has its own call. Output:\n{js}"
+        );
+    }
 }
 
 #[test]
