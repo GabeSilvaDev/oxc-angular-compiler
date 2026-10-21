@@ -3337,6 +3337,59 @@ fn test_animate_enter_and_leave_together() {
 }
 
 #[test]
+fn test_animate_enter_listener() {
+    let js = compile_template_to_js(r#"<div (animate.enter)="fn($event)"></div>"#, "TestComponent");
+    assert!(
+        js.contains("i0.ɵɵanimateEnterListener(function TestComponent_Template_div_animateenter_0_listener($event)"),
+        "Expected ɵɵanimateEnterListener.\nGot:\n{js}"
+    );
+    assert!(js.contains("return ctx.fn($event);"), "Got:\n{js}");
+    assert!(
+        !js.contains("@animate"),
+        "Must not compile to a legacy animation listener.\nGot:\n{js}"
+    );
+}
+
+#[test]
+fn test_animate_leave_listener_with_statements() {
+    let js = compile_template_to_js(
+        r#"<div animate.leave="fade" (animate.leave)="a = 1; fn($event)"></div>"#,
+        "TestComponent",
+    );
+    assert!(js.contains(r#"i0.ɵɵanimateLeave("fade")"#), "Got:\n{js}");
+    assert!(
+        js.contains("i0.ɵɵanimateLeaveListener(function TestComponent_Template_div_animateleave_0_listener($event)"),
+        "Expected ɵɵanimateLeaveListener.\nGot:\n{js}"
+    );
+    assert!(js.contains("ctx.a = 1") && js.contains("return ctx.fn($event);"), "Got:\n{js}");
+    assert!(!js.contains("@animate"), "Got:\n{js}");
+}
+
+#[test]
+fn test_host_animate_listener_and_attribute() {
+    let source = r"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: 'app-fade',
+    template: '',
+    host: { '(animate.leave)': 'done($event)', 'animate.enter': 'fade-in' },
+})
+export class FadeComponent { done(e: any) {} }
+";
+    let allocator = Allocator::default();
+    let result = transform_angular_file(&allocator, "fade.component.ts", source, None, None);
+    assert!(!result.has_errors(), "{:?}", result.diagnostics);
+    let js = &result.code;
+    assert!(
+        js.contains("i0.ɵɵanimateLeaveListener(function FadeComponent_animateleave_HostBindingHandler($event)"),
+        "Expected ɵɵanimateLeaveListener in hostBindings.\nGot:\n{js}"
+    );
+    assert!(js.contains(r#"i0.ɵɵanimateEnter("fade-in")"#), "Got:\n{js}");
+    assert!(!js.contains(r#""animate.leave""#), "Must not listen to a DOM event.\nGot:\n{js}");
+}
+
+#[test]
 fn test_host_animation_trigger_binding() {
     // Component with animation trigger in host property should emit ɵɵsyntheticHostProperty
     let source = r"

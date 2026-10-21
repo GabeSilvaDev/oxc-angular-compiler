@@ -269,36 +269,22 @@ pub fn create_synthetic_host_listener_stmt<'a>(
     )
 }
 
-/// Creates an ɵɵsyntheticHostListener() call statement for animation listeners.
+/// Creates an ɵɵanimateEnterListener() or ɵɵanimateLeaveListener() call statement for an
+/// `(animate.enter)` / `(animate.leave)` listener.
 ///
-/// Animation listeners have event names like "@trigger.start" or "@trigger.done".
-/// The AnimationKind enum currently has Enter/Leave for direction, but animation
-/// callbacks use start/done for timing. For now, we map Enter -> start, Leave -> done.
+/// Ported from Angular's `animationListener` in `instruction.ts`.
 ///
 /// The `handler_fn_name` parameter sets the name of the handler function expression.
 /// The `consumes_dollar_event` parameter controls whether the `$event` parameter is included.
 pub fn create_animation_listener_stmt<'a>(
     allocator: &'a oxc_allocator::Allocator,
     core_namespace: &'a str,
-    name: &Ident<'a>,
     phase: crate::ir::enums::AnimationKind,
     handler_stmts: OxcVec<'a, OutputStatement<'a>>,
     handler_fn_name: Option<&Ident<'a>>,
     consumes_dollar_event: bool,
 ) -> OutputStatement<'a> {
     let mut args = OxcVec::new_in(&allocator);
-
-    // Build the full event name: "@{name}.{phase}"
-    // AnimationKind::Enter maps to "start", AnimationKind::Leave maps to "done"
-    let phase_str = match phase {
-        crate::ir::enums::AnimationKind::Enter => "start",
-        crate::ir::enums::AnimationKind::Leave => "done",
-    };
-    let full_name = allocator.alloc_str(&format!("@{}.{}", name.as_str(), phase_str));
-    args.push(OutputExpression::Literal(Box::new_in(
-        LiteralExpr { value: LiteralValue::String(Ident::from(full_name)), source_span: None },
-        &allocator,
-    )));
 
     // Handler function: function name($event) { ... } or function name() { ... }
     let mut params = OxcVec::new_in(&allocator);
@@ -317,12 +303,11 @@ pub fn create_animation_listener_stmt<'a>(
     ));
     args.push(handler_fn);
 
-    create_instruction_call_stmt(
-        allocator,
-        core_namespace,
-        Identifiers::SYNTHETIC_HOST_LISTENER,
-        args,
-    )
+    let instruction = match phase {
+        crate::ir::enums::AnimationKind::Enter => Identifiers::ANIMATION_ENTER_LISTENER,
+        crate::ir::enums::AnimationKind::Leave => Identifiers::ANIMATION_LEAVE_LISTENER,
+    };
+    create_instruction_call_stmt(allocator, core_namespace, instruction, args)
 }
 
 /// Creates an ɵɵanimateEnter() or ɵɵanimateLeave() call statement for animation string bindings.
