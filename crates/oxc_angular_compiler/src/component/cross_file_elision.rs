@@ -19,8 +19,8 @@ use std::rc::Rc;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BindingPattern, Declaration, ExportDefaultDeclarationKind, Expression, Statement,
-    TSNamespaceDeclarationBody,
+    BindingPattern, Class, Declaration, ExportDefaultDeclarationKind, Expression,
+    ObjectPropertyKind, Statement, TSNamespaceDeclarationBody,
 };
 use oxc_parser::Parser;
 use oxc_resolver::{
@@ -115,6 +115,63 @@ impl ImportValueResolver for CrossFileResolver {
     }
 }
 
+/// The selector of the class `local` declares in `file_path` (`"default"` for
+/// `export default class`), when it is a standalone `@Component` or
+/// `@Directive` whose `selector` and `standalone` are literals.
+fn standalone_class_selector(
+    file_path: &str,
+    local: &str,
+    implicit_standalone: bool,
+) -> Option<String> {
+    let source = std::fs::read_to_string(file_path).ok()?;
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(file_path).unwrap_or_default();
+    let parser_ret = Parser::new(&allocator, &source, source_type).parse();
+    let program = &parser_ret.program;
+
+    let is_local = |class: &Class| class.id.as_ref().is_some_and(|id| id.name == local);
+    let class = program.body.iter().find_map(|stmt| match stmt {
+        Statement::ClassDeclaration(class) if is_local(class) => Some(&**class),
+        Statement::ExportDeclaration(decl) => match &decl.declaration {
+            Declaration::ClassDeclaration(class) if is_local(class) => Some(&**class),
+            _ => None,
+        },
+        Statement::ExportDefaultDeclaration(decl) if local == "default" => {
+            match &decl.declaration {
+                ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(&**class),
+                _ => None,
+            }
+        }
+        _ => None,
+    })?;
+
+    let consts = crate::directive::collect_string_consts(&allocator, program);
+    let decorator = ["Component", "Directive"].iter().find_map(|name| {
+        crate::directive::find_angular_class_decorator(&class.decorators, name, &consts)
+    })?;
+    let Expression::CallExpression(call) = &decorator.expression else { return None };
+    let Some(Expression::ObjectExpression(object)) =
+        call.arguments.first().and_then(|arg| arg.as_expression())
+    else {
+        return None;
+    };
+
+    let mut selector = None;
+    let mut standalone = implicit_standalone;
+    for property in &object.properties {
+        let ObjectPropertyKind::ObjectProperty(property) = property else { return None };
+        let Some(key) = property.key.static_name() else { continue };
+        if key == "selector" {
+            let Expression::StringLiteral(value) = &property.value else { return None };
+            selector = Some(value.value.as_str()?.to_string());
+        } else if key == "standalone" {
+            let Expression::BooleanLiteral(value) = &property.value else { return None };
+            standalone = value.value;
+        }
+    }
+    selector.filter(|selector| standalone && !selector.trim().is_empty())
+}
+
 impl CrossFileAnalyzer {
     /// Create a new cross-file analyzer.
     ///
@@ -192,6 +249,31 @@ impl CrossFileAnalyzer {
         from_file: &Path,
     ) -> Option<crate::directive::StaticValue> {
         self.inner.resolve_export_value(import_source, import_name, from_file)
+    }
+
+    /// The selector of the standalone `@Component` or `@Directive` class that
+    /// `import_name` is exported as from `import_source`, as `import_source`
+    /// is written in `from_file`, following named re-exports. Used to tell
+    /// whether a template matches the class, for `@defer` (#313).
+    ///
+    /// `None` when the import can't be followed to a class declared in a
+    /// source file (packages, `export *`, unresolvable paths), the class isn't
+    /// a standalone component or directive, or its `selector` or `standalone`
+    /// isn't a literal: the caller keeps the import eager. Files read are
+    /// recorded in [`Self::take_value_dependencies`].
+    pub(crate) fn standalone_directive_selector(
+        &self,
+        import_source: &str,
+        import_name: &str,
+        from_file: &Path,
+        implicit_standalone: bool,
+    ) -> Option<String> {
+        self.inner.standalone_directive_selector(
+            import_source,
+            import_name,
+            from_file,
+            implicit_standalone,
+        )
     }
 
     /// The resolver the decorator evaluator reads `from_file`'s imported
@@ -346,6 +428,47 @@ impl Inner {
             self.analyze_file(&resolved);
         }
         self.export_value_at(&resolved, import_name, 0)
+    }
+
+    fn standalone_directive_selector(
+        &self,
+        import_source: &str,
+        import_name: &str,
+        from_file: &Path,
+        implicit_standalone: bool,
+    ) -> Option<String> {
+        let mut file = self.resolve_module_spec(from_file.parent()?, import_source)?;
+        let mut name = import_name.to_string();
+        for _ in 0..MAX_EXPORT_CHAIN {
+            if Path::new(&file).components().any(|c| c.as_os_str() == "node_modules") {
+                return None;
+            }
+            self.value_dependencies.borrow_mut().insert(file.clone());
+            if !self.cache.borrow().contains_key(&file) {
+                if self.analyzing.borrow().contains(&file) {
+                    return None; // Circular import
+                }
+                self.analyze_file(&file);
+            }
+            let info = self.cache.borrow().get(&file)?.get(&name).cloned()?;
+            match info.re_export_source {
+                None => {
+                    return standalone_class_selector(
+                        &file,
+                        info.value_local.as_deref()?,
+                        implicit_standalone,
+                    );
+                }
+                Some((source, original)) => {
+                    if original == "*" {
+                        return None;
+                    }
+                    file = self.resolve_module_spec(Path::new(&file).parent()?, &source)?;
+                    name = original;
+                }
+            }
+        }
+        None
     }
 
     /// Every value `import_source` exports, for `{ ...ns }` with

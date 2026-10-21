@@ -47,7 +47,7 @@ use oxc_ast::ast::{
 };
 use oxc_semantic::{Semantic, SemanticBuilder, SymbolFlags};
 use oxc_str::Ident;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::optimizer::Edit;
 
@@ -61,6 +61,9 @@ const PARAM_DECORATORS: &[&str] = &["Inject", "Optional", "Self", "SkipSelf", "H
 pub struct ImportElisionAnalyzer<'a> {
     /// Set of import specifier local names that should be removed (type-only).
     type_only_specifiers: FxHashSet<Ident<'a>>,
+    /// Number of value (non-type) references to each named or default import
+    /// specifier, by local name.
+    value_reference_counts: FxHashMap<Ident<'a>, usize>,
 }
 
 impl<'a> ImportElisionAnalyzer<'a> {
@@ -82,6 +85,7 @@ impl<'a> ImportElisionAnalyzer<'a> {
         let semantic = &semantic_ret.semantic;
 
         let mut type_only_specifiers = FxHashSet::default();
+        let mut value_reference_counts = FxHashMap::default();
 
         // First, collect all symbols that are used ONLY in constructor parameter decorators.
         // These should be elided because Angular removes these decorators during compilation.
@@ -127,6 +131,10 @@ impl<'a> ImportElisionAnalyzer<'a> {
                         }
 
                         let name: Ident<'a> = spec.local.name.clone().into();
+                        value_reference_counts.insert(
+                            name.clone(),
+                            Self::value_reference_count_of(&spec.local, semantic),
+                        );
 
                         // Check if this import has only type references
                         if Self::is_type_only_import(&spec.local, semantic) {
@@ -139,6 +147,10 @@ impl<'a> ImportElisionAnalyzer<'a> {
                     }
                     ImportDeclarationSpecifier::ImportDefaultSpecifier(spec) => {
                         let name: Ident<'a> = spec.local.name.clone().into();
+                        value_reference_counts.insert(
+                            name.clone(),
+                            Self::value_reference_count_of(&spec.local, semantic),
+                        );
 
                         if Self::is_type_only_import(&spec.local, semantic) {
                             type_only_specifiers.insert(name.clone());
@@ -178,7 +190,7 @@ impl<'a> ImportElisionAnalyzer<'a> {
             }
         }
 
-        Self { type_only_specifiers }
+        Self { type_only_specifiers, value_reference_counts }
     }
 
     /// Local names of **default imports** that a decorated class's constructor
@@ -846,6 +858,33 @@ impl<'a> ImportElisionAnalyzer<'a> {
             .any(|reference| !reference.is_type());
 
         !has_value_reference
+    }
+
+    /// The number of value references to an import binding, or `usize::MAX`
+    /// when a value redeclaration shadows it (a reference can't be told apart).
+    fn value_reference_count_of(id: &BindingIdentifier<'a>, semantic: &Semantic<'a>) -> usize {
+        let symbol_id = id.symbol_id();
+        let symbol_flags = semantic.scoping().symbol_flags(symbol_id);
+        if (symbol_flags - SymbolFlags::Import).is_value() {
+            return usize::MAX;
+        }
+        semantic
+            .scoping()
+            .get_resolved_references(symbol_id)
+            .filter(|reference| !reference.is_type())
+            .count()
+    }
+
+    /// How many value (non-type) references the source makes to the named or
+    /// default import `name`, or `None` for a name no such import binds.
+    pub fn value_reference_count(&self, name: &str) -> Option<usize> {
+        self.value_reference_counts.get(&Ident::from(name)).copied()
+    }
+
+    /// Remove `name`'s import: the compiled output no longer references it,
+    /// such as a component that `@defer` now loads with a dynamic `import()`.
+    pub fn elide(&mut self, name: Ident<'a>) {
+        self.type_only_specifiers.insert(name);
     }
 
     /// Check if a specifier name should be elided (removed).

@@ -22,25 +22,32 @@
 //! import map. It is consumed by the main compile path in
 //! [`super::transform::compile_component_full`].
 //!
-//! ## Why `deferredImports`, not `imports`?
+//! ## `deferredImports` and implicitly deferred `imports`
 //!
 //! Angular's full compilation mode also derives a deferrable set from
 //! `@Component.imports` by matching template selectors to imported
 //! directives/pipes/components (see `resolveAllDeferredDependencies` in
 //! `packages/compiler-cli/src/ngtsc/annotations/component/src/handler.ts`).
-//! That requires cross-file metadata OXC doesn't have — selectors live on
-//! the imported class, not on the import declaration. In local compilation
-//! (which OXC is — single file in, single file out) Angular falls back to
-//! the `deferredImports` field as the only safe source of deferrable
-//! symbols, and OXC does the same.
+//! That requires cross-file metadata — selectors live on the imported class,
+//! not on the import declaration. In local compilation Angular falls back to
+//! the `deferredImports` field as the only source of deferrable symbols.
+//! OXC does the same unless cross-file analysis can read the imported
+//! class's selector: then [`implicitly_deferred_imports`] picks the
+//! standalone components and directives the template matches only inside
+//! `@defer` blocks, and they join `deferredImports` (#313).
 
 use oxc_allocator::Allocator;
 
-use crate::ast::r3::{R3DeferredBlock, R3Node, R3Visitor, visit_all};
+use crate::ast::expression::BindingType;
+use crate::ast::r3::{
+    R3BoundAttribute, R3BoundEvent, R3Component, R3DeferredBlock, R3Directive, R3Element, R3Node,
+    R3Template, R3TemplateAttr, R3TextAttribute, R3Visitor, visit_all,
+};
 use crate::class_metadata::{
     R3DeferPerComponentDependency, compile_component_metadata_async_resolver,
 };
 use crate::output::ast::OutputExpression;
+use crate::pipeline::selector::CssSelector;
 use oxc_str::Ident;
 
 use super::metadata::ComponentMetadata;
@@ -164,4 +171,162 @@ pub fn build_defer_resolver_expression<'a>(
     }
 
     Some(compile_component_metadata_async_resolver(allocator, &deps))
+}
+
+/// The `candidates` matched only inside the main content of `@defer` blocks
+/// (`resolveDeferBlocks` in ngc's component `handler.ts`). `@placeholder`,
+/// `@loading` and `@error` count as eager. Selectorless templates return none.
+pub(super) fn implicitly_deferred_imports<'a>(
+    nodes: &[R3Node<'a>],
+    candidates: &[(Ident<'a>, std::vec::Vec<CssSelector>)],
+) -> std::vec::Vec<Ident<'a>> {
+    struct Matcher<'c, 'a> {
+        candidates: &'c [(Ident<'a>, std::vec::Vec<CssSelector>)],
+        in_defer: bool,
+        deferred: std::vec::Vec<bool>,
+        eager: std::vec::Vec<bool>,
+        selectorless: bool,
+    }
+
+    impl Matcher<'_, '_> {
+        fn record(&mut self, element: &CssSelector) {
+            for (index, (_, selectors)) in self.candidates.iter().enumerate() {
+                if selectors.iter().any(|selector| selector.matches(element)) {
+                    if self.in_defer {
+                        self.deferred[index] = true;
+                    } else {
+                        self.eager[index] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    impl<'a> R3Visitor<'a> for Matcher<'_, 'a> {
+        fn visit_element(&mut self, element: &R3Element<'a>) {
+            if !element.directives.is_empty() {
+                self.selectorless = true;
+            }
+            self.record(&element_selector(
+                &element.name,
+                &element.attributes,
+                &element.inputs,
+                &element.outputs,
+            ));
+            self.visit_element_children(element);
+        }
+
+        fn visit_template(&mut self, template: &R3Template<'a>) {
+            if !template.directives.is_empty() {
+                self.selectorless = true;
+            }
+            self.record(&template_selector(template));
+            self.visit_template_children(template);
+        }
+
+        fn visit_deferred_block(&mut self, block: &R3DeferredBlock<'a>) {
+            let outer = self.in_defer;
+            self.in_defer = true;
+            for child in &block.children {
+                child.visit(self);
+            }
+            self.in_defer = false;
+            if let Some(placeholder) = &block.placeholder {
+                self.visit_deferred_block_placeholder(placeholder);
+            }
+            if let Some(loading) = &block.loading {
+                self.visit_deferred_block_loading(loading);
+            }
+            if let Some(error) = &block.error {
+                self.visit_deferred_block_error(error);
+            }
+            self.in_defer = outer;
+        }
+
+        fn visit_component(&mut self, _component: &R3Component<'a>) {
+            self.selectorless = true;
+        }
+
+        fn visit_directive(&mut self, _directive: &R3Directive<'a>) {
+            self.selectorless = true;
+        }
+    }
+
+    let mut matcher = Matcher {
+        candidates,
+        in_defer: false,
+        deferred: vec![false; candidates.len()],
+        eager: vec![false; candidates.len()],
+        selectorless: false,
+    };
+    visit_all(&mut matcher, nodes);
+    if matcher.selectorless {
+        return std::vec::Vec::new();
+    }
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| matcher.deferred[*index] && !matcher.eager[*index])
+        .map(|(_, (name, _))| name.clone())
+        .collect()
+}
+
+/// An element as Angular matches directives against it
+/// (`getAttrsForDirectiveMatching` in `packages/compiler/src/render3/view/util.ts`):
+/// its static attributes with their values, the names of its property and
+/// two-way bindings and of its outputs, and its `class` attribute as classes.
+fn element_selector(
+    name: &str,
+    attributes: &[R3TextAttribute<'_>],
+    inputs: &[R3BoundAttribute<'_>],
+    outputs: &[R3BoundEvent<'_>],
+) -> CssSelector {
+    let mut selector = CssSelector::new();
+    selector.set_element(name);
+    for attribute in attributes {
+        if attribute.name.starts_with("i18n") {
+            continue;
+        }
+        selector.add_attribute(&attribute.name, Some(&attribute.value));
+        if attribute.name == "class" {
+            for class in attribute.value.split_whitespace() {
+                selector.add_class_name(class);
+            }
+        }
+    }
+    for input in inputs {
+        if matches!(input.binding_type, BindingType::Property | BindingType::TwoWay) {
+            selector.add_attribute(&input.name, None);
+        }
+    }
+    for output in outputs {
+        selector.add_attribute(&output.name, None);
+    }
+    selector
+}
+
+/// A template as Angular matches directives against it: an `<ng-template>`
+/// like an element, a structural directive's template (`*ngIf`) by the names
+/// of its template attributes.
+fn template_selector(template: &R3Template<'_>) -> CssSelector {
+    match &template.tag_name {
+        Some(tag_name) if tag_name.as_str() == "ng-template" => element_selector(
+            "ng-template",
+            &template.attributes,
+            &template.inputs,
+            &template.outputs,
+        ),
+        _ => {
+            let mut selector = CssSelector::new();
+            selector.set_element("ng-template");
+            for attribute in &template.template_attrs {
+                let name = match attribute {
+                    R3TemplateAttr::Bound(bound) => &bound.name,
+                    R3TemplateAttr::Text(text) => &text.name,
+                };
+                selector.add_attribute(name, None);
+            }
+            selector
+        }
+    }
 }

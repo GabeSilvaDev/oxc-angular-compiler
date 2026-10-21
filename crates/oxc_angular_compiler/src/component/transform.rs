@@ -3514,6 +3514,42 @@ pub fn transform_angular_file(
                     let content_query_names: Vec<String> =
                         content_queries.iter().map(|q| q.property_name.to_string()).collect();
 
+                    // The selector of the standalone component or directive an
+                    // `imports` entry refers to, when `@defer` may lazy-load it
+                    // (#313): its import is referenced nowhere else in this file,
+                    // so the static import can go, and cross-file analysis can
+                    // read the selector. Watched files are only reported with
+                    // `resolve_imported_values`, so it is required here too.
+                    #[cfg(feature = "cross_file_elision")]
+                    let deferrable_selector = cross_file_analyzer
+                        .as_ref()
+                        .filter(|_| options.resolve_imported_values)
+                        .map(|analyzer| {
+                            let import_map = &import_map;
+                            let import_elision = &import_elision_mut;
+                            move |local: &str| -> Option<String> {
+                                if import_elision.value_reference_count(local)? != 1 {
+                                    return None;
+                                }
+                                let info = import_map.get(&Ident::from(local))?;
+                                if !info.is_named_import || info.is_type_only {
+                                    return None;
+                                }
+                                let export_name = info.imported_name.as_deref().unwrap_or(local);
+                                analyzer.standalone_directive_selector(
+                                    info.source_module.as_str(),
+                                    export_name,
+                                    std::path::Path::new(path),
+                                    implicit_standalone,
+                                )
+                            }
+                        });
+                    #[cfg(feature = "cross_file_elision")]
+                    let deferrable_selector =
+                        deferrable_selector.as_ref().map(|f| f as DeferrableSelector<'_>);
+                    #[cfg(not(feature = "cross_file_elision"))]
+                    let deferrable_selector = None;
+
                     // 4. Compile the template and generate ɵcmp/ɵfac
                     // Pass the shared pool index to ensure unique constant names
                     // Pass the file-level namespace registry to ensure consistent namespace assignments
@@ -3530,10 +3566,16 @@ pub fn transform_angular_file(
                         &mut file_namespace_registry,
                         &import_map,
                         resolved_resources,
+                        deferrable_selector,
                     ) {
                         Ok(compilation_result) => {
                             // Update the shared pool index for the next component
                             shared_pool_index = compilation_result.next_pool_index;
+
+                            // `@defer` loads these with a dynamic `import()` now.
+                            for name in &compilation_result.implicitly_deferred_imports {
+                                import_elision_mut.elide(Ident::from_in(name.as_str(), allocator));
+                            }
 
                             // Stylesheet `<link>`s in the template are watched
                             // files like decorator `styleUrls`, and a missing
@@ -4704,6 +4746,11 @@ struct FullCompilationResult {
     /// `import(...)` calls in the output.
     has_defer_block: bool,
 
+    /// Local names of `@Component.imports` entries moved to the `@defer`
+    /// resolver because the template matches them only inside `@defer`
+    /// blocks (#313). The caller removes their static imports.
+    implicitly_deferred_imports: Vec<String>,
+
     /// Resolvable-URL stylesheet `<link>`s the template's preparser collected
     /// (upstream `_extractTemplateStyleUrls`). The caller records them as
     /// watch dependencies like decorator `styleUrls`.
@@ -4778,6 +4825,7 @@ fn compile_component_partial<'a>(
         next_pool_index: pool_starting_index,
         ng_content_selectors: Vec::new(),
         has_defer_block,
+        implicitly_deferred_imports: Vec::new(),
         // Partial mode never parses the template; the linker collects link
         // URLs at consumer build time.
         template_style_urls: Vec::new(),
@@ -4865,6 +4913,10 @@ fn html_parse_error_diagnostic(
     }
 }
 
+/// The selector of the standalone component or directive an `imports`
+/// entry refers to, by local name, when `@defer` may lazy-load it.
+type DeferrableSelector<'f> = &'f dyn Fn(&str) -> Option<String>;
+
 fn compile_component_full<'a>(
     allocator: &'a Allocator,
     template: &'a str,
@@ -4878,6 +4930,7 @@ fn compile_component_full<'a>(
     namespace_registry: &mut NamespaceRegistry<'a>,
     import_map: &ImportMap<'a>,
     resolved_resources: Option<&ResolvedResources>,
+    deferrable_selector: Option<DeferrableSelector<'_>>,
 ) -> Result<FullCompilationResult, Vec<OxcDiagnostic>> {
     use oxc_allocator::FromIn;
 
@@ -5016,6 +5069,39 @@ fn compile_component_full<'a>(
         }
     }
 
+    // `imports` entries matched only inside `@defer` are lazy-loaded, as in
+    // ngc's full compilation (#313). Needs cross-file analysis for the
+    // selectors; skipped under HMR, like ngc.
+    let mut implicitly_deferred_imports = Vec::new();
+    if let Some(deferrable_selector) = deferrable_selector
+        && !options.hmr
+        && let Some(OutputExpression::LiteralArray(raw_imports)) = &metadata.raw_imports
+        && raw_imports.entries.iter().all(|entry| matches!(entry, OutputExpression::ReadVar(_)))
+        && super::defer_resolver::template_has_defer_block(&r3_result.nodes)
+    {
+        let candidates: Vec<_> = metadata
+            .imports
+            .iter()
+            .filter_map(|name| {
+                let selector = deferrable_selector(name.as_str())?;
+                Some((name.clone(), crate::pipeline::selector::CssSelector::parse(&selector)))
+            })
+            .collect();
+        let deferred =
+            super::defer_resolver::implicitly_deferred_imports(&r3_result.nodes, &candidates);
+        if !deferred.is_empty() {
+            let is_deferred = |name: &str| deferred.iter().any(|d| d.as_str() == name);
+            metadata.imports.retain(|name| !is_deferred(name.as_str()));
+            if let Some(OutputExpression::LiteralArray(raw_imports)) = &mut metadata.raw_imports {
+                raw_imports.entries.retain(|entry| {
+                    !matches!(entry, OutputExpression::ReadVar(var) if is_deferred(var.name.as_str()))
+                });
+            }
+            implicitly_deferred_imports = deferred.iter().map(ToString::to_string).collect();
+            metadata.deferred_imports.extend(deferred);
+        }
+    }
+
     // Build the deferrable-dependencies resolver from
     // `@Component.deferredImports`.
     //
@@ -5032,9 +5118,9 @@ fn compile_component_full<'a>(
     //
     // Note: Angular's full compilation mode also derives deferrable symbols
     // from `imports: [...]` by matching template selectors against imported
-    // directive classes (`resolveAllDeferredDependencies`). That needs
-    // cross-file metadata OXC doesn't have, so we follow Angular's local
-    // path and require explicit `deferredImports`.
+    // directive classes (`resolveAllDeferredDependencies`). OXC does that
+    // above when cross-file analysis is available (#313) and otherwise
+    // follows Angular's local path, which requires explicit `deferredImports`.
     // Computed once and reused below: the resolver decision and the eventual
     // `setClassMetadataAsync` gate both depend on whether the template uses
     // `@defer`.
@@ -5318,6 +5404,7 @@ fn compile_component_full<'a>(
         next_pool_index,
         ng_content_selectors,
         has_defer_block,
+        implicitly_deferred_imports,
         template_style_urls,
         missing_link_urls,
     })
