@@ -39,6 +39,7 @@ mod host_style_property_parsing;
 pub mod i18n_closure;
 mod i18n_const_collection;
 mod i18n_text_extraction;
+mod insert_incremental_hydration_runtime;
 mod local_refs;
 mod namespace;
 mod naming;
@@ -253,6 +254,13 @@ pub static PHASES: &[Phase] = &[
         run: defer_configs::configure_defer_instructions,
         run_host: None,
         name: "configureDeferInstructions",
+    },
+    // Phase 19b: insertIncrementalHydrationRuntime (Template only)
+    Phase {
+        kind: CompilationJobKind::Template,
+        run: insert_incremental_hydration_runtime::insert_incremental_hydration_runtime,
+        run_host: None,
+        name: "insertIncrementalHydrationRuntime",
     },
     // Phase 20: createVariadicPipes (Template only)
     Phase {

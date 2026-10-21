@@ -102,6 +102,8 @@ pub enum OpKind {
     // Projection operations
     /// Configure content projection.
     ProjectionDef,
+    /// Activate the incremental hydration runtime.
+    EnableIncrementalHydrationRuntime,
     /// Create a content projection slot.
     Projection,
 
@@ -507,6 +509,11 @@ impl TDeferDetailsFlags {
     pub const DEFAULT: Self = Self(0);
     /// Has hydrate triggers.
     pub const HAS_HYDRATE_TRIGGERS: Self = Self(1 << 0);
+
+    /// The raw flag bits, as stored in `DeferOp::flags`.
+    pub const fn bits(self) -> u32 {
+        self.0 as u32
+    }
 }
 
 #[cfg(test)]

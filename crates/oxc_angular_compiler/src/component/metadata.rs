@@ -201,6 +201,23 @@ impl AngularVersion {
         false
     }
 
+    /// Check if this version has the `ɵɵenableIncrementalHydrationRuntime`
+    /// instruction (v22.0.0-next.11+).
+    ///
+    /// From that release the incremental hydration runtime stays inert until a
+    /// compiled template calls the instruction, so every view with a `hydrate`
+    /// trigger emits it. Earlier runtimes don't export it and always run
+    /// incremental hydration.
+    pub fn supports_incremental_hydration_runtime(&self) -> bool {
+        if self.major == 22 && self.minor == 0 && self.patch == 0 {
+            return match self.prerelease {
+                None => true,
+                Some(prerelease) => prerelease >= Prerelease::Next(11),
+            };
+        }
+        self.is_at_least(22, 0, 0)
+    }
+
     /// Check if this version is `major.minor.patch` or newer.
     ///
     /// Compares the release triple only: a prerelease of `22.3.0` counts as

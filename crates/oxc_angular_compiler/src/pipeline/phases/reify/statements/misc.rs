@@ -486,6 +486,19 @@ pub fn create_disable_bindings_stmt<'a>(
     )
 }
 
+/// Creates an ɵɵenableIncrementalHydrationRuntime() call statement.
+pub fn create_enable_incremental_hydration_runtime_stmt<'a>(
+    allocator: &'a oxc_allocator::Allocator,
+    core_namespace: &'a str,
+) -> OutputStatement<'a> {
+    create_instruction_call_stmt(
+        allocator,
+        core_namespace,
+        Identifiers::ENABLE_INCREMENTAL_HYDRATION_RUNTIME,
+        OxcVec::new_in(&allocator),
+    )
+}
+
 /// Creates an ɵɵenableBindings() call statement.
 pub fn create_enable_bindings_stmt<'a>(
     allocator: &'a oxc_allocator::Allocator,

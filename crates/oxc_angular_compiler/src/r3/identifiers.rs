@@ -621,6 +621,10 @@ impl Identifiers {
     /// Define projection.
     pub const PROJECTION_DEF: &'static str = "ɵɵprojectionDef";
 
+    /// Activate the incremental hydration runtime.
+    pub const ENABLE_INCREMENTAL_HYDRATION_RUNTIME: &'static str =
+        "ɵɵenableIncrementalHydrationRuntime";
+
     // ========================================================================
     // Reference Instructions
     // ========================================================================

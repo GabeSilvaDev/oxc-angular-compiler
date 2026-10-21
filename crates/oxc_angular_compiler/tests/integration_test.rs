@@ -929,6 +929,62 @@ fn test_hydrate_never_mutual_exclusivity() {
     );
 }
 
+#[test]
+fn test_hydrate_trigger_enables_incremental_hydration_runtime() {
+    let js = compile_template_to_js(
+        r"@defer (on idle) {a} @defer (hydrate on hover) {b} @defer (hydrate never) {c}",
+        "TestComponent",
+    );
+    assert_eq!(
+        js.matches("ɵɵenableIncrementalHydrationRuntime()").count(),
+        1,
+        "One activation call per view. Output:\n{js}"
+    );
+    let enable = js.find("ɵɵenableIncrementalHydrationRuntime()").unwrap();
+    let hydrating_defer = js.find("ɵɵdefer(4,").unwrap();
+    assert!(
+        js[..enable].contains("ɵɵdefer(1,") && enable < hydrating_defer,
+        "The call goes right before the first defer with hydrate triggers. Output:\n{js}"
+    );
+}
+
+#[test]
+fn test_hydrate_trigger_in_embedded_view_enables_runtime_in_that_view() {
+    let js = compile_template_to_js(
+        r"@defer (hydrate on idle) {a} @if (x) { @defer (hydrate on hover) {b} }",
+        "TestComponent",
+    );
+    assert_eq!(
+        js.matches("ɵɵenableIncrementalHydrationRuntime()").count(),
+        2,
+        "Each view with a hydrating defer block gets its own call. Output:\n{js}"
+    );
+}
+
+#[test]
+fn test_defer_without_hydrate_trigger_does_not_enable_runtime() {
+    let js = compile_template_to_js(r"@defer (on idle; prefetch on hover) {a}", "TestComponent");
+    assert!(!js.contains("ɵɵenableIncrementalHydrationRuntime"), "Output:\n{js}");
+}
+
+#[test]
+fn test_incremental_hydration_runtime_is_not_emitted_before_v22_next_11() {
+    let template = r"@defer (hydrate on idle) {a}";
+    for version in [AngularVersion::new(21, 2, 0), AngularVersion::parse("22.0.0-next.10").unwrap()]
+    {
+        let js = compile_template_to_js_with_version(template, "TestComponent", Some(version));
+        assert!(
+            !js.contains("ɵɵenableIncrementalHydrationRuntime"),
+            "The instruction does not exist before 22.0.0-next.11. Output:\n{js}"
+        );
+    }
+    for version in [AngularVersion::parse("22.0.0-next.11").unwrap(), AngularVersion::new(22, 0, 0)]
+    {
+        let js = compile_template_to_js_with_version(template, "TestComponent", Some(version));
+        assert!(js.contains("ɵɵenableIncrementalHydrationRuntime()"), "Output:\n{js}");
+    }
+}
+
 // ============================================================================
 // Let Declaration Tests
 // ============================================================================

@@ -318,6 +318,14 @@ impl<'a> ComponentCompilationJob<'a> {
         self.angular_version.map_or(true, |v: AngularVersion| v.supports_dom_property())
     }
 
+    /// Check if `ɵɵenableIncrementalHydrationRuntime` is supported (Angular 22.0.0-next.11+).
+    ///
+    /// Returns `true` when version is unknown (None = latest).
+    pub fn supports_incremental_hydration_runtime(&self) -> bool {
+        self.angular_version
+            .map_or(true, |v: AngularVersion| v.supports_incremental_hydration_runtime())
+    }
+
     /// Resolve whether safe navigation (`?.`) should use legacy null semantics.
     ///
     /// Returns `true` when `?.` must expand to the legacy `== null ? null` ternary,
