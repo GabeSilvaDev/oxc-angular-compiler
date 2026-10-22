@@ -13,18 +13,18 @@ static ɵfac = function NoStylesComponent_Factory(__ngFactoryType__) {
 static ɵcmp = /*@__PURE__*/ i0.ɵɵdefineComponent({type:NoStylesComponent,selectors:[["app-no-styles"]],
     decls:2,vars:0,template:function NoStylesComponent_Template(rf,ctx) {
       if ((rf & 1)) {
-        i0.ɵɵelementStart(0,"div");
+        i0.ɵɵdomElementStart(0,"div");
         i0.ɵɵtext(1,"No styles");
-        i0.ɵɵelementEnd();
+        i0.ɵɵdomElementEnd();
       }
     },encapsulation:2});
 }
 (() =>{
-  (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassDebugInfo(NoStylesComponent,
-      {className:"NoStylesComponent",filePath:"no-styles.component.ts",lineNumber:8}));
-})();
-(() =>{
   (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassMetadata(NoStylesComponent,
       [{type:Component,args:[{selector:"app-no-styles",template:"<div>No styles</div>"}]}],
       null,null));
+})();
+(() =>{
+  (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassDebugInfo(NoStylesComponent,
+      {className:"NoStylesComponent",filePath:"no-styles.component.ts",lineNumber:8}));
 })();

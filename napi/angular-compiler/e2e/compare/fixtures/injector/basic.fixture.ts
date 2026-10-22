@@ -84,4 +84,77 @@ export class FullModule {}
     `.trim(),
     expectedFeatures: ['defineInjector', 'defineNgModule', 'MODULE_PROVIDERS', 'CommonModule'],
   },
+  {
+    type: 'full-transform',
+    name: 'injector-with-spread-declarations',
+    category: 'injector',
+    description: 'NgModule whose declarations and imports use const arrays and spreads',
+    className: 'SpreadModule',
+    sourceCode: `
+import { Component, NgModule, Pipe } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+
+@Component({ selector: 'app-a', template: '', standalone: false })
+export class AComponent {}
+
+@Pipe({ name: 'b', standalone: false })
+export class BPipe {
+  transform(value: unknown) {
+    return value;
+  }
+}
+
+const DECLARATIONS = [AComponent];
+const SHARED = [CommonModule, FormsModule];
+
+@NgModule({
+  declarations: [...DECLARATIONS, BPipe],
+  imports: [SHARED],
+})
+export class SpreadModule {}
+    `.trim(),
+    expectedFeatures: ['defineInjector', 'defineNgModule', 'ɵɵsetNgModuleScope', 'SHARED'],
+  },
+  {
+    type: 'full-transform',
+    name: 'injector-with-exports',
+    category: 'injector',
+    description: 'NgModule whose exports, like its imports, are added to the injector imports',
+    className: 'ExportingModule',
+    sourceCode: `
+import { Component, NgModule } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+
+@Component({ selector: 'app-a', template: '', standalone: false })
+export class AComponent {}
+
+const SHARED = [CommonModule];
+
+@NgModule({
+  declarations: [AComponent],
+  imports: SHARED,
+  exports: [AComponent, FormsModule],
+})
+export class ExportingModule {}
+    `.trim(),
+    expectedFeatures: ['defineInjector', 'defineNgModule', 'ɵɵsetNgModuleScope', 'FormsModule'],
+  },
+  {
+    type: 'full-transform',
+    name: 'injector-extends-base-without-constructor',
+    category: 'injector',
+    description: 'NgModule that extends a base class without a constructor inherits its factory',
+    className: 'DerivedModule',
+    sourceCode: `
+import { NgModule } from '@angular/core';
+
+class BaseModule {}
+
+@NgModule({})
+export class DerivedModule extends BaseModule {}
+    `.trim(),
+    expectedFeatures: ['defineInjector', 'defineNgModule', 'ɵɵgetInheritedFactory'],
+  },
 ]

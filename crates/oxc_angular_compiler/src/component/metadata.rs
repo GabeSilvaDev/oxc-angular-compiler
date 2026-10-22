@@ -219,6 +219,39 @@ impl AngularVersion {
         self.is_at_least(22, 0, 0)
     }
 
+    /// Check if this version compiles component templates in DOM-only mode
+    /// (v20.1.0-next.3+).
+    ///
+    /// From that release a full build compiles the template of a standalone
+    /// component without directive dependencies with `ɵɵdomElementStart`,
+    /// `ɵɵdomListener`, `ɵɵdomProperty` and the other DOM-only instructions
+    /// (`TemplateCompilationMode.DomOnly`). `20.1.0-next.2` and earlier always
+    /// use the full instructions.
+    pub fn supports_dom_only_templates(&self) -> bool {
+        if self.major == 20 && self.minor == 1 && self.patch == 0 {
+            return match self.prerelease {
+                None => true,
+                Some(prerelease) => prerelease >= Prerelease::Next(3),
+            };
+        }
+        self.is_at_least(20, 1, 0)
+    }
+
+    /// Check if this version's `ShadowCss` still runs the legacy Shadow DOM
+    /// polyfill passes (before v22.0.0-rc.0).
+    ///
+    /// Until then `shimCssText` rewrote `polyfill-next-selector`,
+    /// `polyfill-rule` and `polyfill-unscoped-rule` blocks and replaced the
+    /// `::shadow` / `::content` combinators with a space. v22.0.0-rc.0 dropped
+    /// all four passes (`22.0.0-next.12` still has them), so a v22 stylesheet
+    /// scopes those tokens like any other selector text.
+    pub fn uses_shadow_css_polyfills(&self) -> bool {
+        if self.major == 22 && self.minor == 0 && self.patch == 0 {
+            return matches!(self.prerelease, Some(prerelease) if prerelease < Prerelease::Rc(0));
+        }
+        self.major < 22
+    }
+
     /// Check if this version is `major.minor.patch` or newer.
     ///
     /// Compares the release triple only: a prerelease of `22.3.0` counts as
@@ -514,6 +547,17 @@ pub struct ComponentMetadata<'a> {
     /// requires cross-file selector info OXC doesn't have.
     pub deferred_imports: Vec<'a, Ident<'a>>,
 
+    /// `true` when the decorator provably brings nothing into the template's
+    /// scope: `imports` and `deferredImports` are each absent or an empty
+    /// array literal, and the config object has no spread that could add
+    /// them. `false` when unknown.
+    ///
+    /// A standalone component whose scope is provably empty can only match
+    /// itself in its template, which is what a full ngtsc build checks before
+    /// compiling the template in DOM-only mode (`hasDirectiveDependencies` in
+    /// `packages/compiler-cli/src/ngtsc/annotations/component/src/handler.ts`).
+    pub imports_provably_empty: bool,
+
     /// Animation triggers for the component.
     ///
     /// Corresponds to the `animations` property in `@Component`.
@@ -563,6 +607,11 @@ pub struct HostDirectiveMetadata<'a> {
 
     /// Whether this is a forward reference (requires wrapping in a function).
     pub is_forward_reference: bool,
+
+    /// Whether `inputs` or `outputs` was written, even as an empty array.
+    /// ngtsc keeps those as non-null mappings, so the entry is passed to
+    /// `ɵɵHostDirectivesFeature` as `{ directive }` instead of the bare class.
+    pub has_mapping_keys: bool,
 }
 
 impl<'a> HostDirectiveMetadata<'a> {
@@ -574,6 +623,7 @@ impl<'a> HostDirectiveMetadata<'a> {
             inputs: Vec::new_in(&allocator),
             outputs: Vec::new_in(&allocator),
             is_forward_reference: false,
+            has_mapping_keys: false,
         }
     }
 
@@ -819,6 +869,7 @@ impl<'a> ComponentMetadata<'a> {
             declaration_list_emit_mode: DeclarationListEmitMode::default(),
             raw_imports: None,
             deferred_imports: Vec::new_in(&allocator),
+            imports_provably_empty: false,
             animations: None,
             schemas: Vec::new_in(&allocator),
             is_signal: false,
@@ -934,6 +985,58 @@ mod tests {
             parse("22.0.0-beta.1"),
         ] {
             assert!(!version.supports_incremental_hydration_runtime(), "{version:?}");
+        }
+    }
+
+    #[test]
+    fn dom_only_templates_start_at_20_1_0_next_3() {
+        let parse = |s| AngularVersion::parse(s).unwrap();
+
+        for version in [
+            parse("20.1.0-next.3"),
+            parse("20.1.0-rc.0"),
+            parse("20.1.0"),
+            parse("20.3.4"),
+            parse("21.0.0-next.0"),
+            parse("22.2.2"),
+        ] {
+            assert!(version.supports_dom_only_templates(), "{version:?}");
+        }
+
+        for version in [
+            parse("19.2.0"),
+            parse("20.0.7"),
+            parse("20.1.0-next.2"),
+            // Unknown tags parse to `Other`, below `next`.
+            parse("20.1.0-beta.1"),
+        ] {
+            assert!(!version.supports_dom_only_templates(), "{version:?}");
+        }
+    }
+
+    #[test]
+    fn shadow_css_polyfills_end_at_22_0_0_rc_0() {
+        let parse = |s| AngularVersion::parse(s).unwrap();
+
+        for version in [
+            parse("19.2.25"),
+            parse("20.3.18"),
+            parse("21.2.25"),
+            parse("22.0.0-next.12"),
+            // Unknown tags parse to `Other`, below `next`.
+            parse("22.0.0-beta.1"),
+        ] {
+            assert!(version.uses_shadow_css_polyfills(), "{version:?}");
+        }
+
+        for version in [
+            parse("22.0.0-rc.0"),
+            parse("22.0.0"),
+            parse("22.2.2"),
+            parse("23.0.0"),
+            AngularVersion::new(u32::MAX, 0, 0),
+        ] {
+            assert!(!version.uses_shadow_css_polyfills(), "{version:?}");
         }
     }
 }

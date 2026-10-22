@@ -9,7 +9,10 @@
 //!
 //! The goal is to have 1:1 compatibility with Angular's ShadowCss implementation.
 
-use oxc_angular_compiler::styles::{finalize_component_style, shim_css_text};
+use oxc_angular_compiler::AngularVersion;
+use oxc_angular_compiler::styles::{
+    finalize_component_style, shim_css_text, shim_css_text_for_version,
+};
 
 /// Normalize CSS for comparison (matches Angular's toEqualCss behavior).
 /// - Removes leading/trailing whitespace
@@ -37,6 +40,12 @@ fn shim(css: &str, content_attr: &str) -> String {
 fn shim_with_host(css: &str, content_attr: &str, host_attr: &str) -> String {
     shim_css_text(css, content_attr, host_attr)
 }
+
+/// The last Angular line that still runs the legacy polyfill passes.
+const V21: Option<AngularVersion> = Some(AngularVersion::new(21, 2, 0));
+
+/// The versions whose `ShadowCss` passes differ: latest and pre-v22.
+const SHIM_VERSIONS: [Option<AngularVersion>; 2] = [None, V21];
 
 /// Assert CSS equality with normalization.
 macro_rules! assert_css_eq {
@@ -330,12 +339,14 @@ fn test_multibyte_utf8_preserved_in_css_values() {
 fn test_finalize_preserves_unicode() {
     // Full pipeline with Sass-compiled CSS containing actual bullet character
     let css = ".test:after { content: \"\u{2022}\"; }";
-    let result = finalize_component_style(css, true, "_ngcontent-%COMP%", "_nghost-%COMP%", true);
+    let result =
+        finalize_component_style(css, true, "_ngcontent-%COMP%", "_nghost-%COMP%", true, None);
     assert!(result.contains('\u{2022}'), "Bullet lost in full pipeline: {result}");
 
     // With @charset prefix from Sass
     let css = "@charset \"UTF-8\";\n.test:after { content: \"\u{2022}\"; }";
-    let result = finalize_component_style(css, true, "_ngcontent-%COMP%", "_nghost-%COMP%", true);
+    let result =
+        finalize_component_style(css, true, "_ngcontent-%COMP%", "_nghost-%COMP%", true, None);
     assert!(result.contains('\u{2022}'), "Bullet lost with @charset: {result}");
 }
 
@@ -604,9 +615,9 @@ fn test_host_with_element() {
 fn test_host_context_single() {
     // Single :host-context() should generate two variants
     let result = shim_with_host(":host-context(.dark) {}", "contenta", "hosta");
-    // Generates: .dark[hosta], .dark [hosta]
-    assert!(result.contains(".dark[hosta]"));
-    assert!(result.contains(".dark [hosta]"));
+    // Generates: .dark[hosta], .dark [hosta]. The descendant form keeps the
+    // spaces Angular's combinator split emits.
+    assert_eq!(result, ".dark[hosta], .dark   [hosta] {}");
 }
 
 #[test]
@@ -614,16 +625,13 @@ fn test_host_context_multiple_permutations() {
     // Multiple :host-context() should generate permutations
     let result = shim_with_host(":host-context(.one):host-context(.two) {}", "contenta", "hosta");
 
-    // Should generate 3 permutations x 2 variants = 6 total
-    // Compound: .one.two
-    assert!(result.contains(".one.two[hosta]"));
-    assert!(result.contains(".one.two [hosta]"));
-
-    // .one ancestor of .two
-    assert!(result.contains(".one .two[hosta]") || result.contains(".one .two [hosta]"));
-
-    // .two ancestor of .one
-    assert!(result.contains(".two .one[hosta]") || result.contains(".two .one [hosta]"));
+    // 3 permutations (.one.two, .one .two, .two .one) x 2 variants, exactly
+    // as `@angular/compiler` 22.2.2 emits them.
+    assert_eq!(
+        result,
+        ".one.two[hosta], .one.two   [hosta], .one   .two[hosta], .one   .two   [hosta], \
+         .two   .one[hosta], .two   .one   [hosta] {}"
+    );
 }
 
 #[test]
@@ -1147,8 +1155,14 @@ fn test_comment_glued_stylesheet_stays_scoped_through_finalize() {
 ";
 
     for minify in [false, true] {
-        let result =
-            finalize_component_style(css, true, "_ngcontent-%COMP%", "_nghost-%COMP%", minify);
+        let result = finalize_component_style(
+            css,
+            true,
+            "_ngcontent-%COMP%",
+            "_nghost-%COMP%",
+            minify,
+            None,
+        );
         assert!(!result.contains("%COMMENT"), "placeholder leaked (minify={minify}):\n{result}");
         for selector in [".probe", ".widget", ".container.sticky-header"] {
             assert!(
@@ -1195,8 +1209,10 @@ fn test_comment_placeholder_never_leaks_into_output() {
     // placeholders carried their comment index, every `:host-context()` case
     // below leaked one: each duplicated placeholder consumed the *next*
     // comment, so the last one ran out and was left in the output verbatim.
-    for css in PLACEHOLDER_STRESS_CASES {
-        let result = shim_with_host(css, "contenta", "hosta");
+    for (css, version) in
+        PLACEHOLDER_STRESS_CASES.iter().flat_map(|c| SHIM_VERSIONS.map(|v| (c, v)))
+    {
+        let result = shim_css_text_for_version(css, "contenta", "hosta", version);
         assert!(!result.contains("%COMMENT"), "placeholder leaked for {css:?}:\n{result}");
     }
 }
@@ -1207,9 +1223,11 @@ fn test_sourcemap_comment_survives_placeholder_duplication() {
     // placeholder is directly visible: before the fix the duplicated
     // `:host-context()` placeholder consumed this comment and teleported it
     // into the middle of a selector, leaving `%COMMENT%` at the real position.
-    for css in PLACEHOLDER_STRESS_CASES {
+    for (css, version) in
+        PLACEHOLDER_STRESS_CASES.iter().flat_map(|c| SHIM_VERSIONS.map(|v| (c, v)))
+    {
         let with_map = format!("{css}\n/*# sourceMappingURL=x.map */");
-        let result = shim_with_host(&with_map, "contenta", "hosta");
+        let result = shim_css_text_for_version(&with_map, "contenta", "hosta", version);
         // It must still occupy its own line - the teleport spliced it into the
         // middle of a selector. (`polyfill-unscoped-rule` legitimately appends
         // its rule after this line, so don't require it to be last.)
@@ -1286,7 +1304,7 @@ fn test_comment_placeholder_indices_are_independent_of_position() {
     // must not shift the comments that follow it onto the wrong placeholders.
     let css = "polyfill-next-selector { content: ':host .a'; }/* dropped */::content .b { color: red; }\n\
                /*# sourceMappingURL=x.map */";
-    let result = shim_with_host(css, "contenta", "hosta");
+    let result = shim_css_text_for_version(css, "contenta", "hosta", V21);
     assert!(result.contains("/*# sourceMappingURL=x.map */"), "{result}");
     assert!(!result.contains("%COMMENT"), "{result}");
 }
@@ -1305,4 +1323,563 @@ fn test_host_pseudo_with_newline_combinator() {
     let css = ":host(:hover)\n.child { color: red; }";
     let expected = "[hosta]:hover .child[contenta] { color: red; }";
     assert_css_eq!(shim_with_host(css, "contenta", "hosta"), expected);
+}
+
+// ============================================================================
+// Alignment with Angular v22 `shadow_css.ts`. Expected strings are the exact
+// output of `@angular/compiler`'s `encapsulateStyle` (22.2.2), not normalized.
+// ============================================================================
+
+const NG_CONTENT: &str = "_ngcontent-%COMP%";
+const NG_HOST: &str = "_nghost-%COMP%";
+
+fn ng_shim(css: &str) -> String {
+    shim_css_text(css, NG_CONTENT, NG_HOST)
+}
+
+#[test]
+fn test_output_is_trimmed() {
+    assert_eq!(ng_shim("  .a { color: red; }  \n\n"), ".a[_ngcontent-%COMP%] { color: red; }");
+    assert_eq!(ng_shim("\n\n.a {}\n"), ".a[_ngcontent-%COMP%] {}");
+    assert_eq!(ng_shim("   "), "");
+    // Angular trims before restoring comments, so newlines kept from a
+    // trailing comment survive the trim.
+    assert_eq!(ng_shim(".a { } \n/* trailing */\n"), ".a[_ngcontent-%COMP%] { } \n");
+    assert_eq!(ng_shim("\n\n/*# sourceMappingURL=x.map */"), "/*# sourceMappingURL=x.map */");
+}
+
+#[test]
+fn test_whitespace_before_closing_brace_is_kept() {
+    // The whitespace between a rule's `}` and its at-rule's `}` was dropped.
+    assert_eq!(
+        ng_shim("@media screen { .a { color: red; } }"),
+        "@media screen { .a[_ngcontent-%COMP%] { color: red; } }"
+    );
+    assert_eq!(
+        ng_shim("@keyframes foo { 0% { opacity: 0 } 100% { opacity: 1 } }"),
+        "@keyframes _ngcontent-%COMP%_foo { 0% { opacity: 0 } 100% { opacity: 1 } }"
+    );
+}
+
+#[test]
+fn test_text_before_closing_brace_stays_in_place() {
+    // Text with no `{` before a `}` is not a rule. It used to be carried into
+    // the next selector (`b c {}`); Angular leaves it unscoped where it was.
+    assert_eq!(
+        ng_shim("@media screen { .a {} b } c {}"),
+        "@media screen { .a[_ngcontent-%COMP%] {} b } c[_ngcontent-%COMP%] {}"
+    );
+    assert_eq!(ng_shim(".a {} b } c {}"), ".a[_ngcontent-%COMP%] {} b } c[_ngcontent-%COMP%] {}");
+    assert_eq!(
+        ng_shim("@media screen { .a { color: red; } .b }"),
+        "@media screen { .a[_ngcontent-%COMP%] { color: red; } .b }"
+    );
+}
+
+#[test]
+fn test_escaped_quote_does_not_end_string() {
+    // An escaped quote used to end the string early, so the rest of the
+    // stylesheet was read as one string and left unscoped.
+    assert_eq!(
+        ng_shim(".a { content: \"\\\"\"; } .b { color: red; }"),
+        ".a[_ngcontent-%COMP%] { content: \"\\\"\"; } .b[_ngcontent-%COMP%] { color: red; }"
+    );
+    assert_eq!(
+        ng_shim(".a { content: '\\''; } .b { color: red; }"),
+        ".a[_ngcontent-%COMP%] { content: '\\''; } .b[_ngcontent-%COMP%] { color: red; }"
+    );
+    assert_eq!(
+        ng_shim(".a { content: \"\\\\\"; } .b {}"),
+        ".a[_ngcontent-%COMP%] { content: \"\\\\\"; } .b[_ngcontent-%COMP%] {}"
+    );
+    assert_eq!(
+        ng_shim(".a[title=\"x\\\"y\"] { color: red; } .b {}"),
+        ".a[title=\"x\\\"y\"][_ngcontent-%COMP%] { color: red; } .b[_ngcontent-%COMP%] {}"
+    );
+    // The `:host-context()` pass has its own string scanner.
+    assert_eq!(
+        normalize_css(&ng_shim(":host-context(.a) { content: \"\\\"\"; } .b {}")),
+        normalize_css(
+            ".a[_nghost-%COMP%], .a [_nghost-%COMP%] { content: \"\\\"\"; } \
+             .b[_ngcontent-%COMP%] {}"
+        )
+    );
+}
+
+#[test]
+fn test_escaped_quote_outside_string_opens_no_string() {
+    // Like Angular's `escapeInStrings`/`escapeBlocks`, a backslash outside a
+    // string escapes the next character. An escaped quote in a selector used
+    // to open a string that the in-string escape handling then never closed,
+    // so the rule and every later one were left unscoped. Expected values are
+    // @angular/compiler 22.2.2's `encapsulateStyle` output.
+    assert_eq!(
+        ng_shim(".x\\'y\\'{ color: red; }.b{ color: blue; }"),
+        ".x\\'y\\'[_ngcontent-%COMP%]{ color: red; }.b[_ngcontent-%COMP%]{ color: blue; }"
+    );
+    assert_eq!(
+        ng_shim(":host .x\\'y{ color: red; } :host .b{ color: blue; }"),
+        "[_nghost-%COMP%]   .x\\'y[_ngcontent-%COMP%]{ color: red; } \
+         [_nghost-%COMP%]   .b[_ngcontent-%COMP%]{ color: blue; }"
+    );
+    assert_eq!(
+        ng_shim("@media screen{.x\\'y{ color: red; }} .b{ color: blue; }"),
+        "@media screen{.x\\'y[_ngcontent-%COMP%]{ color: red; }} .b[_ngcontent-%COMP%]{ color: blue; }"
+    );
+    assert_eq!(
+        ng_shim("@font-face{ font-family: \\'x; } .b{ color: blue; }"),
+        "@font-face{ font-family: \\'x; } .b[_ngcontent-%COMP%]{ color: blue; }"
+    );
+    assert_eq!(
+        ng_shim("@keyframes k{from\\'{ a: b; }} .b{ color: blue; }"),
+        "@keyframes _ngcontent-%COMP%_k{from\\'{ a: b; }} .b[_ngcontent-%COMP%]{ color: blue; }"
+    );
+    assert_eq!(
+        ng_shim(".a\\\\{ color: red; } .b{ color: blue; }"),
+        ".a\\\\[_ngcontent-%COMP%]{ color: red; } .b[_ngcontent-%COMP%]{ color: blue; }"
+    );
+    assert_eq!(ng_shim(".a{} .b\\"), ".a[_ngcontent-%COMP%]{} .b\\");
+}
+
+#[test]
+fn test_tailwind_escaped_quotes_in_class_names() {
+    // Tailwind arbitrary values escape their quotes and brackets. Angular's
+    // `SafeSelector` turns the `[...]` into a placeholder before the `\_`
+    // escape is taken, so `__ph-0__` is never restored; Oxc matches that.
+    assert_eq!(
+        ng_shim(".font-\\[\\'Inter\\'\\]{ font-family: Inter; } .b{ color: blue; }"),
+        ".font-\\__ph-0__[_ngcontent-%COMP%]{ font-family: Inter; } .b[_ngcontent-%COMP%]{ color: blue; }"
+    );
+    assert_eq!(
+        ng_shim(".font-\\[\\\"Inter\\\"\\]{ font-family: Inter; } .b{ color: blue; }"),
+        ".font-\\__ph-0__[_ngcontent-%COMP%]{ font-family: Inter; } .b[_ngcontent-%COMP%]{ color: blue; }"
+    );
+}
+
+#[test]
+fn test_escaped_brace_and_at_outside_string() {
+    // `\{`, `\}` and `\@` open or close no block and start no at-rule.
+    assert_eq!(
+        ng_shim(".a\\{b{ color: red; } .c{ color: blue; }"),
+        ".a\\{b[_ngcontent-%COMP%]{ color: red; } .c[_ngcontent-%COMP%]{ color: blue; }"
+    );
+    assert_eq!(
+        ng_shim(".a\\}b{ color: red; } .c{ color: blue; }"),
+        ".a\\}b[_ngcontent-%COMP%]{ color: red; } .c[_ngcontent-%COMP%]{ color: blue; }"
+    );
+    assert_eq!(
+        ng_shim(".a{ content: \\}; } .c{ color: blue; }"),
+        ".a[_ngcontent-%COMP%]{ content: \\}; } .c[_ngcontent-%COMP%]{ color: blue; }"
+    );
+    assert_eq!(
+        ng_shim(".a\\@media{ color: red; } .c{ color: blue; }"),
+        ".a\\@media[_ngcontent-%COMP%]{ color: red; } .c[_ngcontent-%COMP%]{ color: blue; }"
+    );
+    // `_ruleRe` still reads no brace into a selector, so the text up to an
+    // escaped one is left unscoped, as Angular leaves it.
+    assert_eq!(ng_shim(".a\\{ .b{}"), ".a\\{ .b[_ngcontent-%COMP%]{}");
+    assert_eq!(ng_shim(".a\\} .b{}"), ".a\\} .b[_ngcontent-%COMP%]{}");
+    assert_eq!(
+        ng_shim(".a, .b\\{ .c, .d{ color: red; } .e{}"),
+        ".a, .b\\{ .c[_ngcontent-%COMP%], .d[_ngcontent-%COMP%]{ color: red; } .e[_ngcontent-%COMP%]{}"
+    );
+    assert_eq!(
+        ng_shim("@media x{.a\\{ .b{}} .c{}"),
+        "@media x{.a\\{ .b[_ngcontent-%COMP%]{}} .c[_ngcontent-%COMP%]{}"
+    );
+    // An escaped brace ends an at-rule header the same way, so the next rule
+    // is scoped on its own.
+    assert_eq!(
+        ng_shim("@media x\\{ .a{} } .b{}"),
+        "@media x\\{ .a[_ngcontent-%COMP%]{} } .b[_ngcontent-%COMP%]{}"
+    );
+    assert_eq!(ng_shim("@media x\\{ .a{}"), "@media x\\{ .a[_ngcontent-%COMP%]{}");
+    // Angular leaves the host marker in that unscoped text too.
+    assert_eq!(
+        ng_shim(":host .a\\{b{}"),
+        "-shadowcsshost-no-combinator .a\\{b[_ngcontent-%COMP%]{}"
+    );
+}
+
+#[test]
+fn test_long_selector_list_scopes_in_linear_time() {
+    // Finding whether a comma or combinator sits inside parentheses used to
+    // scan to the end of the selector each time, quadratic in its length: this
+    // ~250k-char list took 3.6s in a debug build, and takes about 0.1s now.
+    let items: Vec<String> = (0..10_000).map(|i| format!(".a{i} > .b:not(.x, .y)")).collect();
+    let selector = items.join(", ");
+    assert!(selector.len() > 200_000);
+    let expected = (0..10_000)
+        .map(|i| format!(".a{i}[_ngcontent-%COMP%]    > .b[_ngcontent-%COMP%]:not(.x, .y)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let start = std::time::Instant::now();
+    let scoped = ng_shim(&format!("{selector} {{}}"));
+    let elapsed = start.elapsed();
+    assert_eq!(scoped, format!("{expected} {{}}"));
+    assert!(elapsed.as_secs() < 2, "scoping a 250k-char selector list took {elapsed:?}");
+}
+
+#[test]
+fn test_host_context_inside_conditional_at_rules() {
+    // `:host-context()` was only rewritten at the top level, leaving a
+    // literal `[_ngcontent-%COMP%]:host-context(.dark)` inside `@media`.
+    // (Angular keeps the three spaces around the descendant combinator; the
+    // shim collapses them, see `assert_css_eq!`.)
+    assert_css_eq!(
+        ng_shim("@media screen { :host-context(.dark) .a { color: red; } }"),
+        "@media screen { .dark[_nghost-%COMP%] .a[_ngcontent-%COMP%], \
+         .dark [_nghost-%COMP%] .a[_ngcontent-%COMP%] { color: red; } }"
+    );
+    assert_css_eq!(
+        ng_shim("@supports (display: grid) { :host-context(.dark) { color: red; } }"),
+        "@supports (display: grid) { .dark[_nghost-%COMP%], .dark [_nghost-%COMP%] { color: red; } }"
+    );
+    assert_css_eq!(
+        ng_shim("@media screen { @supports (x: y) { :host-context(.a, .b) p { color: red; } } }"),
+        "@media screen { @supports (x: y) { \
+         .a[_nghost-%COMP%] p[_ngcontent-%COMP%], .a [_nghost-%COMP%] p[_ngcontent-%COMP%], \
+         .b[_nghost-%COMP%] p[_ngcontent-%COMP%], .b [_nghost-%COMP%] p[_ngcontent-%COMP%] \
+         { color: red; } } }"
+    );
+    assert_css_eq!(
+        ng_shim("@media screen { :host-context(.a):host-context(.b) .c {} }"),
+        "@media screen { \
+         .a.b[_nghost-%COMP%] .c[_ngcontent-%COMP%], .a.b [_nghost-%COMP%] .c[_ngcontent-%COMP%], \
+         .a .b[_nghost-%COMP%] .c[_ngcontent-%COMP%], .a .b [_nghost-%COMP%] .c[_ngcontent-%COMP%], \
+         .b .a[_nghost-%COMP%] .c[_ngcontent-%COMP%], .b .a [_nghost-%COMP%] .c[_ngcontent-%COMP%] {} }"
+    );
+    assert_css_eq!(
+        ng_shim("@layer base { :host-context([dir=rtl]) .a { margin-left: 0; } }"),
+        "@layer base { [dir=rtl][_nghost-%COMP%] .a[_ngcontent-%COMP%], \
+         [dir=rtl] [_nghost-%COMP%] .a[_ngcontent-%COMP%] { margin-left: 0; } }"
+    );
+}
+
+#[test]
+fn test_unscoped_at_rule_bodies_are_copied_unchanged() {
+    // Only `@media`, `@supports`, `@document`, `@layer`, `@container`,
+    // `@scope` and `@starting-style` have their body scoped. A declaration
+    // body used to be read as a selector and split off the at-rule
+    // (`@property --x {} syntax: ...`).
+    for css in [
+        "@property --x { syntax: '<length>'; inherits: false; initial-value: 0px; }",
+        "@counter-style thumbs { system: cyclic; symbols: \"\u{1F44D}\"; suffix: \" \"; }",
+        "@font-feature-values Font One { @styleset { nice-style: 12; } }",
+        "@view-transition { navigation: auto; }",
+        "@position-try --custom { top: anchor(bottom); }",
+        "@font-face { font-family: X; src: url(x.woff); }",
+        "@unknown-rule foo { .a { color: red; } }",
+        // The header is matched case-sensitively, like Angular.
+        "@MEDIA screen { .a { color: red; } }",
+    ] {
+        assert_eq!(ng_shim(css), css);
+    }
+    assert_eq!(
+        ng_shim("@property --x { initial-value: \"}\"; } .a {}"),
+        "@property --x { initial-value: \"}\"; } .a[_ngcontent-%COMP%] {}"
+    );
+    assert_eq!(
+        ng_shim("@font-feature-values Font One { @styleset { nice-style: 12; } } .a {}"),
+        "@font-feature-values Font One { @styleset { nice-style: 12; } } .a[_ngcontent-%COMP%] {}"
+    );
+    // Scoped at-rules still are.
+    for (css, expected) in [
+        (
+            "@container (min-width: 1px) { .a { color: red; } }",
+            "@container (min-width: 1px) { .a[_ngcontent-%COMP%] { color: red; } }",
+        ),
+        (
+            "@scope (.card) { img { border: 1px; } }",
+            "@scope (.card) { img[_ngcontent-%COMP%] { border: 1px; } }",
+        ),
+        (
+            "@starting-style { .a { opacity: 0; } }",
+            "@starting-style { .a[_ngcontent-%COMP%] { opacity: 0; } }",
+        ),
+        (
+            "@document url(http://x) { .a { color: red; } }",
+            "@document url(http://x) { .a[_ngcontent-%COMP%] { color: red; } }",
+        ),
+        (
+            "@media screen { @font-face { font-family: X; } .a {} }",
+            "@media screen { @font-face { font-family: X; } .a[_ngcontent-%COMP%] {} }",
+        ),
+    ] {
+        assert_eq!(ng_shim(css), expected);
+    }
+}
+
+#[test]
+fn test_at_sign_in_values_does_not_start_an_at_rule() {
+    // An unquoted `@` in the last declaration of a rule (`url(a@2x.png)`,
+    // common in minified CSS) opened an at-rule header that swallowed the
+    // rule's `}` and left every later rule unscoped.
+    for (css, expected) in [
+        (
+            ".a{background:url(a@2x.png)}.b{color:red}.c{color:blue}.d{x:y}",
+            ".a[_ngcontent-%COMP%]{background:url(a@2x.png)}.b[_ngcontent-%COMP%]{color:red}.c[_ngcontent-%COMP%]{color:blue}.d[_ngcontent-%COMP%]{x:y}",
+        ),
+        (
+            ".a{background:url(#m@x)}.b{}.c{}",
+            ".a[_ngcontent-%COMP%]{background:url(#m@x)}.b[_ngcontent-%COMP%]{}.c[_ngcontent-%COMP%]{}",
+        ),
+        (
+            ".a{b:image-set(url(a@1x.png) 1x, url(a@2x.png) 2x)}.b{c:d}",
+            ".a[_ngcontent-%COMP%]{b:image-set(url(a@1x.png) 1x, url(a@2x.png) 2x)}.b[_ngcontent-%COMP%]{c:d}",
+        ),
+        (
+            "@media (min-width: 1px) { .a{background:url(a@2x.png)} .b{c:d} } .c{e:f}",
+            "@media (min-width: 1px) { .a[_ngcontent-%COMP%]{background:url(a@2x.png)} .b[_ngcontent-%COMP%]{c:d} } .c[_ngcontent-%COMP%]{e:f}",
+        ),
+        // An `@` in an at-rule header does not restart the header.
+        (
+            "@supports (background: url(a@2x.png)) { .a{c:d} } .b{c:d}",
+            "@supports (background: url(a@2x.png)) { .a[_ngcontent-%COMP%]{c:d} } .b[_ngcontent-%COMP%]{c:d}",
+        ),
+        // Nested at-rules inside a rule body are copied unchanged.
+        (
+            ".a{@media x{color:red}} .b{c:d}",
+            ".a[_ngcontent-%COMP%]{@media x{color:red}} .b[_ngcontent-%COMP%]{c:d}",
+        ),
+    ] {
+        assert_eq!(ng_shim(css), expected);
+    }
+}
+
+#[test]
+fn test_legacy_polyfills_follow_angular_version() {
+    // Angular v22.0.0-rc.0 removed the polyfill passes.
+    let css = "polyfill-next-selector {content: 'x > y'} z {}";
+    assert_eq!(
+        ng_shim(css),
+        "polyfill-next-selector[_ngcontent-%COMP%] {content: 'x > y'} z[_ngcontent-%COMP%] {}"
+    );
+    assert_css_eq!(
+        shim_css_text_for_version(css, NG_CONTENT, NG_HOST, V21),
+        "x[_ngcontent-%COMP%] > y[_ngcontent-%COMP%] {}"
+    );
+
+    let css = "polyfill-unscoped-rule {content: '#menu > .bar';color: blue;}";
+    assert_eq!(
+        ng_shim(css),
+        "polyfill-unscoped-rule[_ngcontent-%COMP%] {content: '#menu > .bar';color: blue;}"
+    );
+    assert_css_eq!(
+        shim_css_text_for_version(css, NG_CONTENT, NG_HOST, V21),
+        "#menu > .bar { color: blue; }"
+    );
+
+    assert_eq!(
+        ng_shim("x::content y {}"),
+        "x[_ngcontent-%COMP%]::content   y[_ngcontent-%COMP%] {}"
+    );
+    assert_css_eq!(
+        shim_css_text_for_version("x::shadow > y {}", NG_CONTENT, NG_HOST, V21),
+        "x[_ngcontent-%COMP%] > y[_ngcontent-%COMP%] {}"
+    );
+
+    // v22 prereleases before rc.0 still had them.
+    let next_12 = AngularVersion::parse("22.0.0-next.12");
+    assert_css_eq!(
+        shim_css_text_for_version("x::content y {}", NG_CONTENT, NG_HOST, next_12),
+        "x[_ngcontent-%COMP%] y[_ngcontent-%COMP%] {}"
+    );
+    let rc_0 = AngularVersion::parse("22.0.0-rc.0");
+    assert_eq!(
+        shim_css_text_for_version("x::content y {}", NG_CONTENT, NG_HOST, rc_0),
+        "x[_ngcontent-%COMP%]::content   y[_ngcontent-%COMP%] {}"
+    );
+}
+
+#[test]
+fn test_finalize_component_style_threads_angular_version() {
+    let css = "x::content y {}";
+    assert_eq!(
+        finalize_component_style(css, true, NG_CONTENT, NG_HOST, false, None),
+        "x[_ngcontent-%COMP%]::content   y[_ngcontent-%COMP%] {}"
+    );
+    assert_css_eq!(
+        finalize_component_style(css, true, NG_CONTENT, NG_HOST, false, V21),
+        "x[_ngcontent-%COMP%] y[_ngcontent-%COMP%] {}"
+    );
+}
+
+// ============================================================================
+// Selector whitespace, exactly as `@angular/compiler` 22.2.2 (and 22.1.8 where
+// the versions differ) emits it. `_applySelectorScope` writes each part as
+// `${scopedPart} ${separator} ` and `_scopeSelector` joins the parts around a
+// `::ng-deep` with a space, so runs of spaces are part of Angular's output.
+// ============================================================================
+
+/// The last release before `ShadowCss` gained its CSS nesting support.
+const V22_1: Option<AngularVersion> = Some(AngularVersion::new(22, 1, 8));
+
+fn ng_shim_for(css: &str, version: Option<AngularVersion>) -> String {
+    shim_css_text_for_version(css, NG_CONTENT, NG_HOST, version)
+}
+
+#[test]
+fn test_combinators_keep_angular_spacing() {
+    for version in [None, V22_1] {
+        assert_eq!(
+            ng_shim_for("one two {}", version),
+            "one[_ngcontent-%COMP%]   two[_ngcontent-%COMP%] {}"
+        );
+        assert_eq!(
+            ng_shim_for("one > two {}", version),
+            "one[_ngcontent-%COMP%]    > two[_ngcontent-%COMP%] {}"
+        );
+        assert_eq!(
+            ng_shim_for("one + two {} one ~ two {}", version),
+            "one[_ngcontent-%COMP%]    + two[_ngcontent-%COMP%] {} \
+             one[_ngcontent-%COMP%]    ~ two[_ngcontent-%COMP%] {}"
+        );
+        assert_eq!(
+            ng_shim_for("li:nth-child(2n + 1) a {}", version),
+            "li[_ngcontent-%COMP%]:nth-child(2n + 1)   a[_ngcontent-%COMP%] {}"
+        );
+        // A space ending a hex escape is not a combinator.
+        assert_eq!(ng_shim_for(".\\fc ber {}", version), ".\\fc ber[_ngcontent-%COMP%] {}");
+    }
+}
+
+#[test]
+fn test_deep_combinators_keep_angular_spacing() {
+    assert_eq!(
+        ng_shim("x >>> y {} x /deep/ y {} x ::ng-deep y {}"),
+        "x[_ngcontent-%COMP%]     y {} x[_ngcontent-%COMP%]     y {} x[_ngcontent-%COMP%]     y {}"
+    );
+    assert_eq!(ng_shim(":host ::ng-deep .x {}"), "[_nghost-%COMP%]     .x {}");
+}
+
+#[test]
+fn test_selector_list_keeps_whitespace_around_commas() {
+    // `_selectorSplitRe` only takes one space on each side of the comma.
+    assert_eq!(ng_shim(".foo,\n.bar {}"), ".foo[_ngcontent-%COMP%], \n.bar[_ngcontent-%COMP%] {}");
+    assert_eq!(
+        ng_shim(".a , .b,.c {}"),
+        ".a[_ngcontent-%COMP%], .b[_ngcontent-%COMP%], .c[_ngcontent-%COMP%] {}"
+    );
+    // A comma inside a string does not split the list.
+    assert_eq!(
+        ng_shim("a[title=\"a,b\"], c {}"),
+        "a[title=\"a,b\"][_ngcontent-%COMP%], c[_ngcontent-%COMP%] {}"
+    );
+}
+
+#[test]
+fn test_host_context_permutations_in_angular_order() {
+    assert_eq!(
+        ng_shim(":host-context(.X):host-context(.Y):host-context(.Z) {}"),
+        ".X.Y.Z[_nghost-%COMP%], .X.Y.Z   [_nghost-%COMP%], .X.Y   .Z[_nghost-%COMP%], \
+         .X.Y   .Z   [_nghost-%COMP%], .X.Z   .Y[_nghost-%COMP%], .X.Z   .Y   [_nghost-%COMP%], \
+         .X   .Y.Z[_nghost-%COMP%], .X   .Y.Z   [_nghost-%COMP%], .X   .Y   .Z[_nghost-%COMP%], \
+         .X   .Y   .Z   [_nghost-%COMP%], .X   .Z   .Y[_nghost-%COMP%], .X   .Z   .Y   [_nghost-%COMP%], \
+         .Y.Z   .X[_nghost-%COMP%], .Y.Z   .X   [_nghost-%COMP%], .Y   .Z   .X[_nghost-%COMP%], \
+         .Y   .Z   .X   [_nghost-%COMP%], .Z   .Y   .X[_nghost-%COMP%], .Z   .Y   .X   [_nghost-%COMP%] {}"
+    );
+    assert_eq!(
+        ng_shim(":host-context(.a) .b, .c {}"),
+        ".a[_nghost-%COMP%]   .b[_ngcontent-%COMP%], .a   [_nghost-%COMP%]   .b[_ngcontent-%COMP%], \
+         .c[_ngcontent-%COMP%] {}"
+    );
+    assert_eq!(
+        ng_shim(":where(:host-context(.a)) {}"),
+        ":where(.a[_nghost-%COMP%]), :where(.a   [_nghost-%COMP%]) {}"
+    );
+}
+
+#[test]
+fn test_host_matches_case_insensitively() {
+    assert_eq!(
+        ng_shim(":HOST(.a) :Host-Context(.b) {}"),
+        ".a[_nghost-%COMP%]   .b[_nghost-%COMP%], .b   [_nghost-%COMP%] {}"
+    );
+    // A selector list inside `:host()` is put back as a literal `:host(...)`.
+    assert_eq!(
+        ng_shim(":host(.a, .b) .c {}"),
+        "[_ngcontent-%COMP%]:host(.a, .b)   .c[_ngcontent-%COMP%] {}"
+    );
+}
+
+#[test]
+fn test_css_nesting_era_selectors() {
+    // v22.2 leaves `&` and rules without a block unscoped.
+    assert_eq!(
+        ng_shim("& .a {} .b & {}"),
+        "&   .a[_ngcontent-%COMP%] {} .b[_ngcontent-%COMP%]   & {}"
+    );
+    assert_eq!(
+        ng_shim_for("& .a {} .b & {}", V22_1),
+        "&[_ngcontent-%COMP%]   .a[_ngcontent-%COMP%] {} .b[_ngcontent-%COMP%]   &[_ngcontent-%COMP%] {}"
+    );
+    assert_eq!(ng_shim(".a; .b {}"), ".a; .b[_ngcontent-%COMP%] {}");
+    assert_eq!(ng_shim_for(".a; .b {}", V22_1), ".a[_ngcontent-%COMP%]; .b[_ngcontent-%COMP%] {}");
+}
+
+#[test]
+fn test_css_nesting_era_strips_rule_bodies() {
+    // v22.2 strips the host marker and deep combinators from a rule body.
+    let css = ".a { content: \":host.foo .bar\"; color: red; }";
+    assert_eq!(ng_shim(css), ".a[_ngcontent-%COMP%] { content: \"  .bar\"; color: red; }");
+    assert_eq!(
+        ng_shim_for(css, V22_1),
+        ".a[_ngcontent-%COMP%] { content: \"-shadowcsshost-no-combinator.foo .bar\"; color: red; }"
+    );
+    let css = ".a ::ng-deep .b { content: \">>> x\"; }";
+    assert_eq!(ng_shim(css), ".a[_ngcontent-%COMP%]     .b { content: \"  x\"; }");
+    assert_eq!(ng_shim_for(css, V22_1), ".a[_ngcontent-%COMP%]     .b { content: \">>> x\"; }");
+    // `22.2.0-next.1` predates the change, `next.2` has it.
+    let next_1 = AngularVersion::parse("22.2.0-next.1");
+    let next_2 = AngularVersion::parse("22.2.0-next.2");
+    assert_eq!(ng_shim_for(css, next_1), ng_shim_for(css, V22_1));
+    assert_eq!(ng_shim_for(css, next_2), ng_shim(css));
+    // `@font-face` bodies are stripped in every version.
+    for version in [None, V22_1] {
+        assert_eq!(
+            ng_shim_for("@font-face { :host ::ng-deep font-family {} }", version),
+            "@font-face {     font-family {} }"
+        );
+    }
+}
+
+#[test]
+fn test_newline_combinator_scopes_both_sides() {
+    // Oxc deviation: Angular only splits on a space and emits `.foo\n.bar[c]`
+    // and `[h]:hover\n.child`, leaving `.foo` and `.child` unscoped.
+    assert_eq!(ng_shim(".foo\n.bar {}"), ".foo[_ngcontent-%COMP%]   .bar[_ngcontent-%COMP%] {}");
+    assert_eq!(
+        ng_shim(":host:hover\n.child {}"),
+        "[_nghost-%COMP%]:hover   .child[_ngcontent-%COMP%] {}"
+    );
+}
+
+#[test]
+fn test_newline_does_not_split_host_markers_angular_scopes_together() {
+    // A later `:host` is folded into the first `:host(...)` match as a bare
+    // marker, which Angular only turns into the host attribute while it is in
+    // the same part. A marker inside `:where()` alone would get the content
+    // attribute in front. So the newline split is skipped there, matching
+    // @angular/compiler 22.2.2 exactly.
+    assert_eq!(ng_shim(":host(.h)\n:host {}"), ".h[_nghost-%COMP%]\n[_nghost-%COMP%] {}");
+    assert_eq!(
+        ng_shim(":host(.a)\n:not(:host) {}"),
+        ".a[_nghost-%COMP%]\n:not([_nghost-%COMP%]) {}"
+    );
+    assert_eq!(
+        ng_shim(":host(.h)\n:where(:host) {}"),
+        ".h[_nghost-%COMP%]\n:where([_nghost-%COMP%]) {}"
+    );
+    assert_eq!(
+        ng_shim(".x, :where(:host)\t:host-context(.k) {}"),
+        ".x[_ngcontent-%COMP%], :where([_nghost-%COMP%])\t.k[_nghost-%COMP%], .k   [_nghost-%COMP%] {}"
+    );
+    // Other parts of the same selector still split on a newline, as if it
+    // were a space (`.p .q :host(.h)` leaves `.p` and `.q` unscoped too).
+    assert_eq!(
+        ng_shim(".p\n.q :host(.h)\n:host {}"),
+        ".p   .q   .h[_nghost-%COMP%]\n[_nghost-%COMP%] {}"
+    );
 }

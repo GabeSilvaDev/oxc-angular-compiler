@@ -10,14 +10,18 @@
 //! ## Generated Output
 //!
 //! ```javascript
-//! // Module definition:
+//! // Module definition (the scope is patched on below):
 //! AppModule.ɵmod = /*@__PURE__*/ i0.ɵɵdefineNgModule({
 //!   type: AppModule,
-//!   bootstrap: [AppComponent],
-//!   declarations: [MyComponent],
-//!   imports: [CommonModule],
-//!   exports: [MyComponent]
+//!   bootstrap: [AppComponent]
 //! });
+//! (function() {
+//!   i0.ɵɵsetNgModuleScope(AppModule, {
+//!     declarations: [MyComponent],
+//!     imports: [CommonModule],
+//!     exports: [MyComponent]
+//!   });
+//! })();
 //!
 //! // Factory function:
 //! AppModule.ɵfac = function AppModule_Factory(__ngFactoryType__) {
@@ -101,11 +105,10 @@ pub struct FullNgModuleDefinition<'a> {
 ///   exports: [MyComponent]
 /// });
 ///
-/// // Module with side-effect scope (for tree-shaking):
+/// // Module with side-effect scope (not ngJitMode-guarded, see compiler.rs):
 /// AppModule.ɵmod = /*@__PURE__*/ i0.ɵɵdefineNgModule({ type: AppModule });
 /// (function() {
-///   (typeof ngJitMode === "undefined" || ngJitMode) &&
-///     i0.ɵɵsetNgModuleScope(AppModule, { declarations: [...], imports: [...] });
+///   i0.ɵɵsetNgModuleScope(AppModule, { declarations: [...], imports: [...] });
 /// })();
 /// ```
 pub fn generate_ng_module_definition<'a>(
@@ -322,17 +325,34 @@ fn build_injector_metadata<'a>(
         builder = builder.providers(providers.clone_in(allocator));
     }
 
-    // Prefer raw_imports_expr (preserves StoreModule.forRoot(...) and
-    // spread elements needed for ModuleWithProviders resolution).
-    if let Some(raw_imports) = &metadata.raw_imports_expr {
-        builder = builder.raw_imports(raw_imports.clone_in(allocator));
-    } else {
-        for import in &metadata.imports {
-            let import_expr = OutputExpression::ReadVar(oxc_allocator::Box::new_in(
-                ReadVarExpr { name: import.clone(), source_span: None },
-                &allocator,
-            ));
-            builder = builder.add_import(import_expr);
+    // Like ngtsc's local compilation (ng_module/src/handler.ts `analyze`), the
+    // injector imports are the raw `imports` followed by the raw `exports`: an
+    // array literal adds its elements (keeping `StoreModule.forRoot(...)` calls
+    // and spreads), any other expression is added as is. A full ngtsc build
+    // filters both lists by what each reference resolves to, which needs other
+    // files; the runtime ignores entries that are neither NgModules nor
+    // standalone components.
+    for (raw, names) in [
+        (&metadata.raw_imports_expr, &metadata.imports),
+        (&metadata.raw_exports_expr, &metadata.exports),
+    ] {
+        match raw {
+            Some(OutputExpression::LiteralArray(array)) => {
+                for entry in &array.entries {
+                    builder = builder.add_import(entry.clone_in(allocator));
+                }
+            }
+            Some(expr) => builder = builder.add_import(expr.clone_in(allocator)),
+            // The expression could not be converted: fall back to the names.
+            None => {
+                for name in names {
+                    let import_expr = OutputExpression::ReadVar(oxc_allocator::Box::new_in(
+                        ReadVarExpr { name: *name, source_span: None },
+                        &allocator,
+                    ));
+                    builder = builder.add_import(import_expr);
+                }
+            }
         }
     }
 
@@ -768,6 +788,163 @@ mod tests {
             !js.contains("deps:[]") && !js.contains("deps: []"),
             "Partial ɵfac should not drop ctor deps, got: {js}"
         );
+    }
+
+    /// Compile `code`'s NgModule in full mode and emit all of its output.
+    fn full_module_js(code: &str) -> String {
+        let allocator = Allocator::default();
+        let code = allocator.alloc_str(code);
+        let metadata = module_metadata_from_code(&allocator, code);
+        let class_name = metadata.class_name.to_string();
+        let definition =
+            generate_full_ng_module_definition(&allocator, "i0", &metadata, CompilationMode::Full)
+                .expect("Should generate definition");
+        emit_full_ng_module_definition(&class_name, &definition)
+    }
+
+    #[test]
+    fn test_ng_module_scope_is_a_side_effect() {
+        // Like ngtsc in full compilation: ɵmod keeps only `type` and
+        // `bootstrap`, the scope goes to a ɵɵsetNgModuleScope call, and a
+        // class without a constructor or a superclass gets a plain factory.
+        // Unlike ngtsc the call has no `ngJitMode` guard: Oxc resolves
+        // component dependencies at runtime from this scope, so it must run
+        // in production builds too. ɵinj lists the imports and then the
+        // exports, like ngtsc's local compilation.
+        let js = full_module_js(
+            r"
+            @NgModule({
+              declarations: [A],
+              imports: [CommonModule],
+              exports: [A],
+              bootstrap: [A],
+            })
+            export class M {}
+        ",
+        );
+        assert_eq!(
+            js,
+            "M.ɵmod = /*@__PURE__*/ i0.ɵɵdefineNgModule({type:M,bootstrap:[A]});\n\
+             M.ɵfac = function M_Factory(__ngFactoryType__) {\n  return new (__ngFactoryType__ || M)();\n};\n\
+             M.ɵinj = /*@__PURE__*/ i0.ɵɵdefineInjector({imports:[CommonModule,A]});\n\
+             (function() {\n  \
+             i0.ɵɵsetNgModuleScope(M,{declarations:[A],imports:[CommonModule],exports:[A]});\n})();"
+        );
+    }
+
+    #[test]
+    fn test_ng_module_injector_imports_include_exports() {
+        // ngtsc's local compilation adds the raw `imports` and `exports` to
+        // ɵinj: an array literal entry by entry, any other expression as is.
+        // An exported NgModule's providers are registered this way.
+        let inj_line = |code: &str| {
+            full_module_js(code).lines().find(|l| l.starts_with("M.ɵinj")).unwrap().to_string()
+        };
+        assert_eq!(
+            inj_line(
+                "@NgModule({ imports: [SHARED, ...MORE, R.forRoot()], exports: [SharedModule] })
+                 export class M {}"
+            ),
+            "M.ɵinj = /*@__PURE__*/ i0.ɵɵdefineInjector({imports:[SHARED,...MORE,R.forRoot(),SharedModule]});"
+        );
+        assert_eq!(
+            inj_line("@NgModule({ imports: SHARED, exports: EXPORTED }) export class M {}"),
+            "M.ɵinj = /*@__PURE__*/ i0.ɵɵdefineInjector({imports:[SHARED,EXPORTED]});"
+        );
+        assert_eq!(
+            inj_line("@NgModule({ exports: [SharedModule] }) export class M {}"),
+            "M.ɵinj = /*@__PURE__*/ i0.ɵɵdefineInjector({imports:[SharedModule]});"
+        );
+        assert_eq!(
+            inj_line("@NgModule({ imports: [], exports: [] }) export class M {}"),
+            "M.ɵinj = /*@__PURE__*/ i0.ɵɵdefineInjector({});"
+        );
+    }
+
+    /// The `ɵmod` line and the `ɵɵsetNgModuleScope` IIFE (if any) of `js`.
+    fn mod_and_scope(js: &str) -> (&str, Option<&str>) {
+        let mod_line = js.lines().next().unwrap_or_default();
+        (mod_line, js.find("(function() {").map(|start| &js[start..]))
+    }
+
+    #[test]
+    fn test_ng_module_scope_keeps_unresolved_lists_as_written() {
+        // Const arrays, spreads and `forRoot()` calls cannot be resolved to
+        // classes in a single file; they reach ɵɵsetNgModuleScope as written
+        // (the runtime flattens them and unwraps ModuleWithProviders).
+        let js = full_module_js(
+            r"
+            @NgModule({
+              declarations: [...DECLS, P],
+              imports: [SHARED, RouterModule.forChild([])],
+              exports: DECLS,
+            })
+            export class M {}
+        ",
+        );
+        assert_eq!(
+            mod_and_scope(&js),
+            (
+                "M.ɵmod = /*@__PURE__*/ i0.ɵɵdefineNgModule({type:M});",
+                Some(
+                    "(function() {\n  i0.ɵɵsetNgModuleScope(M,{declarations:[...DECLS,P],\
+                     imports:[SHARED,RouterModule.forChild([])],\n      exports:DECLS});\n})();"
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn test_ng_module_scope_skips_empty_lists() {
+        // ngtsc drops empty lists from the scope, and the whole call when
+        // nothing is left.
+        let js = full_module_js(
+            r"
+            @NgModule({ imports: [CommonModule], declarations: [], exports: [] })
+            export class M {}
+        ",
+        );
+        assert_eq!(
+            mod_and_scope(&js).1,
+            Some("(function() {\n  i0.ɵɵsetNgModuleScope(M,{imports:[CommonModule]});\n})();")
+        );
+
+        let js = full_module_js(
+            r"
+            @NgModule({ declarations: [] })
+            export class M {}
+        ",
+        );
+        assert_eq!(
+            mod_and_scope(&js),
+            ("M.ɵmod = /*@__PURE__*/ i0.ɵɵdefineNgModule({type:M});", None)
+        );
+    }
+
+    #[test]
+    fn test_ng_module_scope_forward_refs_use_arrow_function() {
+        // ngtsc's refsToArray wraps forward-declared lists in an arrow function.
+        let js = full_module_js(
+            r"
+            @NgModule({ declarations: [forwardRef(() => Late)] })
+            export class M {}
+        ",
+        );
+        assert_eq!(
+            mod_and_scope(&js).1,
+            Some("(function() {\n  i0.ɵɵsetNgModuleScope(M,{declarations:() =>[Late]});\n})();")
+        );
+    }
+
+    #[test]
+    fn test_ng_module_without_constructor_with_superclass_uses_inherited_factory() {
+        let js = full_module_js(
+            r"
+            @NgModule({})
+            export class M extends Base {}
+        ",
+        );
+        assert!(js.contains("ɵɵgetInheritedFactory(M)"), "Should inherit the factory, got: {js}");
     }
 
     #[test]

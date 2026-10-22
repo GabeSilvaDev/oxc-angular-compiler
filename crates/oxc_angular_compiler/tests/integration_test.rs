@@ -595,6 +595,43 @@ fn test_defer_on_viewport() {
     insta::assert_snapshot!("defer_on_viewport", js);
 }
 
+#[test]
+fn test_defer_idle_timeout() {
+    // Angular's reify passes `trigger.timeout` to every idle instruction
+    // (`on`, `prefetch on` and `hydrate on`) when one is given.
+    let js = compile_template_to_js(
+        "@defer (on idle(100ms); prefetch on idle(2s)) {a} @defer (on idle; hydrate on idle(250)) {b}",
+        "TestComponent",
+    );
+    for expected in [
+        "i0.ɵɵdeferOnIdle(100);",
+        "i0.ɵɵdeferPrefetchOnIdle(2000);",
+        "i0.ɵɵdeferOnIdle();",
+        "i0.ɵɵdeferHydrateOnIdle(250);",
+    ] {
+        assert!(js.contains(expected), "expected `{expected}` in:\n{js}");
+    }
+}
+
+#[test]
+fn test_defer_idle_timeout_needs_v22() {
+    // Before v22, Angular's `createIdleTrigger` rejects any parameter.
+    let allocator = Allocator::default();
+    let template = "@defer (on idle(100ms)) {a}";
+    let html_result = HtmlParser::new(&allocator, template, "test.html").parse();
+    let options = TransformOptions {
+        angular_version: Some(AngularVersion::new(21, 2, 0)),
+        ..TransformOptions::default()
+    };
+    let r3_result =
+        HtmlToR3Transform::new(&allocator, template, options).transform(&html_result.nodes);
+    let errors: Vec<_> = r3_result.errors.iter().map(|e| e.msg.as_str()).collect();
+    assert!(
+        errors.iter().any(|e| e.contains("\"idle\" trigger cannot have parameters")),
+        "expected the pre-v22 idle parameter error, got: {errors:?}"
+    );
+}
+
 /// Reproduces voidzero-dev/oxc-angular-compiler#289 (aligned with Angular's
 /// local-compilation behavior): a `@defer` block on a component whose lazy
 /// dependency is declared in the `@Component.deferredImports` array must emit
@@ -1669,14 +1706,12 @@ export class TestComponent {
 // ============================================================================
 
 #[test]
-fn test_standalone_component_uses_full_mode() {
-    // OXC operates as a single-file compiler, equivalent to Angular's local compilation mode.
-    // In local compilation mode, Angular ALWAYS sets hasDirectiveDependencies=true,
-    // which means DomOnly mode is never used for component templates.
-    // See: angular/packages/compiler-cli/src/ngtsc/annotations/component/src/handler.ts:1257
-    //
-    // This test ensures standalone components with no imports use Full mode instructions
-    // (ɵɵelementStart) NOT DomOnly mode instructions (ɵɵdomElementStart).
+fn test_standalone_component_without_imports_uses_dom_only_mode() {
+    // A full ngtsc build compiles a standalone component without directive
+    // dependencies in DomOnly mode (`hasDirectiveDependencies` in
+    // angular/packages/compiler-cli/src/ngtsc/annotations/component/src/handler.ts).
+    // Without `imports` the template scope holds only the component itself,
+    // which this template does not use, so Oxc can prove the same.
     let allocator = Allocator::default();
     let source = r#"
 import { Component } from '@angular/core';
@@ -1695,22 +1730,10 @@ export class ExternalComponent {
     let result = transform_angular_file(&allocator, "test.component.ts", source, None, None);
 
     assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    assert!(result.code.contains("ɵɵdomElementStart"), "{}", result.code);
+    assert!(!result.code.contains("ɵɵelementStart"), "{}", result.code);
 
-    // Must use Full mode instructions (elementStart), not DomOnly (domElementStart)
-    assert!(
-        !result.code.contains("domElementStart"),
-        "Standalone component should use Full mode (elementStart), not DomOnly mode (domElementStart).\n\
-         OXC operates in local compilation mode where hasDirectiveDependencies is always true.\n\
-         Output:\n{}",
-        result.code
-    );
-    assert!(
-        result.code.contains("elementStart"),
-        "Expected Full mode instruction ɵɵelementStart in output.\nOutput:\n{}",
-        result.code
-    );
-
-    insta::assert_snapshot!("standalone_component_uses_full_mode", result.code);
+    insta::assert_snapshot!("standalone_component_without_imports_uses_dom_only_mode", result.code);
 }
 
 // ============================================================================
@@ -4994,7 +5017,7 @@ export class TestComponent {
 }
 ";
 
-    // OXC always uses Full mode (elementStart, not domElementStart)
+    // Any import keeps Full mode (elementStart, not domElementStart)
     let result = transform_angular_file(&allocator, "test.ts", source, None, None);
 
     // Should use elementStart (Full mode), NOT domElementStart (DomOnly mode)
@@ -5010,15 +5033,22 @@ export class TestComponent {
     );
 }
 
-/// Test that standalone components WITHOUT imports use Full mode (local compilation).
-///
-/// OXC is a single-file compiler, equivalent to Angular's local compilation mode.
-/// In local compilation mode, Angular ALWAYS sets hasDirectiveDependencies=true,
-/// so DomOnly mode is never used for component templates.
-/// See: angular/packages/compiler-cli/src/ngtsc/annotations/component/src/handler.ts:1257
-#[test]
-fn test_dom_only_mode_not_used_for_standalone_without_imports() {
+/// Compiles `source` and returns whether its component template used the
+/// DOM-only instructions, checking that it used one mode throughout.
+fn compiles_dom_only(source: &str, options: Option<&ComponentTransformOptions>) -> bool {
     let allocator = Allocator::default();
+    let result = transform_angular_file(&allocator, "test.ts", source, options, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let dom_only = result.code.contains("ɵɵdomElement");
+    let full = result.code.contains("ɵɵelement");
+    assert!(dom_only != full, "Expected exactly one template mode. Output:\n{}", result.code);
+    dom_only
+}
+
+/// A standalone component without imports uses DomOnly mode, like a full
+/// ngtsc build.
+#[test]
+fn test_dom_only_mode_used_for_standalone_without_imports() {
     let source = r"
 import { Component } from '@angular/core';
 
@@ -5033,19 +5063,7 @@ import { Component } from '@angular/core';
 export class TestComponent {}
 ";
 
-    let result = transform_angular_file(&allocator, "test.ts", source, None, None);
-
-    // OXC in local compilation mode: always Full mode for component templates
-    assert!(
-        result.code.contains("ɵɵelementStart"),
-        "Standalone component without imports should use ɵɵelementStart (Full mode). Output:\n{}",
-        result.code
-    );
-    assert!(
-        !result.code.contains("ɵɵdomElementStart"),
-        "Standalone component without imports should NOT use ɵɵdomElementStart. Output:\n{}",
-        result.code
-    );
+    assert!(compiles_dom_only(source, None));
 }
 
 /// Test that non-standalone components use Full mode.
@@ -5245,22 +5263,11 @@ fn test_animation_enter_string_literal_only_in_embedded_view() {
     insta::assert_snapshot!("animation_enter_string_literal_only_embedded_view", js);
 }
 
-/// Test that implicit standalone components (no `standalone` in decorator) use Full mode.
-///
-/// Angular 19+ defaults `standalone` to `true` when not specified. However, OXC performs
-/// single-file compilation without NgModule context. Angular's ngtsc (in local compilation
-/// mode) always sets `hasDirectiveDependencies = true` because it can't fully inspect
-/// dependencies. OXC should do the same: only use DomOnly mode when `standalone: true`
-/// is EXPLICITLY set in the decorator.
-///
-/// Components that rely on the implicit default may be declared in NgModules, which
-/// Angular's global compilation handles by setting `hasDirectiveDependencies =
-/// !isStandalone || ...`. Without NgModule context, OXC must be conservative.
-///
-/// See: angular/packages/compiler-cli/src/ngtsc/annotations/component/src/handler.ts:1326-1339
+/// Implicitly standalone components (Angular 19+ default) use DomOnly mode too:
+/// ngtsc reads `isStandalone` the same way, and declaring such a component in
+/// an NgModule is an error.
 #[test]
-fn test_dom_only_mode_not_used_for_implicit_standalone() {
-    let allocator = Allocator::default();
+fn test_dom_only_mode_used_for_implicit_standalone() {
     let source = r"
 import { Component } from '@angular/core';
 
@@ -5274,34 +5281,17 @@ import { Component } from '@angular/core';
 export class TestComponent {}
 ";
 
-    // Angular version 19+ defaults standalone to true, but implicit standalone
-    // should NOT trigger DomOnly mode because the component might be in an NgModule
     let options = ComponentTransformOptions {
         angular_version: Some(AngularVersion::new(21, 0, 0)),
         ..Default::default()
     };
-    let result = transform_angular_file(&allocator, "test.ts", source, Some(&options), None);
-
-    // Should use Full mode (elementStart), NOT DomOnly (domElementStart)
-    assert!(
-        result.code.contains("ɵɵelementStart"),
-        "Implicit standalone component should use ɵɵelementStart (Full mode). Output:\n{}",
-        result.code
-    );
-    assert!(
-        !result.code.contains("ɵɵdomElementStart"),
-        "Implicit standalone component should NOT use ɵɵdomElementStart (DomOnly). Output:\n{}",
-        result.code
-    );
+    assert!(compiles_dom_only(source, Some(&options)));
 }
 
-/// Test that implicit standalone components with empty imports also use Full mode.
-///
-/// Even with an empty `imports: []` array, if `standalone` is not explicitly set,
-/// OXC should use Full mode to be safe.
+/// `imports: []` brings nothing into scope, so an implicitly standalone
+/// component keeps DomOnly mode.
 #[test]
-fn test_dom_only_mode_not_used_for_implicit_standalone_with_empty_imports() {
-    let allocator = Allocator::default();
+fn test_dom_only_mode_used_for_implicit_standalone_with_empty_imports() {
     let source = r"
 import { Component } from '@angular/core';
 
@@ -5317,27 +5307,12 @@ export class TestComponent {}
         angular_version: Some(AngularVersion::new(21, 0, 0)),
         ..Default::default()
     };
-    let result = transform_angular_file(&allocator, "test.ts", source, Some(&options), None);
-
-    // Implicit standalone + empty imports should still use Full mode
-    assert!(
-        result.code.contains("ɵɵelementStart"),
-        "Implicit standalone with empty imports should use Full mode. Output:\n{}",
-        result.code
-    );
-    assert!(
-        !result.code.contains("ɵɵdomElementStart"),
-        "Implicit standalone with empty imports should NOT use DomOnly. Output:\n{}",
-        result.code
-    );
+    assert!(compiles_dom_only(source, Some(&options)));
 }
 
-/// Test that standalone components with empty imports use Full mode (local compilation).
-///
-/// OXC always uses Full mode for component templates, matching Angular's local compilation.
+/// Empty `imports` and `deferredImports` keep DomOnly mode.
 #[test]
-fn test_dom_only_mode_not_used_for_standalone_with_empty_imports() {
-    let allocator = Allocator::default();
+fn test_dom_only_mode_used_for_standalone_with_empty_imports() {
     let source = r"
 import { Component } from '@angular/core';
 
@@ -5345,29 +5320,116 @@ import { Component } from '@angular/core';
   selector: 'app-test',
   standalone: true,
   imports: [],
+  deferredImports: [],
   template: `<div>Hello</div>`
 })
 export class TestComponent {}
 ";
 
-    let result = transform_angular_file(&allocator, "test.ts", source, None, None);
-
-    // OXC in local compilation mode: always Full mode for component templates
-    assert!(
-        result.code.contains("ɵɵelementStart"),
-        "Standalone with empty imports should use ɵɵelementStart (Full mode). Output:\n{}",
-        result.code
-    );
-    assert!(
-        !result.code.contains("ɵɵdomElementStart"),
-        "Standalone with empty imports should NOT use ɵɵdomElementStart. Output:\n{}",
-        result.code
-    );
+    assert!(compiles_dom_only(source, None));
 }
 
-/// Test that standalone components with ONLY pipe imports use Full mode (local compilation).
+/// Anything Oxc cannot prove empty keeps Full mode: imports through an
+/// identifier, a spread, `forwardRef`, `deferredImports`, or a spread in the
+/// decorator object that could add them.
+#[test]
+fn test_full_mode_used_when_imports_are_not_provably_empty() {
+    for config in [
+        "imports: SHARED,",
+        "imports: [...SHARED],",
+        "imports: [forwardRef(() => Other)],",
+        "deferredImports: [Other],",
+        "imports: [] as any[],",
+        "...BASE,",
+    ] {
+        let source = format!(
+            "import {{ Component, forwardRef }} from '@angular/core';\n\
+             const SHARED: any[] = [];\n\
+             const BASE = {{}};\n\
+             class Other {{}}\n\
+             @Component({{ selector: 'app-test', {config} template: '<div>@defer {{ <p>x</p> }}</div>' }})\n\
+             export class TestComponent {{}}\n"
+        );
+        assert!(!compiles_dom_only(&source, None), "`{config}` should keep Full mode");
+    }
+}
+
+/// A standalone scope holds the component itself, so a template that uses its
+/// own selector has a directive dependency and keeps Full mode — anywhere in the
+/// template, `@defer` blocks included. Without a selector the component matches
+/// `ng-component`, ngtsc's default.
+#[test]
+fn test_full_mode_used_when_template_matches_own_selector() {
+    for (selector, template) in [
+        ("selector: 'app-tree',", "<span>x</span>@if (on) { <app-tree /> }"),
+        (
+            "selector: 'app-tree',",
+            "<span>x</span>@defer { <app-tree /> } @placeholder { <i>p</i> }",
+        ),
+        ("selector: '[appTree]',", "<span>x</span><ng-template appTree></ng-template>"),
+        ("selector: 'app-tree, [appTree]',", "<div appTree></div>"),
+        ("selector: '.tree',", "<div class=\"a tree\"></div>"),
+        ("", "<span>x</span><ng-component></ng-component>"),
+    ] {
+        let source = format!(
+            "import {{ Component }} from '@angular/core';\n\
+             @Component({{ {selector} template: `{template}` }})\n\
+             export class TreeComponent {{ on = true; }}\n"
+        );
+        assert!(
+            !compiles_dom_only(&source, None),
+            "`{selector}` `{template}` should keep Full mode"
+        );
+    }
+
+    for (selector, template) in [
+        ("selector: 'app-tree:not(.leaf)',", "<app-tree class=\"leaf\"></app-tree>"),
+        ("selector: '[appTree]',", "<div appTreeX></div>"),
+        ("selector: 'app-tree',", "<div>app-tree</div><span>x</span>"),
+        ("", "<div></div>"),
+    ] {
+        let source = format!(
+            "import {{ Component }} from '@angular/core';\n\
+             @Component({{ {selector} template: `{template}` }})\n\
+             export class TreeComponent {{}}\n"
+        );
+        assert!(
+            compiles_dom_only(&source, None),
+            "`{selector}` `{template}` should use DomOnly mode"
+        );
+    }
+}
+
+/// DomOnly templates start at Angular 20.1.0-next.3.
+#[test]
+fn test_dom_only_mode_is_version_gated() {
+    let source = r"
+import { Component } from '@angular/core';
+
+@Component({ selector: 'app-test', standalone: true, template: `<div (click)='go()'>Hello</div>` })
+export class TestComponent { go() {} }
+";
+    for (version, dom_only) in [
+        ("19.2.0", false),
+        ("20.0.7", false),
+        ("20.1.0-next.2", false),
+        ("20.1.0-next.3", true),
+        ("20.1.0", true),
+        ("22.2.2", true),
+    ] {
+        let options = ComponentTransformOptions {
+            angular_version: AngularVersion::parse(version),
+            ..Default::default()
+        };
+        assert_eq!(compiles_dom_only(source, Some(&options)), dom_only, "{version}");
+    }
+}
+
+/// Test that standalone components with ONLY pipe imports use Full mode.
 ///
-/// OXC always uses Full mode for component templates, matching Angular's local compilation.
+/// A full ngtsc build would use DomOnly mode here (pipes are not directive
+/// dependencies), but Oxc cannot tell an imported pipe from a directive within
+/// one file, so any import keeps Full mode, like ngtsc's local compilation.
 #[test]
 fn test_dom_only_mode_not_used_for_standalone_with_pipe_only_imports() {
     let allocator = Allocator::default();
@@ -5388,7 +5450,7 @@ export class TestComponent {
 
     let result = transform_angular_file(&allocator, "test.ts", source, None, None);
 
-    // OXC in local compilation mode: always Full mode for component templates
+    // Any import keeps Full mode
     assert!(
         result.code.contains("ɵɵelementStart"),
         "Standalone with pipe-only imports should use ɵɵelementStart (Full mode). Output:\n{}",
@@ -5401,9 +5463,8 @@ export class TestComponent {
     );
 }
 
-/// Test that multiple pipe-only imports also use Full mode (local compilation).
-///
-/// OXC always uses Full mode for component templates, matching Angular's local compilation.
+/// Test that multiple pipe-only imports also use Full mode, as Oxc cannot tell
+/// imported pipes from directives.
 #[test]
 fn test_dom_only_mode_not_used_for_standalone_with_multiple_pipe_imports() {
     let allocator = Allocator::default();
@@ -5422,7 +5483,7 @@ export class TestComponent {}
 
     let result = transform_angular_file(&allocator, "test.ts", source, None, None);
 
-    // OXC in local compilation mode: always Full mode for component templates
+    // Any import keeps Full mode
     assert!(
         result.code.contains("ɵɵelementStart"),
         "Multiple pipe-only imports should use Full mode. Output:\n{}",
@@ -5673,8 +5734,8 @@ fn test_i18n_expression_ordering_icu_plural_with_pipe() {
 }
 
 /// Compiles a component with the given template and returns its `consts` function and
-/// template function, with line breaks collapsed and the `__makeTemplateObject` helper
-/// shortened to `__tpl`, so assertions do not depend on the emitter's line wrapping.
+/// template function, with line breaks collapsed, so assertions do not depend on the
+/// emitter's line wrapping.
 fn compile_i18n_component(template: &str) -> String {
     let allocator = Allocator::default();
     let source = format!(
@@ -5684,10 +5745,7 @@ fn compile_i18n_component(template: &str) -> String {
     );
     let result = transform_angular_file(&allocator, "repro.ts", &source, None, None);
     assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
-    let code = result.code.replace(
-        r#"(this&&this.__makeTemplateObject||function(e,t){return Object.defineProperty?Object.defineProperty(e,"raw",{value:t}):e.raw=t,e})"#,
-        "__tpl",
-    );
+    let code = result.code;
     let start = code.find("consts:").expect("component should have consts");
     let end = code[start..].find("encapsulation").map_or(code.len(), |e| start + e);
     let mut out = String::new();
@@ -5703,6 +5761,56 @@ fn assert_contains(haystack: &str, needle: &str) {
     assert!(haystack.contains(needle), "Expected to find:\n{needle}\nin:\n{haystack}");
 }
 
+/// `i18n` metadata is trimmed once, as in Angular's `parseI18nMeta`, so the meaning and
+/// description keep their inner spaces. Angular 22.2.2 gives `<p i18n="  m | d  ">` meaning
+/// `"m "` and description `" d"`, and with a custom id `" m | d @@ custom "` keeps the space
+/// before the id:
+///   /** @desc  d @meaning m  */ ... $localize `:m | d:Hello`
+///   MSG_EXTERNAL__custom$$ ... $localize `:m | d @@ custom:Custom`
+#[test]
+fn test_i18n_meta_is_trimmed_once() {
+    let js = compile_i18n_component(
+        r#"<p i18n="  m | d  ">Hello</p><img i18n-alt="  m | d  " alt="Logo" /><p i18n=" m | d @@ custom ">Custom</p>"#,
+    );
+    assert_contains(&js, "/** @desc  d @meaning m  */");
+    assert_contains(&js, r#"$localize `:m | d:Hello`"#);
+    assert_contains(&js, r#"$localize `:m | d:Logo`"#);
+    assert_contains(&js, "/** @desc  d  @meaning m  */const MSG_EXTERNAL__custom$$");
+    assert_contains(&js, r#"$localize `:m | d @@ custom:Custom`"#);
+}
+
+/// `consts` with i18n initializers is an arrow function with a block body, and a message is
+/// a native `$localize` tagged template. Angular 22.2 `ngc` (ES2022):
+///   consts: () => { let i18n_0; ... i18n_0 = $localize `:@@close:Close`; } return [...]; }
+/// Without initializers `consts` stays a plain array.
+#[test]
+fn test_i18n_consts_is_arrow_function_with_native_localize() {
+    let js = compile_i18n_component(r#"<div i18n-title="@@close" title="Close"></div>"#);
+    assert_contains(&js, "consts:() =>{let i18n_0;");
+    assert_contains(&js, "(i18n_0 = $localize `:@@close:Close`);");
+    assert!(!js.contains("makeTemplateObject"), "No template object helper expected:\n{js}");
+
+    let js = compile_i18n_component(r#"<div title="Close"></div>"#);
+    assert_contains(&js, r#"consts:[["title","Close"]]"#);
+}
+
+/// The HMR update's `consts` takes the same arrow form as the component definition.
+#[test]
+fn test_hmr_i18n_consts_is_arrow_function() {
+    let allocator = Allocator::default();
+    let output = oxc_angular_compiler::compile_template_for_hmr(
+        &allocator,
+        r#"<div i18n-title="@@close" title="Close"></div>"#,
+        "Repro",
+        "repro.ts",
+        &ComponentTransformOptions::default(),
+    )
+    .expect("HMR template should compile");
+    let consts = output.consts_js.expect("template should have consts");
+    assert!(consts.starts_with("() =>{"), "Expected an arrow function, got:\n{consts}");
+    assert!(consts.contains("$localize `:@@close:Close`"), "got:\n{consts}");
+}
+
 /// An `i18n-<attr>` message takes the attribute's own value as its text.
 /// Expected output taken from Angular 22.1.5 `ngc`:
 ///   goog.getMsg("Close") / $localize `:@@close:Close`
@@ -5710,7 +5818,7 @@ fn assert_contains(haystack: &str, needle: &str) {
 fn test_i18n_attribute_message_uses_attribute_value() {
     let js = compile_i18n_component(r#"<div i18n-title="@@close" title="Close"></div>"#);
     assert_contains(&js, r#"goog.getMsg("Close")"#);
-    assert_contains(&js, r#"__tpl([":@@close:Close"], [":@@close:Close"])"#);
+    assert_contains(&js, "$localize `:@@close:Close`");
     assert_contains(&js, r#"return [["title",i18n_0]]"#);
 }
 
@@ -5724,10 +5832,7 @@ fn test_i18n_interpolated_attribute_message_uses_attribute_value() {
         &js,
         "goog.getMsg(\"Hi {$interpolation}!\",{\"interpolation\":\"\u{FFFD}0\u{FFFD}\"}",
     );
-    assert_contains(
-        &js,
-        "__tpl([\":@@hi:Hi \", \":INTERPOLATION:!\"], [\":@@hi:Hi \", \":INTERPOLATION:!\"]), \"\u{FFFD}0\u{FFFD}\")",
-    );
+    assert_contains(&js, "$localize `:@@hi:Hi ${\"\u{FFFD}0\u{FFFD}\"}:INTERPOLATION:!`");
 }
 
 /// `i18n-<attr>` alongside an `i18n` element body: both messages keep their text.
@@ -5739,9 +5844,9 @@ fn test_i18n_attribute_and_element_body_on_same_element() {
         r#"<div i18n="@@body" i18n-title="@@ttl" title="Close">Body text</div>"#,
     );
     assert_contains(&js, r#"goog.getMsg("Close")"#);
-    assert_contains(&js, r#"__tpl([":@@ttl:Close"], [":@@ttl:Close"])"#);
+    assert_contains(&js, "$localize `:@@ttl:Close`");
     assert_contains(&js, r#"goog.getMsg("Body text")"#);
-    assert_contains(&js, r#"__tpl([":@@body:Body text"], [":@@body:Body text"])"#);
+    assert_contains(&js, "$localize `:@@body:Body text`");
     assert_contains(&js, r#"return [i18n_1,["title",i18n_0]]"#);
 }
 
@@ -5762,7 +5867,7 @@ fn test_i18n_sole_icu_is_the_message() {
     );
     assert_contains(
         &js,
-        r#"__tpl([":@@items:{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}"], [":@@items:{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}"]))"#,
+        "$localize `:@@items:{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}`",
     );
     // Post-processing runs after the Closure/$localize branch, for both modes.
     assert_contains(
@@ -5786,7 +5891,7 @@ fn test_i18n_sole_select_icu_is_the_message() {
         &js,
         r#"goog.getMsg("{VAR_SELECT, select, male {he} female {she} other {they}}")"#,
     );
-    assert_contains(&js, r#"__tpl(["{VAR_SELECT, select, male {he} female {she} other {they}}"]"#);
+    assert_contains(&js, "$localize `{VAR_SELECT, select, male {he} female {she} other {they}}`");
     assert_contains(
         &js,
         "}(i18n_0 = i0.ɵɵi18nPostprocess(i18n_0,{\"VAR_SELECT\":\"\u{FFFD}0\u{FFFD}\"}));",
@@ -5854,7 +5959,7 @@ fn test_i18n_icu_with_sibling_content_is_sub_message() {
     );
     assert_contains(
         &js,
-        r#"__tpl(["{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}"]"#,
+        "$localize `{VAR_PLURAL, plural, =1 {one item} other {{INTERPOLATION} items}}`",
     );
     assert_contains(
         &js,
@@ -5866,7 +5971,7 @@ fn test_i18n_icu_with_sibling_content_is_sub_message() {
     );
     assert_contains(
         &js,
-        "__tpl([\"Hello \", \":INTERPOLATION:! \", \":ICU@@3633748910064245637:\"], [\"Hello \", \":INTERPOLATION:! \", \":ICU@@3633748910064245637:\"]), \"\u{FFFD}0\u{FFFD}\", i18n_0)",
+        "$localize `Hello ${\"\u{FFFD}0\u{FFFD}\"}:INTERPOLATION:! ${i18n_0}:ICU@@3633748910064245637:`",
     );
     assert_contains(&js, "return [i18n_1]");
     assert_contains(&js, "i0.ɵɵi18nExp(ctx.name)(ctx.count)(ctx.count);");
@@ -5895,7 +6000,7 @@ fn test_i18n_two_icus_in_one_message() {
     assert_contains(&js, r#"goog.getMsg("{$icu} and {$icu_1}",{"icu":i18n_0,"icu_1":i18n_1}"#);
     assert_contains(
         &js,
-        r#"__tpl(["", ":ICU@@3286071892512017447: and ", ":ICU_1@@8078998681144872872:"], ["", ":ICU@@3286071892512017447: and ", ":ICU_1@@8078998681144872872:"]), i18n_0, i18n_1)"#,
+        "$localize `${i18n_0}:ICU@@3286071892512017447: and ${i18n_1}:ICU_1@@8078998681144872872:`",
     );
     assert!(!js.contains("i18nPostprocess(i18n_2"), "Root message needs no post-processing:\n{js}");
     assert_contains(&js, "return [i18n_2]");
@@ -5913,7 +6018,7 @@ fn test_i18n_localize_placeholder_names_keep_underscores() {
     );
     assert_contains(
         &js,
-        "__tpl([\"Hello \", \":START_BOLD_TEXT:world\", \":CLOSE_BOLD_TEXT:!\"], [\"Hello \", \":START_BOLD_TEXT:world\", \":CLOSE_BOLD_TEXT:!\"]), \"\u{FFFD}#2\u{FFFD}\", \"\u{FFFD}/#2\u{FFFD}\")",
+        "$localize `Hello ${\"\u{FFFD}#2\u{FFFD}\"}:START_BOLD_TEXT:world${\"\u{FFFD}/#2\u{FFFD}\"}:CLOSE_BOLD_TEXT:!`",
     );
 }
 
@@ -5933,10 +6038,7 @@ fn test_i18n_attribute_with_empty_value_has_no_message() {
 fn test_i18n_custom_interpolation_placeholder_name() {
     let js = compile_i18n_component(r#"<span i18n>Hello {{ name // i18n(ph="PH") }}</span>"#);
     assert_contains(&js, "goog.getMsg(\"Hello {$ph}\",{\"ph\":\"\u{FFFD}0\u{FFFD}\"})");
-    assert_contains(
-        &js,
-        "__tpl([\"Hello \", \":PH:\"], [\"Hello \", \":PH:\"]), \"\u{FFFD}0\u{FFFD}\")",
-    );
+    assert_contains(&js, "$localize `Hello ${\"\u{FFFD}0\u{FFFD}\"}:PH:`");
 }
 
 /// Whitespace next to an ICU is part of the message. Angular 22.1.5:
@@ -5952,7 +6054,7 @@ fn test_i18n_keeps_whitespace_next_to_icu() {
     assert_contains(&js, r#"goog.getMsg("{$icu} {$startBoldText}x{$closeBoldText}","#);
     assert_contains(
         &js,
-        r#"__tpl(["", ":ICU@@8078998681144872872: ", ":START_BOLD_TEXT:x", ":CLOSE_BOLD_TEXT:"]"#,
+        "$localize `${i18n_0}:ICU@@8078998681144872872: ${\"\u{FFFD}#2\u{FFFD}\"}:START_BOLD_TEXT:x${\"\u{FFFD}/#2\u{FFFD}\"}:CLOSE_BOLD_TEXT:`",
     );
 }
 
@@ -5982,7 +6084,7 @@ fn test_i18n_if_else_block_placeholders() {
     );
     assert_contains(
         &js,
-        r#"__tpl(["", ":START_BLOCK_IF:", ":START_TAG_SPAN:yes", ":CLOSE_TAG_SPAN:", ":CLOSE_BLOCK_IF:", ":START_BLOCK_ELSE:no", ":CLOSE_BLOCK_ELSE:"]"#,
+        "`${\"\u{FFFD}*2:1\u{FFFD}\"}:START_BLOCK_IF:${\"\u{FFFD}#1:1\u{FFFD}\"}:START_TAG_SPAN:yes${\"\u{FFFD}/#1:1\u{FFFD}\"}:CLOSE_TAG_SPAN:${\"\u{FFFD}/*2:1\u{FFFD}\"}:CLOSE_BLOCK_IF:${\"\u{FFFD}*3:2\u{FFFD}\"}:START_BLOCK_ELSE:no${\"\u{FFFD}/*3:2\u{FFFD}\"}:CLOSE_BLOCK_ELSE:`",
     );
     assert!(!js.contains("i18nPostprocess"), "No post-processing expected:\n{js}");
 }
@@ -5995,11 +6097,8 @@ fn test_i18n_meta_block_escapes_colons() {
     let js = compile_i18n_component(
         r#"<div i18n="meaning:A|descA@@idA">Content A</div><div i18n-title="d: x@@t2" title="T">x</div>"#,
     );
-    assert_contains(
-        &js,
-        "__tpl([\":meaning:A|descA@@idA:Content A\"], [\":meaning\\\\:A|descA@@idA:Content A\"])",
-    );
-    assert_contains(&js, "__tpl([\":d: x@@t2:T\"], [\":d\\\\: x@@t2:T\"])");
+    assert_contains(&js, "$localize `:meaning\\:A|descA@@idA:Content A`");
+    assert_contains(&js, "$localize `:d\\: x@@t2:T`");
 }
 
 /// An ICU outside any i18n block still gets a message and is wrapped in its own i18n block.
@@ -6108,7 +6207,7 @@ fn test_i18n_ng_content_placeholder_values() {
 fn test_i18n_custom_placeholder_name_with_spaces() {
     let js = compile_i18n_component(r#"<div i18n>Hi {{ name // i18n(ph = "who") }}</div>"#);
     assert_contains(&js, "goog.getMsg(\"Hi {$who}\",{\"who\":\"\u{FFFD}0\u{FFFD}\"})");
-    assert_contains(&js, "__tpl([\"Hi \", \":WHO:\"]");
+    assert_contains(&js, "$localize `Hi ${\"\u{FFFD}0\u{FFFD}\"}:WHO:`");
 }
 
 /// An i18n element with a structural directive keeps its interpolation value. Angular 22.1.5:
@@ -6148,7 +6247,7 @@ fn test_i18n_namespaced_element_placeholders() {
         r#"<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><xhtml:div xmlns="http://www.w3.org/1999/xhtml" i18n>Count: <span>5</span></xhtml:div></foreignObject></svg>"#,
     );
     assert_contains(&js, "goog.getMsg(\"Count: {$startTagXhtmlSpan}5{$closeTagXhtmlSpan}\"");
-    assert_contains(&js, "\":START_TAG__XHTML_SPAN:5\"");
+    assert_contains(&js, "}:START_TAG__XHTML_SPAN:5${");
 }
 
 /// SVG elements in an i18n message are named with their namespace. Angular 22.1.5:
@@ -6159,7 +6258,7 @@ fn test_i18n_svg_element_placeholders() {
         compile_i18n_component(r#"<div i18n>Save <svg><circle r="1"></circle></svg> now</div>"#);
     assert_contains(
         &js,
-        r#"__tpl(["Save ", ":START_TAG__SVG_SVG:", ":START_TAG__SVG_CIRCLE:", ":CLOSE_TAG__SVG_CIRCLE:", ":CLOSE_TAG__SVG_SVG: now"]"#,
+        "$localize `Save ${\"\u{FFFD}#2\u{FFFD}\"}:START_TAG__SVG_SVG:${\"\u{FFFD}#3\u{FFFD}\"}:START_TAG__SVG_CIRCLE:${\"\u{FFFD}/#3\u{FFFD}\"}:CLOSE_TAG__SVG_CIRCLE:${\"\u{FFFD}/#2\u{FFFD}\"}:CLOSE_TAG__SVG_SVG: now`",
     );
 }
 
@@ -6189,10 +6288,7 @@ fn test_i18n_message_keeps_ngsp() {
 fn test_i18n_icu_placeholder_has_associated_message_id() {
     let js =
         compile_i18n_component(r#"<span i18n>a {count, plural, =1 {one} other {more}} b</span>"#);
-    assert_contains(
-        &js,
-        r#"__tpl(["a ", ":ICU@@911278603808503436: b"], ["a ", ":ICU@@911278603808503436: b"]), i18n_0)"#,
-    );
+    assert_contains(&js, "$localize `a ${i18n_0}:ICU@@911278603808503436: b`");
 }
 
 /// Text expressions of an i18n block are applied at the block's last slot, so Angular advances
@@ -6224,8 +6320,7 @@ fn test_i18n_attribute_on_ng_template_uses_bindings_marker() {
 /// Text that looks like a placeholder marker stays literal text. Angular 22.1.5 for
 /// `&#123;\\path and &#123;$x&#125; {{ name }}`:
 ///   goog.getMsg("{\\\\path and {$x} {$interpolation}", { "interpolation": "\\uFFFD0\\uFFFD" })
-///   __makeTemplateObject(["{\\\\path and {$x} ", ":INTERPOLATION:"],
-///                        ["{\\\\\\\\path and {$x} ", ":INTERPOLATION:"])
+///   $localize `{\\\\path and {$x} ${"\\uFFFD0\\uFFFD"}:INTERPOLATION:`
 #[test]
 fn test_i18n_literal_placeholder_like_text() {
     let js = compile_i18n_component(r"<div i18n>&#123;\\path and &#123;$x&#125; {{ name }}</div>");
@@ -6233,10 +6328,7 @@ fn test_i18n_literal_placeholder_like_text() {
         &js,
         "goog.getMsg(\"{\\\\path and {$x} {$interpolation}\",{\"interpolation\":\"\u{FFFD}0\u{FFFD}\"})",
     );
-    assert_contains(
-        &js,
-        "__tpl([\"{\\\\path and {$x} \", \":INTERPOLATION:\"], [\"{\\\\\\\\path and {$x} \", \":INTERPOLATION:\"]), \"\u{FFFD}0\u{FFFD}\")",
-    );
+    assert_contains(&js, "$localize `{\\\\path and {$x} ${\"\u{FFFD}0\u{FFFD}\"}:INTERPOLATION:`");
 }
 
 #[test]
@@ -16237,6 +16329,87 @@ export class D {}
 }
 
 #[test]
+fn test_ng_module_scope_is_set_by_a_side_effect() {
+    // Like ngtsc in full compilation: the class keeps ɵmod with only the
+    // type, and an IIFE after it patches the scope on. Unlike ngtsc the call
+    // is not ngJitMode-guarded, since ɵɵgetComponentDepsFactory reads this
+    // scope at runtime, also in production builds.
+    let allocator = Allocator::default();
+    let source = r"
+import { NgModule } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+
+const SHARED = [CommonModule];
+
+@NgModule({ imports: [SHARED, FormsModule] })
+export class M {}
+";
+    let result = transform_angular_file(&allocator, "m.module.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    assert!(
+        result.code.contains("static ɵmod = /*@__PURE__*/ i0.ɵɵdefineNgModule({type:M});"),
+        "ɵmod should only have the type. Got:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains(
+            "(function() {\n  i0.ɵɵsetNgModuleScope(M,{imports:[SHARED,FormsModule]});\n})();"
+        ),
+        "Should patch the scope on in an unguarded IIFE. Got:\n{}",
+        result.code
+    );
+
+    // The IIFE must parse as an expression statement, not a function declaration.
+    let parsed =
+        oxc_parser::Parser::new(&allocator, &result.code, oxc_span::SourceType::ts()).parse();
+    assert!(
+        parsed.diagnostics.is_empty(),
+        "Output should parse: {:?}\n{}",
+        parsed.diagnostics,
+        result.code
+    );
+}
+
+#[test]
+fn test_ng_module_class_metadata_precedes_scope() {
+    // ngtsc's `insertMetadataStatement` unshifts ɵsetClassMetadata in front
+    // of the ɵmod statements, so it comes before the ɵɵsetNgModuleScope IIFE.
+    let allocator = Allocator::default();
+    let source = r"
+import { NgModule } from '@angular/core';
+import { CommonModule } from '@angular/common';
+
+@NgModule({ imports: [CommonModule] })
+export class M {}
+";
+    let result = transform_angular_file(&allocator, "m.module.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let metadata = result.code.find("ɵsetClassMetadata(M").expect("setClassMetadata");
+    let scope = result.code.find("ɵɵsetNgModuleScope(M").expect("setNgModuleScope");
+    assert!(metadata < scope, "setClassMetadata should come first. Got:\n{}", result.code);
+}
+
+#[test]
+fn test_component_class_metadata_precedes_debug_info() {
+    // ngtsc's `compileResults` pushes the class metadata, then the debug info.
+    // The debug info line counts `\r\n`, `\r`, U+2028 and U+2029 like
+    // TypeScript's `computeLineStarts`.
+    let allocator = Allocator::default();
+    let source = "import { Component } from '@angular/core';\r\n// \u{2028}\r@Component({ selector: 'c', template: '' })\r\nexport class C {}\n";
+    let result = transform_angular_file(&allocator, "c.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let metadata = result.code.find("ɵsetClassMetadata(C").expect("setClassMetadata");
+    let debug_info = result.code.find("ɵsetClassDebugInfo(C").expect("setClassDebugInfo");
+    assert!(metadata < debug_info, "setClassMetadata should come first. Got:\n{}", result.code);
+    assert!(
+        result.code.contains("lineNumber:5"),
+        "class is on line 5 by TypeScript's count. Got:\n{}",
+        result.code
+    );
+}
+
+#[test]
 fn test_jit_true_ng_module_skips_aot() {
     let allocator = Allocator::default();
     let source = r"
@@ -17903,4 +18076,266 @@ fn test_lone_surrogate_host_listener_argument_is_diagnostic() {
         );
         assert_eq!(expect_diagnostics(&source), [expected], "`{member}`");
     }
+}
+
+// ============================================================================
+// Security-sensitive static attributes
+// ============================================================================
+// Constant values of security-sensitive attributes become trusted constants in
+// the consts array (`ɵɵtrustConstantHtml` / `ɵɵtrustConstantResourceUrl`), host
+// attributes stay plain, and static i18n attributes are wrapped in their
+// sanitizer by `resolveI18nAttrSanitizers` (19.2.23 / 20.3.22 / 21.2.15 / 22+).
+
+/// Compiles `template` in a component for `version` and returns the code with
+/// all whitespace removed. The component is `standalone: false`, like the
+/// compliance test cases ported here, so the template uses the full
+/// instructions.
+fn compile_component_compact(template: &str, version: Option<AngularVersion>) -> String {
+    let allocator = Allocator::default();
+    let source = format!(
+        "import {{ Component }} from '@angular/core';\n\
+         @Component({{ selector: 'my-component', standalone: false, template: {template:?} }})\n\
+         export class MyComponent {{}}\n"
+    );
+    let options = ComponentTransformOptions { angular_version: version, ..Default::default() };
+    let result = transform_angular_file(&allocator, "test.ts", &source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    result.code.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Port of `r3_compiler_compliance/elements/security_sensitive_constant_attributes`.
+#[test]
+fn test_security_sensitive_constant_attributes_use_trusted_value_fns() {
+    let code = compile_component_compact(
+        r#"<embed src="https://angular.io/" />
+        <iframe srcdoc="<h1>Angular</h1>"></iframe>
+        <object data="https://angular.io/" codebase="/"></object>
+        <embed src="https://angular.io/" />
+        <img src="https://angular.io/" />"#,
+        None,
+    );
+    assert!(
+        code.contains(
+            "consts:[[\"src\",i0.ɵɵtrustConstantResourceUrl`https://angular.io/`],\
+             [\"srcdoc\",i0.ɵɵtrustConstantHtml`<h1>Angular</h1>`],\
+             [\"data\",i0.ɵɵtrustConstantResourceUrl`https://angular.io/`,\
+             \"codebase\",i0.ɵɵtrustConstantResourceUrl`/`],[\"src\",\"https://angular.io/\"]]"
+        ),
+        "{code}"
+    );
+    assert!(
+        code.contains(
+            "i0.ɵɵelement(0,\"embed\",0)(1,\"iframe\",1)(2,\"object\",2)(3,\"embed\",0)(4,\"img\",3)"
+        ),
+        "{code}"
+    );
+}
+
+/// Structural templates and `ng-template` look attributes up under `ng-template`;
+/// trusted constants escape template-literal control sequences.
+#[test]
+fn test_security_sensitive_constant_attributes_on_templates() {
+    let code = compile_component_compact(
+        r#"<div *ngIf="c" innerHTML="<b>x</b>"></div><ng-template innerHTML="<i>y</i>"></ng-template>@if (c) {<embed src="/a${x}`b" />}<svg><a href="/s"></a></svg>"#,
+        None,
+    );
+    assert!(
+        code.contains(
+            "consts:[[\"innerHTML\",i0.ɵɵtrustConstantHtml`<b>x</b>`,4,\"ngIf\"],\
+             [\"innerHTML\",i0.ɵɵtrustConstantHtml`<i>y</i>`],[\"src\",\"/a${x}`b\"],\
+             [\"href\",\"/s\"],[\"innerHTML\",i0.ɵɵtrustConstantHtml`<b>x</b>`],\
+             [\"src\",i0.ɵɵtrustConstantResourceUrl`/a$\\{x}\\`b`]]"
+        ),
+        "{code}"
+    );
+}
+
+/// Port of `r3_view_compiler_bindings/host_bindings/security_sensitive_constant_attributes`:
+/// upstream skips trusted value functions for host jobs.
+#[test]
+fn test_host_security_sensitive_constant_attributes_stay_plain() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Directive } from '@angular/core';
+
+@Directive({
+  selector: '[hostBindingDir]',
+  host: {'src': 'trusted', 'srcdoc': 'trusted'},
+})
+export class HostBindingDir {}
+
+@Directive({
+  selector: 'img',
+  host: {'src': 'trusted', 'srcdoc': 'trusted'},
+})
+export class HostBindingDir2 {}
+";
+    let result = transform_angular_file(&allocator, "test.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let code: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        code.matches("hostAttrs:[\"src\",\"trusted\",\"srcdoc\",\"trusted\"]").count(),
+        2,
+        "{code}"
+    );
+    assert!(!code.contains("trustConstant"), "{code}");
+}
+
+/// Static i18n attributes are wrapped in their sanitizer, or `ɵɵvalidateAttribute`
+/// with the `:svg:` / `:math:` qualified tag, matching ngtsc 22.2.2.
+#[test]
+fn test_i18n_attribute_sanitizers() {
+    let code = compile_component_compact(
+        r#"<a href="https://x" i18n-href>x</a><svg><a href="https://y" i18n-href></a><animate attributeName="x" i18n-attributeName></animate><set to="x" i18n-to></set></svg><ng-template href="x" i18n-href></ng-template><a *ngIf="c" href="https://z" i18n-href>z</a><math><mi href="https://m" i18n-href></mi></math><form action="/go" i18n-action></form><area href="/a" i18n-href /><div title="t" i18n-title></div>"#,
+        None,
+    );
+    assert!(
+        code.contains(
+            "return[[\"href\",i0.ɵɵsanitizeUrl(i18n_0)],[\"href\",i0.ɵɵsanitizeUrl(i18n_1)],\
+             [\"attributeName\",i0.ɵɵvalidateAttribute(i18n_2,\":svg:animate\",\"attributeName\")],\
+             [\"to\",i0.ɵɵvalidateAttribute(i18n_3,\":svg:set\",\"to\")],[\"href\",i18n_4],\
+             [\"href\",i18n_5,4,\"ngIf\"],[\"href\",i0.ɵɵsanitizeUrl(i18n_6)],\
+             [\"action\",i0.ɵɵsanitizeUrl(i18n_7)],[\"href\",i0.ɵɵsanitizeUrl(i18n_8)],\
+             [\"title\",i18n_9],[\"href\",i0.ɵɵsanitizeUrl(i18n_5)]];"
+        ),
+        "{code}"
+    );
+}
+
+/// `resolveI18nAttrSanitizers` landed with `normalizeTagName`
+/// (angular/angular@61a97f22e8); earlier versions emit the bare i18n variable.
+#[test]
+fn test_i18n_attribute_sanitizers_are_version_gated() {
+    const TEMPLATE: &str = r#"<a href="https://x" i18n-href>x</a>"#;
+    for version in [
+        AngularVersion::new(19, 2, 22),
+        AngularVersion::new(20, 3, 21),
+        AngularVersion::new(21, 2, 14),
+    ] {
+        let code = compile_component_compact(TEMPLATE, Some(version));
+        assert!(code.contains("return[[\"href\",i18n_0]];"), "{version:?}: {code}");
+    }
+    for version in [
+        AngularVersion::new(19, 2, 23),
+        AngularVersion::new(20, 3, 22),
+        AngularVersion::new(21, 2, 15),
+        AngularVersion::new(22, 0, 0),
+    ] {
+        let code = compile_component_compact(TEMPLATE, Some(version));
+        assert!(
+            code.contains("return[[\"href\",i0.ɵɵsanitizeUrl(i18n_0)]];"),
+            "{version:?}: {code}"
+        );
+    }
+}
+
+/// `hostAttrs` follow ngtsc's object order: as written, with array-index keys
+/// first, then a non-empty static style and class (an empty one is dropped).
+#[test]
+fn host_attrs_follow_ngtsc_order() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Directive } from '@angular/core';
+
+@Directive({
+    selector: '[d]',
+    host: { z: 'last', '10': 'ten', role: 'button', '2': 'two', class: '', style: 'color: red' },
+})
+export class D {}
+"#;
+    let result = transform_angular_file(&allocator, "d.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(
+            r#"hostAttrs:["2","two","10","ten","z","last","role","button",2,"color","red"]"#
+        ),
+        "{}",
+        result.code
+    );
+}
+
+/// A `@HostBinding` / `@HostListener` on a key `host:` already binds replaces
+/// that entry where it was written, so the key is bound once (ngtsc's
+/// `extractHostBindings`), for components and directives alike.
+#[test]
+fn host_members_replace_host_entries_once() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component, Directive, HostBinding, HostListener } from '@angular/core';
+
+@Component({
+    selector: 'app-c',
+    template: '',
+    host: { '[title]': 'hostTitle', '[id]': 'hostId', '(click)': 'fromHost()' },
+})
+export class C {
+    @HostBinding('title') memberTitle = '';
+    @HostListener('click') fromMember() {}
+}
+
+@Directive({
+    selector: '[d]',
+    host: { '[class.on]': 'flag', '(click)': 'fromHost()' },
+})
+export class D {
+    @HostBinding('class.on') memberFlag = false;
+    @HostListener('click') fromMember() {}
+}
+"#;
+    let result = transform_angular_file(&allocator, "c.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized.contains(r#"ɵɵdomProperty("title",ctx.memberTitle)("id",ctx.hostId)"#),
+        "{}",
+        result.code
+    );
+    assert!(normalized.contains(r#"ɵɵclassProp("on",ctx.memberFlag);"#), "{}", result.code);
+    assert!(!normalized.contains("ctx.fromHost()"), "{}", result.code);
+    assert_eq!(normalized.matches("returnctx.fromMember();").count(), 2, "{}", result.code);
+}
+
+/// `createHostDirectivesFeatureArg`: an entry is the bare class unless
+/// `inputs` or `outputs` is written (even empty), and a forward reference
+/// wraps the whole array in a function, for directives as for components.
+#[test]
+fn host_directives_feature_arg_matches_angular() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component, Directive, forwardRef } from '@angular/core';
+
+@Directive({ selector: '[basic]' })
+export class BasicDirective {}
+
+const HOST_DIRECTIVES = [BasicDirective, { directive: BasicDirective, inputs: [] }];
+
+@Component({ selector: 'app-c', template: '', hostDirectives: HOST_DIRECTIVES })
+export class C {}
+
+@Directive({
+    selector: '[d]',
+    hostDirectives: [{ directive: BasicDirective }, forwardRef(() => LaterDirective)],
+})
+export class D {}
+
+@Directive({ selector: '[later]' })
+export class LaterDirective {}
+"#;
+    let result = transform_angular_file(&allocator, "c.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let normalized = result.code.replace([' ', '\n', '\t'], "");
+    assert!(
+        normalized
+            .contains(r#"ɵɵHostDirectivesFeature([BasicDirective,{directive:BasicDirective}])"#),
+        "{}",
+        result.code
+    );
+    assert!(
+        normalized.contains(
+            r#"ɵɵHostDirectivesFeature(function(){return[BasicDirective,LaterDirective];})"#
+        ),
+        "{}",
+        result.code
+    );
 }

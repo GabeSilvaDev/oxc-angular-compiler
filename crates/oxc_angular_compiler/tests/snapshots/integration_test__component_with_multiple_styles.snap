@@ -13,19 +13,19 @@ static ɵfac = function MultiStyledComponent_Factory(__ngFactoryType__) {
 static ɵcmp = /*@__PURE__*/ i0.ɵɵdefineComponent({type:MultiStyledComponent,selectors:[["app-multi-styled"]],
     decls:2,vars:0,template:function MultiStyledComponent_Template(rf,ctx) {
       if ((rf & 1)) {
-        i0.ɵɵelementStart(0,"div");
+        i0.ɵɵdomElementStart(0,"div");
         i0.ɵɵtext(1,"Content");
-        i0.ɵɵelementEnd();
+        i0.ɵɵdomElementEnd();
       }
     },styles:[".first[_ngcontent-%COMP%] { color: blue; }",".second[_ngcontent-%COMP%] { background: white; }"]});
 }
-(() =>{
-  (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassDebugInfo(MultiStyledComponent,
-      {className:"MultiStyledComponent",filePath:"multi-styled.component.ts",lineNumber:12}));
-})();
 (() =>{
   (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassMetadata(MultiStyledComponent,
       [{type:Component,args:[{selector:"app-multi-styled",template:"<div>Content</div>",
           styles:[".first { color: blue; }",".second { background: white; }"]}]}],
       null,null));
+})();
+(() =>{
+  (((typeof ngDevMode === "undefined") || ngDevMode) && i0.ɵsetClassDebugInfo(MultiStyledComponent,
+      {className:"MultiStyledComponent",filePath:"multi-styled.component.ts",lineNumber:12}));
 })();
