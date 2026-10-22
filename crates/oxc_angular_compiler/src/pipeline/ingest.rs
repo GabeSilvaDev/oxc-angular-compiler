@@ -31,7 +31,8 @@ use crate::ast::r3::{
     R3TextAttribute, SecurityContext,
 };
 use crate::ir::enums::{
-    BindingKind, DeferOpModifierKind, DeferTriggerKind, Namespace, TDeferDetailsFlags, TemplateKind,
+    AnimationKind, BindingKind, DeferOpModifierKind, DeferTriggerKind, Namespace,
+    TDeferDetailsFlags, TemplateKind,
 };
 use crate::ir::expression::{
     BinaryExpr, ConditionalCaseExpr, EmptyExpr, IrBinaryOperator, IrExpression, LexicalReadExpr,
@@ -40,12 +41,12 @@ use crate::ir::expression::{
     TwoWayBindingSetExpr, VisitorContextFlag, transform_expressions_in_expression,
 };
 use crate::ir::ops::{
-    BindingOp, ConditionalBranchCreateOp, ConditionalOp, ConditionalUpdateOp, CreateOp,
-    CreateOpBase, DeclareLetOp, DeferOnOp, DeferOp, DeferWhenOp, ElementEndOp, ElementStartOp,
-    ExtractedAttributeOp, I18nAttributesOp, I18nEndOp, I18nPlaceholder, I18nSlotHandle,
-    I18nStartOp, IcuEndOp, IcuStartOp, InterpolateTextOp, ListenerOp, LocalRef, ProjectionOp,
-    RepeaterCreateOp, RepeaterOp, RepeaterVarNames, SlotId, StatementOp, StoreLetOp, TemplateOp,
-    TextOp, TwoWayListenerOp, UpdateOp, UpdateOpBase, XrefId,
+    AnimationListenerOp, BindingOp, ConditionalBranchCreateOp, ConditionalOp, ConditionalUpdateOp,
+    CreateOp, CreateOpBase, DeclareLetOp, DeferOnOp, DeferOp, DeferWhenOp, ElementEndOp,
+    ElementStartOp, ExtractedAttributeOp, I18nAttributesOp, I18nEndOp, I18nPlaceholder,
+    I18nSlotHandle, I18nStartOp, IcuEndOp, IcuStartOp, InterpolateTextOp, ListenerOp, LocalRef,
+    ProjectionOp, RepeaterCreateOp, RepeaterOp, RepeaterVarNames, SlotId, StatementOp, StoreLetOp,
+    TemplateOp, TextOp, TwoWayListenerOp, UpdateOp, UpdateOpBase, XrefId,
 };
 use crate::output::ast::{OutputExpression, ReadVarExpr};
 use crate::pipeline::compilation::{AliasVariable, ContextVariable};
@@ -1893,16 +1894,29 @@ fn ingest_listener_owned<'a>(
             }
         }
 
+        if output.event_type == ParsedEventType::Animation {
+            let op = create_animation_listener_op(
+                allocator,
+                element_xref,
+                tag,
+                false,
+                output.name,
+                handler_ops,
+                handler_expr,
+                output.source_span,
+            );
+            if let Some(view) = job.view_mut(view_xref) {
+                view.create.push(op);
+            }
+            return;
+        }
+
         // Match Angular's createListenerOp:
         //   isLegacyAnimationListener = legacyAnimationPhase !== null
         // The raw phase string is preserved verbatim so that bogus phases (e.g.
         // `@anim.foo`) still emit `ɵɵsyntheticHostListener("@anim.foo", fn)`,
-        // matching Angular's reference output. ParsedEventType::Animation has no
-        // phase and is currently flagged as an animation listener for parity with
-        // the prior behavior; it should be dispatched to AnimationListenerOp by a
-        // separate template-path fix.
+        // matching Angular's reference output.
         let (is_animation_listener, legacy_animation_phase) = match output.event_type {
-            ParsedEventType::Animation => (true, None),
             ParsedEventType::LegacyAnimation => {
                 let phase = output.phase.clone();
                 (phase.is_some(), phase)
@@ -1931,6 +1945,55 @@ fn ingest_listener_owned<'a>(
     if let Some(view) = job.view_mut(view_xref) {
         view.create.push(op);
     }
+}
+
+/// Creates the `AnimationListenerOp` for an `(animate.enter)` / `(animate.leave)` event.
+///
+/// The last handler expression is returned, as in Angular's `makeListenerHandlerOps`.
+#[allow(clippy::too_many_arguments)]
+fn create_animation_listener_op<'a>(
+    allocator: &'a oxc_allocator::Allocator,
+    target: XrefId,
+    tag: Option<Ident<'a>>,
+    host_listener: bool,
+    name: Ident<'a>,
+    mut handler_ops: Vec<'a, UpdateOp<'a>>,
+    handler_expr: Option<Box<'a, IrExpression<'a>>>,
+    source_span: oxc_span::Span,
+) -> CreateOp<'a> {
+    if let Some(expr) = handler_expr {
+        let return_stmt = crate::output::ast::OutputStatement::Return(Box::new_in(
+            crate::output::ast::ReturnStatement {
+                value: OutputExpression::WrappedIrNode(Box::new_in(
+                    crate::output::ast::WrappedIrExpr {
+                        node: expr,
+                        source_span: Some(source_span),
+                    },
+                    &allocator,
+                )),
+                source_span: Some(source_span),
+            },
+            &allocator,
+        ));
+        handler_ops.push(UpdateOp::Statement(StatementOp {
+            base: UpdateOpBase::default(),
+            statement: return_stmt,
+        }));
+    }
+    let phase =
+        if name.as_str().ends_with("enter") { AnimationKind::Enter } else { AnimationKind::Leave };
+    CreateOp::AnimationListener(AnimationListenerOp {
+        base: CreateOpBase { source_span: Some(source_span), ..Default::default() },
+        target,
+        target_slot: SlotId(0), // Will be set during slot allocation
+        tag,
+        host_listener,
+        name,
+        handler_ops,
+        handler_fn_name: None,
+        phase,
+        consumes_dollar_event: false, // Set during resolve_dollar_event phase
+    })
 }
 
 /// Checks if a template is an explicit `<ng-template>` (as opposed to a structural directive).
@@ -2212,6 +2275,12 @@ fn ingest_template<'a>(
     for output in outputs {
         if template_kind == TemplateKind::NgTemplate {
             // For explicit <ng-template>, create listeners at the template level.
+            // Angular's `ingestTemplateBindings` makes a plain listener for every output here,
+            // `(animate.enter)` / `(animate.leave)` included.
+            let mut output = output;
+            if output.event_type == ParsedEventType::Animation {
+                output.event_type = ParsedEventType::Regular;
+            }
             ingest_listener_owned(job, view_xref, xref, tag_name.clone(), output);
         } else {
             // For structural directives, create ExtractedAttributeOp for directive matching.
@@ -4500,10 +4569,25 @@ fn ingest_host_event<'a>(job: &mut HostBindingCompilationJob<'a>, event: R3Bound
     // not silently dropped — they round-trip into the emitted instruction so the
     // output matches Angular byte-for-byte.
     //
-    // For host events the binding parser only produces Regular or LegacyAnimation
-    // (Animation is template-only), and a LegacyAnimation event with no phase (e.g.
-    // `@HostListener('@anim')`) leaves is_animation_listener=false so reify emits a
-    // plain ɵɵlistener — matching Angular's `isLegacyAnimationListener=false` path.
+    // A LegacyAnimation event with no phase (e.g. `@HostListener('@anim')`) leaves
+    // is_animation_listener=false so reify emits a plain ɵɵlistener — matching
+    // Angular's `isLegacyAnimationListener=false` path.
+    if event.event_type == ParsedEventType::Animation {
+        let root_xref = job.root.xref;
+        let op = create_animation_listener_op(
+            allocator,
+            root_xref,
+            None,
+            true,
+            event.name,
+            handler_ops,
+            handler_expr,
+            event.source_span,
+        );
+        job.root.create.push(op);
+        return;
+    }
+
     let (legacy_animation_phase, target) = match event.event_type {
         ParsedEventType::LegacyAnimation => (event.phase.clone(), None),
         _ => (None, event.target.clone()),

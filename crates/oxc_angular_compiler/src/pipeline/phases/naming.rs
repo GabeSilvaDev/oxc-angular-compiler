@@ -864,7 +864,7 @@ fn process_single_create_op_ref<'a>(
         CreateOp::AnimationListener(listener) => {
             if listener.handler_fn_name.is_none() {
                 let slot = listener.target_slot.0;
-                let animation_kind = listener.name.as_str().replace('.', "");
+                let animation_kind = listener.name.as_str().replacen('.', "", 1);
                 let fn_name_str = fn_name.map(|n| n.as_str()).unwrap_or(base_name);
 
                 let handler_name = if listener.host_listener {
@@ -1220,7 +1220,7 @@ pub fn name_functions_and_variables_for_host(job: &mut HostBindingCompilationJob
             }
             CreateOp::AnimationListener(listener) => {
                 if listener.handler_fn_name.is_none() && listener.host_listener {
-                    let animation_kind = listener.name.as_str().replace('.', "");
+                    let animation_kind = listener.name.as_str().replacen('.', "", 1);
                     let handler_name =
                         format!("{sanitized_base}_{animation_kind}_HostBindingHandler");
                     let sanitized = sanitize_identifier(&handler_name);

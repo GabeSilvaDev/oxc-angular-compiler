@@ -706,6 +706,13 @@ fn convert_r3_host_metadata_to_input<'a>(
 
         let (effective_name, event_type, phase) =
             parse_legacy_animation_event(final_event_name, &allocator);
+        // Angular's `_parseRegularEvent` checks the name before splitting off the target.
+        let event_type =
+            if event_type == ParsedEventType::Regular && event_name.starts_with("animate.") {
+                ParsedEventType::Animation
+            } else {
+                event_type
+            };
 
         // Parse the handler expression
         let value_str = allocator.alloc_str(value.as_str());

@@ -909,7 +909,7 @@ fn reify_create_op<'a>(
             ))
         }
         CreateOp::AnimationListener(listener) => {
-            // Emit syntheticHostListener instruction for animation listeners
+            // Emit ɵɵanimateEnterListener / ɵɵanimateLeaveListener
             let mut handler_stmts = OxcVec::new_in(&allocator);
             for handler_op in listener.handler_ops.iter() {
                 if let Some(stmt) = reify_update_op(
@@ -929,7 +929,6 @@ fn reify_create_op<'a>(
             Some(create_animation_listener_stmt(
                 &allocator,
                 core_namespace,
-                &listener.name,
                 listener.phase,
                 handler_stmts,
                 listener.handler_fn_name.as_ref(),
@@ -1803,7 +1802,7 @@ fn reify_host_create_op<'a>(
             }
         }
         CreateOp::AnimationListener(listener) => {
-            // Emit syntheticHostListener for animation listeners
+            // Emit ɵɵanimateEnterListener / ɵɵanimateLeaveListener
             let mut handler_stmts = OxcVec::new_in(&allocator);
             for handler_op in listener.handler_ops.iter() {
                 // Host bindings use Full mode (not DomOnly)
@@ -1824,12 +1823,22 @@ fn reify_host_create_op<'a>(
             Some(create_animation_listener_stmt(
                 &allocator,
                 core_namespace,
-                &listener.name,
                 listener.phase,
                 handler_stmts,
                 listener.handler_fn_name.as_ref(),
                 listener.consumes_dollar_event,
             ))
+        }
+        CreateOp::AnimationString(anim) => {
+            // Emit ɵɵanimateEnter or ɵɵanimateLeave for a static `animate.enter` / `animate.leave`
+            let expr = convert_ir_expression(
+                allocator,
+                core_namespace,
+                &anim.expression,
+                expressions,
+                root_xref,
+            );
+            Some(create_animation_string_stmt(allocator, core_namespace, anim.animation_kind, expr))
         }
         // ExtractedAttribute ops are handled separately for hostAttrs
         CreateOp::ExtractedAttribute(_) => None,
