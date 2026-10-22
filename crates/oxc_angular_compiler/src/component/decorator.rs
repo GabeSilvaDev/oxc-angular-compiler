@@ -6,7 +6,7 @@
 use oxc_allocator::{Allocator, Vec};
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, Class, ClassElement, Decorator, Expression,
-    MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
+    MethodDefinitionKind, ObjectExpression, ObjectPropertyKind, PropertyKey,
 };
 use oxc_span::Span;
 use oxc_str::Ident;
@@ -18,9 +18,8 @@ use super::metadata::{
 };
 use super::transform::ImportMap;
 use crate::directive::{
-    HostKey, StringConsts, extract_host_bindings_in, extract_host_listeners_in,
-    extract_input_metadata_in, extract_output_metadata_in, merge_by_class_property,
-    parse_decorator_io,
+    HostKey, MemberHostBindings, StringConsts, evaluate_host_directives, extract_input_metadata_in,
+    extract_output_metadata_in, merge_by_class_property, merge_host_bindings, parse_decorator_io,
 };
 use crate::output::oxc_converter::convert_oxc_expression;
 use crate::util::is_metadata_property;
@@ -61,25 +60,15 @@ pub fn extract_component_metadata<'a>(
     let class_name: Ident<'a> = class.id.as_ref()?.name.clone().into();
     let class_span = class.span;
 
-    // Find Angular's @Component decorator
-    let component_decorator = find_component_decorator(&class.decorators, consts)?;
-
-    // Get the decorator call arguments
-    let call_expr = match &component_decorator.expression {
-        Expression::CallExpression(call) => call,
-        _ => return None,
-    };
-
-    // Get the first argument (the config object)
-    let config_arg = call_expr.arguments.first()?;
-    let config_obj = match config_arg {
-        Argument::ObjectExpression(obj) => obj,
-        _ => return None,
-    };
+    let config_obj = component_config(class, consts)?;
 
     // Create metadata with defaults (standalone uses implicit_standalone when not explicitly set)
     let mut metadata =
         ComponentMetadata::new(allocator, class_name, class_span, implicit_standalone);
+
+    // Whether `imports` and `deferredImports` are provably empty; a spread or
+    // accessor this loop skips could add them.
+    let mut imports_provably_empty = true;
 
     // Parse each property in the config object
     for prop in &config_obj.properties {
@@ -113,7 +102,7 @@ pub fn extract_component_metadata<'a>(
                     // for @Component.template field" in local mode,
                     // "template must be a string" otherwise) — pre-existing.
                     metadata.template =
-                        crate::directive::extract_string_value(allocator, &prop.value, consts);
+                        crate::directive::evaluate_string_value(allocator, &prop.value, consts);
                     // The text between the quotes or backticks.
                     metadata.template_span = match &prop.value {
                         Expression::StringLiteral(lit) => Some(lit.span),
@@ -125,8 +114,12 @@ pub fn extract_component_metadata<'a>(
                     .map(|span| Span::new(span.start + 1, span.end - 1));
                 }
                 "templateUrl" => {
+                    // Evaluated like ngtsc's `parseTemplateDeclaration`, so a
+                    // URL imported from another file resolves when the consts
+                    // carry the cross-file resolver. The resource extractor
+                    // (`extract_component_resource_urls`) reads it the same way.
                     metadata.template_url =
-                        crate::directive::extract_string_value(allocator, &prop.value, consts);
+                        crate::directive::evaluate_string_value(allocator, &prop.value, consts);
                 }
                 "styles" => {
                     // ngtsc's `reflectObjectLiteral` drops computed keys and
@@ -157,13 +150,7 @@ pub fn extract_component_metadata<'a>(
                     }
                 }
                 "styleUrls" | "styleUrl" => {
-                    if let Some(urls) = extract_string_array(allocator, &prop.value, consts) {
-                        metadata.style_urls = urls;
-                    } else if let Some(url) =
-                        crate::directive::extract_string_value(allocator, &prop.value, consts)
-                    {
-                        metadata.style_urls.push(url);
-                    }
+                    read_style_urls(allocator, &prop.value, consts, &mut metadata.style_urls);
                 }
                 "standalone" => {
                     // Only override the implicit value if an explicit boolean is provided
@@ -187,6 +174,7 @@ pub fn extract_component_metadata<'a>(
                     }
                 }
                 "imports" => {
+                    imports_provably_empty &= is_empty_array_literal(&prop.value);
                     // For standalone components, we need:
                     // 1. The identifier list for local analysis
                     metadata.imports = extract_identifier_array(allocator, &prop.value);
@@ -195,6 +183,7 @@ pub fn extract_component_metadata<'a>(
                         convert_oxc_expression(allocator, &prop.value, source_text);
                 }
                 "deferredImports" => {
+                    imports_provably_empty &= is_empty_array_literal(&prop.value);
                     // Symbols explicitly opted into lazy loading via `@defer`.
                     // Mirrors Angular's `@Component.deferredImports` field; in
                     // local compilation this is the only source of deferrable
@@ -258,51 +247,23 @@ pub fn extract_component_metadata<'a>(
                     // Unknown property - ignore
                 }
             }
+        } else {
+            imports_provably_empty = false;
         }
     }
+    metadata.imports_provably_empty = imports_provably_empty;
 
-    // Extract host bindings and listeners from @HostBinding/@HostListener decorators on class members
-    // These are merged with any host metadata from the @Component({ host: {} }) property
-    //
-    // Divergence from ngtsc (pre-existing merge structure): upstream assigns
-    // member entries into `bindings.properties[name]` / `bindings.listeners`
-    // [eventName], overwriting same-named `host:` entries so one binding per
-    // key remains. Here they are appended instead, so a key declared in both
-    // emits two bindings — both listeners fire, and both property ops emit
-    // (the member's, applied last, still wins like upstream).
-    let host_bindings = extract_host_bindings_in(allocator, class, Some(consts));
-    let host_listeners = extract_host_listeners_in(allocator, class, Some(consts));
-
-    if !host_bindings.is_empty() || !host_listeners.is_empty() {
+    // Merge @HostBinding/@HostListener members into the `host:` bindings the
+    // way ngtsc's `extractHostBindings` does (shared with @Directive).
+    let members = MemberHostBindings::of(allocator, class, Some(consts));
+    if !members.is_empty() || metadata.host.is_some() {
         let host = metadata.host.get_or_insert_with(|| HostMetadata::new(allocator));
-
-        // Add @HostBinding properties
-        // Wrap with brackets: "class.active" -> "[class.active]"
-        for (host_prop, class_prop) in host_bindings {
-            let wrapped_key =
-                Ident::from(allocator.alloc_str(&format!("[{}]", host_prop.as_str())));
-            host.properties.push((wrapped_key, class_prop));
-        }
-
-        // Add @HostListener events
-        // Wrap event name with parentheses and build method expression with args
-        // Reference: Angular's shared.ts:713 - `bindings.listeners[eventName] = \`${member.name}(${args.join(',')})\``
-        for (event_name, method_name, args) in host_listeners {
-            // Wrap event name: "click" -> "(click)"
-            let wrapped_key =
-                Ident::from(allocator.alloc_str(&format!("({})", event_name.as_str())));
-
-            // Build method expression with args: "handleClick" + ["$event"] -> "handleClick($event)"
-            let method_expr = if args.is_empty() {
-                Ident::from(allocator.alloc_str(&format!("{}()", method_name.as_str())))
-            } else {
-                let args_str: String =
-                    args.iter().map(|a| a.as_str()).collect::<std::vec::Vec<_>>().join(",");
-                Ident::from(allocator.alloc_str(&format!("{}({})", method_name.as_str(), args_str)))
-            };
-
-            host.listeners.push((wrapped_key, method_expr));
-        }
+        merge_host_bindings(
+            &mut host.properties,
+            &mut host.listeners,
+            &mut host.attributes,
+            members,
+        );
     }
 
     // Detect if the component extends another class
@@ -423,6 +384,11 @@ fn get_property_key_name<'a>(
     }
 }
 
+/// Whether `expr` is the array literal `[]`.
+fn is_empty_array_literal(expr: &Expression<'_>) -> bool {
+    matches!(expr, Expression::ArrayExpression(array) if array.elements.is_empty())
+}
+
 /// Extract a boolean value from an expression.
 fn extract_boolean_value(expr: &Expression<'_>) -> Option<bool> {
     match expr {
@@ -430,33 +396,71 @@ fn extract_boolean_value(expr: &Expression<'_>) -> Option<bool> {
         _ => None,
     }
 }
-/// Extract an array of strings from an expression.
-///
-/// `${...}` interpolations inside individual template-literal elements are
-/// folded against `consts` (e.g. `` styles: [`:host { color: ${COLOR}; }`] ``)
-/// to match Angular's partial evaluator. Identifier elements (`[STYLE_CONST]`)
-/// are likewise resolved.
-fn extract_string_array<'a>(
-    allocator: &'a Allocator,
-    expr: &Expression<'a>,
-    consts: &StringConsts<'a>,
-) -> Option<Vec<'a, Ident<'a>>> {
-    let Expression::ArrayExpression(arr) = expr else {
+/// The `{...}` config object of `class`'s `@Component(...)`, or `None` when
+/// the class has no `@Component` call with an object literal argument.
+fn component_config<'a>(
+    class: &'a Class<'a>,
+    consts: &StringConsts<'_>,
+) -> Option<&'a ObjectExpression<'a>> {
+    let component_decorator = find_component_decorator(&class.decorators, consts)?;
+    let Expression::CallExpression(call_expr) = &component_decorator.expression else {
         return None;
     };
+    match call_expr.arguments.first()? {
+        Argument::ObjectExpression(obj) => Some(obj),
+        _ => None,
+    }
+}
 
-    let mut result = Vec::new_in(&allocator);
-    for element in &arr.elements {
-        // ArrayExpressionElement variants that can hold a value expression all
-        // carry one — funnel them through `as_expression()` and let the shared
-        // resolver decide which shapes fold.
-        let Some(elem_expr) = element.as_expression() else { continue };
-        if let Some(value) = crate::directive::extract_string_value(allocator, elem_expr, consts) {
-            result.push(value);
+/// One `styleUrl` / `styleUrls` property: an array literal replaces the URLs
+/// read so far; any other value adds to them.
+fn read_style_urls<'a>(
+    allocator: &'a Allocator,
+    value: &'a Expression<'a>,
+    consts: &StringConsts<'a>,
+    urls: &mut Vec<'a, Ident<'a>>,
+) {
+    if matches!(value, Expression::ArrayExpression(_)) {
+        urls.clear();
+    }
+    crate::directive::evaluate_style_urls(allocator, value, consts, urls);
+}
+
+/// The `templateUrl` and `styleUrl(s)` of `class`'s `@Component`, read exactly
+/// as [`extract_component_metadata`] reads them, and `None` exactly when it
+/// gives `None`. Only those properties are evaluated, so the import value
+/// resolver in `consts` (if any) reads another file only when one of them
+/// names an imported binding — never for `host`, `styles`, inputs or deps.
+pub fn extract_component_resource_urls_of<'a>(
+    allocator: &'a Allocator,
+    class: &'a Class<'a>,
+    consts: &StringConsts<'a>,
+) -> Option<(Option<Ident<'a>>, Vec<'a, Ident<'a>>)> {
+    class.id.as_ref()?;
+    let config_obj = component_config(class, consts)?;
+    let mut template_url = None;
+    let mut style_urls = Vec::new_in(&allocator);
+    for prop in &config_obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(prop) = prop
+            && is_metadata_property(prop)
+        {
+            if matches!(&prop.key, PropertyKey::StringLiteral(lit) if lit.value.has_lone_surrogate())
+            {
+                continue;
+            }
+            match get_property_key_name(&prop.key, consts)?.as_str() {
+                "templateUrl" => {
+                    template_url =
+                        crate::directive::evaluate_string_value(allocator, &prop.value, consts);
+                }
+                "styleUrls" | "styleUrl" => {
+                    read_style_urls(allocator, &prop.value, consts, &mut style_urls);
+                }
+                _ => {}
+            }
         }
     }
-
-    Some(result)
+    Some((template_url, style_urls))
 }
 
 /// Extract an array of identifiers (for imports).
@@ -559,281 +563,36 @@ fn extract_host_metadata<'a>(
     Some(host)
 }
 
-/// Extract host directives from a hostDirectives array expression.
-///
-/// Divergence from ngtsc's `extractHostDirectives`: upstream evaluates the
-/// expression with the partial evaluator (a const or spread array works, a
-/// non-array is an error). Here only a literal `ArrayExpression` is read and
-/// anything else yields no host directives, with no diagnostic.
-///
-/// Handles the following patterns:
-/// - Simple identifier: `hostDirectives: [TooltipDirective]`
-/// - Object with directive: `hostDirectives: [{ directive: ColorDirective }]`
-/// - Object with mappings: `hostDirectives: [{ directive: D, inputs: ['color', 'bgColor'], outputs: ['changed'] }]`
-/// - Forward ref: `hostDirectives: [forwardRef(() => MyDirective)]`
-///
-/// Reference: packages/compiler-cli/src/ngtsc/annotations/directive/src/shared.ts:1873-1985
+/// Extract host directives from a `hostDirectives` expression, read through
+/// the evaluator like ngtsc's `extractHostDirectives` (see
+/// [`crate::directive::evaluate_host_directives`]).
 fn extract_host_directives<'a>(
     allocator: &'a Allocator,
-    expr: &Expression<'a>,
+    expr: &'a Expression<'a>,
     import_map: &ImportMap<'a>,
     consts: &StringConsts<'a>,
 ) -> Vec<'a, HostDirectiveMetadata<'a>> {
-    let mut result = Vec::new_in(&allocator);
-
-    let Expression::ArrayExpression(arr) = expr else {
-        return result;
-    };
-
-    for element in &arr.elements {
-        if let Some(meta) = extract_single_host_directive(allocator, element, import_map, consts) {
-            result.push(meta);
+    let entries = evaluate_host_directives(allocator, expr, consts);
+    let mut result = Vec::with_capacity_in(entries.len(), &allocator);
+    for entry in entries {
+        let has_mapping_keys = entry.has_mapping_keys();
+        let mut meta = HostDirectiveMetadata::new(allocator, entry.name);
+        // Look up the source module from the import map
+        if let Some(import_info) = import_map.get(&entry.name) {
+            meta.source_module = Some(import_info.source_module);
         }
+        meta.is_forward_reference = entry.is_forward_reference;
+        meta.has_mapping_keys = has_mapping_keys;
+        if let Some(inputs) = entry.inputs {
+            meta.inputs = inputs;
+        }
+        if let Some(outputs) = entry.outputs {
+            meta.outputs = outputs;
+        }
+        result.push(meta);
     }
-
     result
 }
-
-/// Extract a single host directive from an array element.
-///
-/// Handles:
-/// - Identifier: `TooltipDirective`
-/// - Object: `{ directive: ColorDirective, inputs: [...], outputs: [...] }`
-/// - ForwardRef call: `forwardRef(() => MyDirective)`
-fn extract_single_host_directive<'a>(
-    allocator: &'a Allocator,
-    element: &ArrayExpressionElement<'a>,
-    import_map: &ImportMap<'a>,
-    consts: &StringConsts<'a>,
-) -> Option<HostDirectiveMetadata<'a>> {
-    match element {
-        // Simple identifier: TooltipDirective
-        ArrayExpressionElement::Identifier(id) => {
-            let name: Ident<'a> = id.name.clone().into();
-            let mut meta = HostDirectiveMetadata::new(allocator, name.clone());
-            // Look up the source module from the import map
-            if let Some(import_info) = import_map.get(&name) {
-                meta.source_module = Some(import_info.source_module.clone());
-            }
-            Some(meta)
-        }
-
-        // Object expression: { directive: ColorDirective, inputs: [...], outputs: [...] }
-        ArrayExpressionElement::ObjectExpression(obj) => {
-            let mut directive_name: Option<Ident<'a>> = None;
-            let mut inputs = Vec::new_in(&allocator);
-            let mut outputs = Vec::new_in(&allocator);
-            let mut is_forward_reference = false;
-
-            for prop in &obj.properties {
-                if let ObjectPropertyKind::ObjectProperty(prop) = prop
-                    && is_metadata_property(prop)
-                {
-                    let Some(key_name) = get_property_key_name(&prop.key, consts) else {
-                        continue;
-                    };
-
-                    match key_name.as_str() {
-                        "directive" => {
-                            // Extract directive class name
-                            // Can be identifier or forwardRef call
-                            let (name, is_forward_ref) = extract_directive_reference(&prop.value);
-                            directive_name = name;
-                            is_forward_reference = is_forward_ref;
-                        }
-                        "inputs" => {
-                            // Extract input mappings
-                            inputs = extract_io_mappings(allocator, &prop.value);
-                        }
-                        "outputs" => {
-                            // Extract output mappings
-                            outputs = extract_io_mappings(allocator, &prop.value);
-                        }
-                        _ => {
-                            // Unknown property - ignore
-                        }
-                    }
-                }
-            }
-
-            directive_name.map(|name| {
-                let mut meta = HostDirectiveMetadata::new(allocator, name.clone());
-                // Look up the source module from the import map
-                if let Some(import_info) = import_map.get(&name) {
-                    meta.source_module = Some(import_info.source_module.clone());
-                }
-                meta.inputs = inputs;
-                meta.outputs = outputs;
-                meta.is_forward_reference = is_forward_reference;
-                meta
-            })
-        }
-
-        // ForwardRef call: forwardRef(() => MyDirective)
-        ArrayExpressionElement::CallExpression(call) => {
-            if is_forward_ref_call(&call.callee) {
-                if let Some(name) = extract_forward_ref_directive_name(call.arguments.first()) {
-                    let mut meta = HostDirectiveMetadata::new(allocator, name.clone());
-                    // Look up the source module from the import map
-                    if let Some(import_info) = import_map.get(&name) {
-                        meta.source_module = Some(import_info.source_module.clone());
-                    }
-                    meta.is_forward_reference = true;
-                    return Some(meta);
-                }
-            }
-            None
-        }
-
-        _ => None,
-    }
-}
-
-/// Extract a directive reference from an expression.
-///
-/// Returns the directive class name and whether it's a forward reference.
-fn extract_directive_reference<'a>(expr: &Expression<'a>) -> (Option<Ident<'a>>, bool) {
-    match expr {
-        // Simple identifier: ColorDirective
-        Expression::Identifier(id) => (Some(id.name.clone().into()), false),
-
-        // ForwardRef call: forwardRef(() => ColorDirective)
-        Expression::CallExpression(call) => {
-            if is_forward_ref_call(&call.callee) {
-                (extract_forward_ref_directive_name(call.arguments.first()), true)
-            } else {
-                (None, false)
-            }
-        }
-
-        _ => (None, false),
-    }
-}
-
-/// Check if a callee is a forwardRef call.
-fn is_forward_ref_call(callee: &Expression<'_>) -> bool {
-    match callee {
-        Expression::Identifier(id) => id.name == "forwardRef",
-        _ => false,
-    }
-}
-
-/// Extract the directive name from a forwardRef argument.
-///
-/// Handles: `forwardRef(() => MyDirective)`
-fn extract_forward_ref_directive_name<'a>(arg: Option<&Argument<'a>>) -> Option<Ident<'a>> {
-    let arg = arg?;
-    match arg {
-        // forwardRef(() => MyDirective)
-        Argument::ArrowFunctionExpression(arrow) => {
-            // Expression body: () => MyDirective
-            if let Some(Expression::Identifier(id)) = arrow.get_expression() {
-                return Some(id.name.clone().into());
-            }
-            // Block body with single ExpressionStatement (parity with pre-0.144)
-            if let Some(body) = arrow.get_function_body() {
-                if let Some(oxc_ast::ast::Statement::ExpressionStatement(stmt)) =
-                    body.statements.first()
-                {
-                    if let Expression::Identifier(id) = &stmt.expression {
-                        return Some(id.name.clone().into());
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// Extract input/output mappings from an array expression.
-///
-/// Handles two formats:
-/// - Simple string: `["color"]` - same public and internal name
-/// - Mapping string: `["color: bgColor"]` - public name mapped to internal name
-///
-/// Returns Vec of (publicName, internalName) pairs.
-///
-/// Divergence: ngtsc evaluates the array with the partial evaluator, so a
-/// const or a spread works; here only a literal `ArrayExpression` is read.
-fn extract_io_mappings<'a>(
-    allocator: &'a Allocator,
-    expr: &Expression<'a>,
-) -> Vec<'a, (Ident<'a>, Ident<'a>)> {
-    let mut result = Vec::new_in(&allocator);
-
-    let Expression::ArrayExpression(arr) = expr else {
-        return result;
-    };
-
-    for element in &arr.elements {
-        if let Some((public_name, internal_name)) = parse_mapping_element(allocator, element) {
-            result.push((public_name, internal_name));
-        }
-    }
-
-    result
-}
-
-/// Parse a single mapping element from an input/output array.
-///
-/// Handles:
-/// - Simple string: `"color"` -> ("color", "color")
-/// - Mapping string: `"color: bgColor"` -> ("bgColor", "color")
-/// - Tuple array: `["color", "bgColor"]` -> ("bgColor", "color")
-fn parse_mapping_element<'a>(
-    allocator: &'a Allocator,
-    element: &ArrayExpressionElement<'a>,
-) -> Option<(Ident<'a>, Ident<'a>)> {
-    match element {
-        // Simple string: "color" - same public and internal name
-        ArrayExpressionElement::StringLiteral(lit) => {
-            let value = lit.value.as_str()?;
-
-            // Check for mapping format: "internalName: publicName"
-            if let Some(colon_pos) = value.find(':') {
-                let internal_name = value[..colon_pos].trim();
-                let public_name = value[colon_pos + 1..].trim();
-                Some((
-                    Ident::from(allocator.alloc_str(public_name)),
-                    Ident::from(allocator.alloc_str(internal_name)),
-                ))
-            } else {
-                // Same name for both
-                Some((Ident::from(value), Ident::from(value)))
-            }
-        }
-
-        // Tuple array: ["internalName", "publicName"]
-        ArrayExpressionElement::ArrayExpression(arr) => {
-            let elements = &arr.elements;
-            if elements.len() >= 2 {
-                let internal = match elements.first() {
-                    Some(ArrayExpressionElement::StringLiteral(lit)) => {
-                        lit.value.as_str().map(Ident::from)
-                    }
-                    _ => None,
-                };
-                let public = match elements.get(1) {
-                    Some(ArrayExpressionElement::StringLiteral(lit)) => {
-                        lit.value.as_str().map(Ident::from)
-                    }
-                    _ => None,
-                };
-                if let (Some(internal_name), Some(public_name)) = (internal, public) {
-                    return Some((public_name, internal_name));
-                }
-            }
-            None
-        }
-
-        _ => None,
-    }
-}
-
-// =============================================================================
-// Constructor Dependency Extraction
-// =============================================================================
 
 /// Check if a class has an `ngOnChanges` method.
 ///
@@ -2238,7 +1997,7 @@ mod tests {
     #[test]
     fn test_extract_host_directives_forward_ref() {
         let code = r#"
-            import {Component} from '@angular/core';
+            import {Component, forwardRef} from '@angular/core';
             @Component({
                 selector: 'app-test',
                 template: '',
@@ -2256,7 +2015,7 @@ mod tests {
     #[test]
     fn test_extract_host_directives_forward_ref_in_object() {
         let code = r#"
-            import {Component} from '@angular/core';
+            import {Component, forwardRef} from '@angular/core';
             @Component({
                 selector: 'app-test',
                 template: '',

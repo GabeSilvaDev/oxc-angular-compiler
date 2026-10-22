@@ -49,7 +49,8 @@ use crate::ir::ops::{
 };
 use crate::output::ast::{OutputExpression, ReadVarExpr};
 use crate::pipeline::compilation::{AliasVariable, ContextVariable};
-use rustc_hash::{FxHashMap, FxHashSet};
+use indexmap::IndexMap;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::cell::RefCell;
 
 /// Options for ingesting a component template.
@@ -1288,7 +1289,16 @@ fn ingest_element<'a>(
     // so that binding_specialization can detect ngNonBindable and other special attributes.
     // Note: We preserve i18n metadata for i18n-marked text attributes (e.g., tooltip="text" i18n-tooltip)
     // Element attributes are not structural template attributes
-    ingest_static_attributes_with_i18n(job, view_xref, xref, &element.attributes, false);
+    // Angular looks attributes up under the element's full name, which already
+    // carries any `:svg:` / `:math:` prefix.
+    ingest_static_attributes_with_i18n(
+        job,
+        view_xref,
+        xref,
+        element.name.as_str(),
+        &element.attributes,
+        false,
+    );
 
     // Ingest bindings BEFORE children to ensure update ops are in slot order.
     // This matches Angular's TypeScript implementation in ingest.ts.
@@ -1408,6 +1418,7 @@ fn ingest_static_attributes_with_i18n<'a>(
     job: &mut ComponentCompilationJob<'a>,
     view_xref: XrefId,
     element_xref: XrefId,
+    security_tag: &str,
     attributes: &[R3TextAttribute<'a>],
     is_structural_template_attribute: bool,
 ) {
@@ -1418,6 +1429,12 @@ fn ingest_static_attributes_with_i18n<'a>(
     for attr in attributes {
         let name = attr.name.clone();
         let value = attr.value.clone();
+        // `domSchema.securityContext(tag, attr.name, true)` in Angular's ingest.
+        let security_context = crate::schema::get_security_context_for(
+            security_tag,
+            name.as_str(),
+            job.angular_version,
+        );
 
         // ngNonBindable and animate.* require special handling
         if name.as_str() == "ngNonBindable" || name.as_str().starts_with("animate.") {
@@ -1434,7 +1451,7 @@ fn ingest_static_attributes_with_i18n<'a>(
                 name,
                 expression: Box::new_in(value_expr, &allocator),
                 unit: None,
-                security_context: SecurityContext::None,
+                security_context,
                 i18n_message: None,
                 is_text_attribute: true,
             };
@@ -1496,7 +1513,7 @@ fn ingest_static_attributes_with_i18n<'a>(
             namespace,
             name: local_name,
             value: Some(Box::new_in(value_expr, &allocator)),
-            security_context: SecurityContext::None,
+            security_context,
             truthy_expression: false,
             i18n_context: None,
             i18n_message,
@@ -1528,6 +1545,7 @@ fn ingest_single_static_attribute<'a>(
     job: &mut ComponentCompilationJob<'a>,
     view_xref: XrefId,
     element_xref: XrefId,
+    security_tag: &str,
     name: Ident<'a>,
     value: Ident<'a>,
     is_structural_template_attribute: bool,
@@ -1535,6 +1553,9 @@ fn ingest_single_static_attribute<'a>(
     use crate::output::ast::{LiteralExpr, LiteralValue, OutputExpression};
 
     let allocator = job.allocator;
+    // `domSchema.securityContext(tag, attr.name, true)` in Angular's ingest.
+    let security_context =
+        crate::schema::get_security_context_for(security_tag, name.as_str(), job.angular_version);
 
     let literal_expr = OutputExpression::Literal(Box::new_in(
         LiteralExpr { value: LiteralValue::String(value), source_span: None },
@@ -1554,7 +1575,7 @@ fn ingest_single_static_attribute<'a>(
             name,
             expression: Box::new_in(value_expr, &allocator),
             unit: None,
-            security_context: SecurityContext::None,
+            security_context,
             i18n_message: None,
             is_text_attribute: true,
         });
@@ -1576,7 +1597,7 @@ fn ingest_single_static_attribute<'a>(
             namespace,
             name: local_name,
             value: Some(Box::new_in(value_expr, &allocator)),
-            security_context: SecurityContext::None,
+            security_context,
             truthy_expression: false,
             i18n_context: None,
             i18n_message: None,
@@ -2082,7 +2103,15 @@ fn ingest_template<'a>(
             R3TemplateAttr::Text(attr) => {
                 // Static structural template attributes (e.g., ngFor from *ngFor="let item of items")
                 // Process inline to preserve ordering
-                ingest_single_static_attribute(job, view_xref, xref, attr.name, attr.value, true);
+                ingest_single_static_attribute(
+                    job,
+                    view_xref,
+                    xref,
+                    NG_TEMPLATE_TAG_NAME,
+                    attr.name,
+                    attr.value,
+                    true,
+                );
             }
         }
     }
@@ -2093,7 +2122,15 @@ fn ingest_template<'a>(
     // Angular's TS passes asMessage(attr.i18n) to createTemplateBinding (ingest.ts line 1497).
     if !attributes.is_empty() {
         // Hoisted attributes from wrapped element are regular attributes, not Template
-        ingest_static_attributes_with_i18n(job, view_xref, xref, &attributes, false);
+        // Angular looks template attributes up under `ng-template`, whatever the tag.
+        ingest_static_attributes_with_i18n(
+            job,
+            view_xref,
+            xref,
+            NG_TEMPLATE_TAG_NAME,
+            &attributes,
+            false,
+        );
     }
 
     // Process hoisted inputs from the wrapped element (e.g., [class]="..." on <div *ngIf>).
@@ -2377,6 +2414,13 @@ fn ingest_content<'a>(
     //   }
     let mut binding_ops: std::vec::Vec<UpdateOp<'a>> = std::vec::Vec::new();
     for attr in content.attributes {
+        // `domSchema.securityContext(content.name, attr.name, true)`; `content.name`
+        // is always `ng-content`.
+        let security_context = crate::schema::get_security_context_for(
+            "ng-content",
+            attr.name.as_str(),
+            job.angular_version,
+        );
         // Create a string literal expression for the attribute value
         let value_expr = create_string_literal_atom(allocator, attr.value);
         let binding_op = UpdateOp::Binding(BindingOp {
@@ -2386,7 +2430,7 @@ fn ingest_content<'a>(
             name: attr.name,
             expression: Box::new_in(value_expr, &allocator),
             unit: None,
-            security_context: SecurityContext::None,
+            security_context,
             i18n_message: None,
             is_text_attribute: true, // Static attributes are always text attributes
         });
@@ -3441,7 +3485,8 @@ fn ingest_defer_triggers<'a>(
             target_slot: None,
             target_slot_view_steps: None,
             target_name: None,
-            delay: None,
+            // The optional `idle(<time>)` timeout (Angular's `trigger.timeout`).
+            delay: idle_trigger.timeout,
             options: None,
         });
         if let Some(view) = job.view_mut(view_xref) {
@@ -3655,10 +3700,15 @@ pub struct HostBindingInput<'a> {
     pub properties: Vec<'a, R3BoundAttribute<'a>>,
     /// Static host attributes (`attr="value"`).
     /// Uses OutputExpression to match TypeScript's `{[key: string]: o.Expression}`.
-    pub attributes: FxHashMap<Ident<'a>, crate::output::ast::OutputExpression<'a>>,
+    /// Insertion-ordered like that object, since the order is the `hostAttrs` order.
+    pub attributes: HostAttributes<'a>,
     /// Host event bindings (`(event)="handler"`).
     pub events: Vec<'a, R3BoundEvent<'a>>,
 }
+
+/// The static host attributes of a [`HostBindingInput`], in `hostAttrs` order.
+pub type HostAttributes<'a> =
+    IndexMap<Ident<'a>, crate::output::ast::OutputExpression<'a>, FxBuildHasher>;
 
 /// Stores an expression from a host binding and returns an IrExpression that references it.
 fn host_store_and_ref_expr<'a>(
