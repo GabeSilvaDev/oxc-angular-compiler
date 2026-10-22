@@ -3641,10 +3641,16 @@ impl<'a> HtmlToR3Transform<'a> {
         let handler_span = self.calculate_event_handler_span(attr);
         let handler = self.parse_event_expression(&attr.value, handler_span);
         let name_atom = Ident::from(self.allocator.alloc_str(name));
+        // `on-animate.enter` is an animation event, like `(animate.enter)`
+        let event_type = if name.starts_with("animate.") {
+            ParsedEventType::Animation
+        } else {
+            ParsedEventType::Regular
+        };
 
         R3BoundEvent {
             name: name_atom,
-            event_type: ParsedEventType::Regular,
+            event_type,
             handler,
             target: None,
             phase: None,

@@ -3413,6 +3413,39 @@ export class FadeComponent { done(e: any) {} }
 }
 
 #[test]
+fn test_animate_listener_canonical_on_prefix() {
+    let js = compile_template_to_js(r#"<div on-animate.enter="fn()"></div>"#, "TestComponent");
+    assert!(
+        js.contains("i0.ɵɵanimateEnterListener(function TestComponent_Template_div_animateenter_0_listener()"),
+        "Expected ɵɵanimateEnterListener.\nGot:\n{js}"
+    );
+    assert!(!js.contains(r#""animate.enter""#), "Must not listen to a DOM event.\nGot:\n{js}");
+}
+
+#[test]
+fn test_animate_listener_name_with_extra_dot() {
+    // Like Angular's `name.replace('.', '')`, only the first dot is dropped.
+    let js = compile_template_to_js(r#"<div (animate.enter.x)="fn()"></div>"#, "TestComponent");
+    assert!(js.contains("TestComponent_Template_div_animateenter_x_0_listener"), "Got:\n{js}");
+}
+
+#[test]
+fn test_animate_listener_on_ng_template_is_plain_listener() {
+    // Angular's `ingestTemplateBindings` makes a plain listener for outputs on an <ng-template>.
+    let js = compile_template_to_js(
+        r#"<ng-template (animate.leave)="fn($event)" (click)="other()"></ng-template>"#,
+        "TestComponent",
+    );
+    assert!(
+        js.contains(
+            r#"ɵɵlistener("animate.leave",function TestComponent_Template_ng_template_animate_leave_0_listener($event)"#
+        ),
+        "Got:\n{js}"
+    );
+    assert!(!js.contains("ɵɵanimateLeaveListener"), "Got:\n{js}");
+}
+
+#[test]
 fn test_host_animation_trigger_binding() {
     // Component with animation trigger in host property should emit ɵɵsyntheticHostProperty
     let source = r"

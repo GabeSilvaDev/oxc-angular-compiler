@@ -2275,6 +2275,12 @@ fn ingest_template<'a>(
     for output in outputs {
         if template_kind == TemplateKind::NgTemplate {
             // For explicit <ng-template>, create listeners at the template level.
+            // Angular's `ingestTemplateBindings` makes a plain listener for every output here,
+            // `(animate.enter)` / `(animate.leave)` included.
+            let mut output = output;
+            if output.event_type == ParsedEventType::Animation {
+                output.event_type = ParsedEventType::Regular;
+            }
             ingest_listener_owned(job, view_xref, xref, tag_name.clone(), output);
         } else {
             // For structural directives, create ExtractedAttributeOp for directive matching.

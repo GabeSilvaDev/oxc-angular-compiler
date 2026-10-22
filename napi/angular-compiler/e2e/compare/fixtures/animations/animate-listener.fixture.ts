@@ -85,4 +85,43 @@ export class AnimateHostListenerDirective {
     `.trim(),
     expectedFeatures: ['ɵɵanimateEnterListener'],
   },
+  {
+    name: 'animate-listener-canonical-on-prefix',
+    category: 'animations',
+    description: 'on-animate.enter, the canonical form of (animate.enter)',
+    className: 'AnimateOnPrefixComponent',
+    type: 'full-transform',
+    sourceCode: `
+import { Component } from '@angular/core';
+
+@Component({
+  selector: 'app-animate-on-prefix',
+  template: \`<div on-animate.enter="onEnter($event)">Content</div>\`,
+})
+export class AnimateOnPrefixComponent {
+  onEnter(event: unknown) {}
+}
+    `.trim(),
+    expectedFeatures: ['ɵɵanimateEnterListener'],
+  },
+  {
+    name: 'animate-listener-on-ng-template',
+    category: 'animations',
+    description: '(animate.leave) on an ng-template stays a plain listener',
+    className: 'AnimateNgTemplateComponent',
+    type: 'full-transform',
+    sourceCode: `
+import { Component } from '@angular/core';
+
+@Component({
+  selector: 'app-animate-ng-template',
+  template: \`<ng-template (animate.leave)="onLeave($event)" (click)="onClick()"></ng-template>\`,
+})
+export class AnimateNgTemplateComponent {
+  onLeave(event: unknown) {}
+  onClick() {}
+}
+    `.trim(),
+    expectedFeatures: ['ɵɵdomListener'],
+  },
 ]
