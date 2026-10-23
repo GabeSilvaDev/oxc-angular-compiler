@@ -35,11 +35,13 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, BindingPattern, CallExpression, Expression, ObjectExpression,
+    Argument, ArrayExpressionElement, BindingPattern, CallExpression, Decorator,
+    ExportDefaultDeclaration, Expression, ExpressionStatement, ObjectExpression,
     ObjectPropertyKind, Program, PropertyKey, Statement,
 };
+use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
-use oxc_span::{GetSpan, SourceType};
+use oxc_span::{GetSpan, SourceType, Span};
 
 use crate::AngularVersion;
 use crate::optimizer::Edit;
@@ -143,7 +145,10 @@ pub fn link_with_options(
     LinkResult { code: linked_code, map, linked: true }
 }
 
-/// Recursively walk the AST to find all ɵɵngDeclare* calls and generate edits.
+/// Find all ɵɵngDeclare* calls and generate edits.
+///
+/// Like Babel's linker, which visits every `CallExpression`, this visits every call wherever it sits
+/// (class members, array and object literals, IIFE callees, conditions, decorators, ...).
 fn collect_declaration_edits(
     program: &Program<'_>,
     source: &str,
@@ -151,242 +156,91 @@ fn collect_declaration_edits(
     options: &LinkOptions,
     edits: &mut Vec<Edit>,
 ) {
-    for stmt in &program.body {
-        walk_statement(stmt, source, filename, options, edits);
+    DeclarationCollector {
+        source,
+        filename,
+        options,
+        edits,
+        statement_start: None,
+        decorator: None,
+    }
+    .visit_program(program);
+}
+
+struct DeclarationCollector<'s> {
+    source: &'s str,
+    filename: &'s str,
+    options: &'s LinkOptions,
+    edits: &'s mut Vec<Edit>,
+    /// The expression of the statement being visited, and whether a `;` may go before it: true for a statement in
+    /// a statement list, false for `export default` or the bare body of `if`, a loop or a label
+    statement_start: Option<(Span, bool)>,
+    /// The expression of the decorator being visited
+    decorator: Option<Span>,
+}
+
+impl DeclarationCollector<'_> {
+    fn visit_statement_expression<'a>(&mut self, expr: &Expression<'a>, is_statement: bool) {
+        let outer = self.statement_start.replace((expr.span(), is_statement));
+        self.visit_expression(expr);
+        self.statement_start = outer;
     }
 }
 
-/// Walk a statement looking for ɵɵngDeclare* calls.
-fn walk_statement(
-    stmt: &Statement<'_>,
-    source: &str,
-    filename: &str,
-    options: &LinkOptions,
-    edits: &mut Vec<Edit>,
-) {
-    match stmt {
-        Statement::ExpressionStatement(expr_stmt) => {
-            walk_expression(&expr_stmt.expression, source, filename, options, edits);
-        }
-        Statement::ClassDeclaration(class_decl) => {
-            walk_class_body(&class_decl.body, source, filename, options, edits);
-        }
-        Statement::VariableDeclaration(var_decl) => {
-            for decl in &var_decl.declarations {
-                if let Some(init) = &decl.init {
-                    walk_expression(init, source, filename, options, edits);
+impl<'a> Visit<'a> for DeclarationCollector<'_> {
+    fn visit_statements(&mut self, stmts: &oxc_allocator::Vec<'a, Statement<'a>>) {
+        for stmt in stmts {
+            match stmt {
+                Statement::ExpressionStatement(stmt) => {
+                    self.visit_statement_expression(&stmt.expression, true);
                 }
+                _ => self.visit_statement(stmt),
             }
         }
-        Statement::ReturnStatement(ret) => {
-            if let Some(ref arg) = ret.argument {
-                walk_expression(arg, source, filename, options, edits);
-            }
-        }
-        Statement::BlockStatement(block) => {
-            for stmt in &block.body {
-                walk_statement(stmt, source, filename, options, edits);
-            }
-        }
-        Statement::IfStatement(if_stmt) => {
-            walk_statement(&if_stmt.consequent, source, filename, options, edits);
-            if let Some(ref alt) = if_stmt.alternate {
-                walk_statement(alt, source, filename, options, edits);
-            }
-        }
-        Statement::ForStatement(for_stmt) => {
-            walk_statement(&for_stmt.body, source, filename, options, edits);
-        }
-        Statement::ForInStatement(for_in) => {
-            walk_statement(&for_in.body, source, filename, options, edits);
-        }
-        Statement::ForOfStatement(for_of) => {
-            walk_statement(&for_of.body, source, filename, options, edits);
-        }
-        Statement::WhileStatement(while_stmt) => {
-            walk_statement(&while_stmt.body, source, filename, options, edits);
-        }
-        Statement::DoWhileStatement(do_while) => {
-            walk_statement(&do_while.body, source, filename, options, edits);
-        }
-        Statement::TryStatement(try_stmt) => {
-            for stmt in &try_stmt.block.body {
-                walk_statement(stmt, source, filename, options, edits);
-            }
-            if let Some(ref handler) = try_stmt.handler {
-                for stmt in &handler.body.body {
-                    walk_statement(stmt, source, filename, options, edits);
-                }
-            }
-            if let Some(ref finalizer) = try_stmt.finalizer {
-                for stmt in &finalizer.body {
-                    walk_statement(stmt, source, filename, options, edits);
-                }
-            }
-        }
-        Statement::SwitchStatement(switch_stmt) => {
-            for case in &switch_stmt.cases {
-                for stmt in &case.consequent {
-                    walk_statement(stmt, source, filename, options, edits);
-                }
-            }
-        }
-        Statement::LabeledStatement(labeled) => {
-            walk_statement(&labeled.body, source, filename, options, edits);
-        }
-        Statement::FunctionDeclaration(func_decl) => {
-            if let Some(ref body) = func_decl.body {
-                for stmt in &body.statements {
-                    walk_statement(stmt, source, filename, options, edits);
-                }
-            }
-        }
-        Statement::ExportDeclaration(export_decl) => {
-            walk_declaration(&export_decl.declaration, source, filename, options, edits);
-        }
-        Statement::ExportDefaultDeclaration(export_default) => match &export_default.declaration {
-            oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class_decl) => {
-                walk_class_body(&class_decl.body, source, filename, options, edits);
-            }
-            oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(func_decl) => {
-                if let Some(ref body) = func_decl.body {
-                    for stmt in &body.statements {
-                        walk_statement(stmt, source, filename, options, edits);
-                    }
-                }
-            }
-            _ => {
-                if let Some(expr) = export_default.declaration.as_expression() {
-                    walk_expression(expr, source, filename, options, edits);
-                }
-            }
-        },
-        _ => {}
     }
-}
 
-/// Walk a class body looking for ɵɵngDeclare* calls in property definitions and static blocks.
-fn walk_class_body(
-    body: &oxc_ast::ast::ClassBody<'_>,
-    source: &str,
-    filename: &str,
-    options: &LinkOptions,
-    edits: &mut Vec<Edit>,
-) {
-    for element in &body.body {
-        if let oxc_ast::ast::ClassElement::PropertyDefinition(prop) = element
-            && let Some(ref value) = prop.value
+    /// Only reached outside a statement list, such as `if (c) x;`, where a `;` would become the whole body
+    fn visit_expression_statement(&mut self, stmt: &ExpressionStatement<'a>) {
+        self.visit_statement_expression(&stmt.expression, false);
+    }
+
+    fn visit_decorator(&mut self, decorator: &Decorator<'a>) {
+        let outer = self.decorator.replace(decorator.expression.span());
+        walk::walk_decorator(self, decorator);
+        self.decorator = outer;
+    }
+
+    fn visit_export_default_declaration(&mut self, decl: &ExportDefaultDeclaration<'a>) {
+        match decl.declaration.as_expression() {
+            Some(expr) => self.visit_statement_expression(expr, false),
+            None => walk::walk_export_default_declaration(self, decl),
+        }
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if let Some(name) = get_declare_name(call)
+            && let Some(mut edit) =
+                link_declaration(name, call, self.source, self.filename, self.options)
         {
-            walk_expression(value, source, filename, options, edits);
-        }
-        if let oxc_ast::ast::ClassElement::StaticBlock(block) = element {
-            for stmt in &block.body {
-                walk_statement(stmt, source, filename, options, edits);
-            }
-        }
-        if let oxc_ast::ast::ClassElement::MethodDefinition(method) = element
-            && let Some(ref body) = method.value.body
-        {
-            for stmt in &body.statements {
-                walk_statement(stmt, source, filename, options, edits);
-            }
-        }
-    }
-}
-
-/// Walk a declaration (from export statements) looking for ɵɵngDeclare* calls.
-fn walk_declaration(
-    decl: &oxc_ast::ast::Declaration<'_>,
-    source: &str,
-    filename: &str,
-    options: &LinkOptions,
-    edits: &mut Vec<Edit>,
-) {
-    match decl {
-        oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
-            for d in &var_decl.declarations {
-                if let Some(init) = &d.init {
-                    walk_expression(init, source, filename, options, edits);
-                }
-            }
-        }
-        oxc_ast::ast::Declaration::FunctionDeclaration(func_decl) => {
-            if let Some(ref body) = func_decl.body {
-                for stmt in &body.statements {
-                    walk_statement(stmt, source, filename, options, edits);
-                }
-            }
-        }
-        oxc_ast::ast::Declaration::ClassDeclaration(class_decl) => {
-            walk_class_body(&class_decl.body, source, filename, options, edits);
-        }
-        _ => {}
-    }
-}
-
-/// Walk an expression looking for ɵɵngDeclare* calls.
-fn walk_expression(
-    expr: &Expression<'_>,
-    source: &str,
-    filename: &str,
-    options: &LinkOptions,
-    edits: &mut Vec<Edit>,
-) {
-    match expr {
-        Expression::CallExpression(call) => {
-            if let Some(name) = get_declare_name(call)
-                && let Some(edit) = link_declaration(name, call, source, filename, options)
+            // A linked factory is a `function` expression: where it starts a longer statement, such as
+            // `ɵɵngDeclareFactory(…).name;`, it would be read as a declaration, so it gets parentheses (and, in a
+            // statement list, a `;` so that they do not call the line before)
+            // `@function …` does not parse either
+            if self.decorator.is_some_and(|expr| expr.start == call.span.start) {
+                edit.replacement = format!("({})", edit.replacement);
+            } else if let Some((expr, is_statement)) = self.statement_start
+                && expr.start == call.span.start
+                && expr != call.span
             {
-                edits.push(edit);
-                return;
+                let semicolon = if is_statement { ";" } else { "" };
+                edit.replacement = format!("{semicolon}({})", edit.replacement);
             }
-            // Walk arguments recursively
-            for arg in &call.arguments {
-                if let Argument::SpreadElement(_) = arg {
-                    continue;
-                }
-                walk_expression(arg.to_expression(), source, filename, options, edits);
-            }
+            // The edit replaces the whole call, so a declaration nested in its arguments
+            // must not get an overlapping edit of its own.
+            self.edits.push(edit);
+            return;
         }
-        Expression::AssignmentExpression(assign) => {
-            walk_expression(&assign.right, source, filename, options, edits);
-        }
-        Expression::SequenceExpression(seq) => {
-            for expr in &seq.expressions {
-                walk_expression(expr, source, filename, options, edits);
-            }
-        }
-        Expression::ConditionalExpression(cond) => {
-            walk_expression(&cond.consequent, source, filename, options, edits);
-            walk_expression(&cond.alternate, source, filename, options, edits);
-        }
-        Expression::LogicalExpression(logical) => {
-            walk_expression(&logical.left, source, filename, options, edits);
-            walk_expression(&logical.right, source, filename, options, edits);
-        }
-        Expression::ParenthesizedExpression(paren) => {
-            walk_expression(&paren.expression, source, filename, options, edits);
-        }
-        Expression::ArrowFunctionExpression(arrow) => {
-            if let Some(body) = arrow.get_function_body() {
-                for stmt in &body.statements {
-                    walk_statement(stmt, source, filename, options, edits);
-                }
-            } else if let Some(expr) = arrow.get_expression() {
-                walk_expression(expr, source, filename, options, edits);
-            }
-        }
-        Expression::FunctionExpression(func) => {
-            if let Some(body) = &func.body {
-                for stmt in &body.statements {
-                    walk_statement(stmt, source, filename, options, edits);
-                }
-            }
-        }
-        Expression::ClassExpression(class_expr) => {
-            walk_class_body(&class_expr.body, source, filename, options, edits);
-        }
-        _ => {}
+        walk::walk_call_expression(self, call);
     }
 }
 
