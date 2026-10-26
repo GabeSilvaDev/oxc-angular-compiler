@@ -600,3 +600,26 @@ C.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "17.0.0", version: "22.2.2", n
         assert!(linked.contains(expected), "missing `{expected}` in\n{}", result.code);
     }
 }
+
+#[test]
+fn test_link_defer_block_dependencies_in_parentheses() {
+    // Babel's AST has no parentheses: `(null)` is a null entry, and an entry is
+    // emitted without the parentheses around it, as the TS linker does.
+    let code = r#"import * as i0 from "@angular/core";
+export class C {}
+C.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "17.0.0", version: "22.2.2", ngImport: i0, type: C, isStandalone: true, selector: "c", template: "@defer { m1 } @defer { m2 }", deferBlockDependencies: [(() => [import("./a")]), (null)] });
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "test.mjs");
+    assert!(result.linked);
+    let linked: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    // Fragments of the TS linker's output.
+    for expected in [
+        r#"constC_Defer_1_DepsFn=()=>[import("./a")];"#,
+        "i0.ɵɵdefer(1,0,C_Defer_1_DepsFn);",
+        "i0.ɵɵdefer(4,3);",
+    ] {
+        assert!(linked.contains(expected), "missing `{expected}` in\n{}", result.code);
+    }
+    assert!(!linked.contains("C_Defer_4_DepsFn"), "{}", result.code);
+}

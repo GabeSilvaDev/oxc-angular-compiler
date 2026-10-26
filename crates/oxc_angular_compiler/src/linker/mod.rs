@@ -1920,12 +1920,13 @@ fn link_component(
     let template_ref: &str = template_allocator.alloc_str(&template_owned);
 
     // `deferBlockDependencies: [() => [import("./a").then(m => m.A)], null]`,
-    // one entry per `@defer` block, emitted as written.
+    // one entry per `@defer` block, emitted as written. Parentheses are not part
+    // of an entry (Babel's AST has none), so `(null)` is null too.
     let defer_block_deps: Vec<Option<&str>> = get_array_property(meta, "deferBlockDependencies")
         .map(|deps| {
             deps.elements
                 .iter()
-                .map(|el| match el.as_expression() {
+                .map(|el| match el.as_expression().map(Expression::without_parentheses) {
                     Some(Expression::NullLiteral(_)) | None => None,
                     Some(expr) => {
                         let span = expr.span();
