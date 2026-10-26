@@ -597,18 +597,24 @@ fn generate_ctor_deps_type_from_component_deps(deps: Option<&[R3DependencyMetada
 /// pipes, NgModules, and injectables.
 ///
 /// Returns `never` if no dependency has any special flags (attribute, optional, host, self, skipSelf).
-/// Otherwise returns a tuple type like `[null, {attribute: string, optional: true}, null]`.
+/// Otherwise returns a tuple type like `[null, {attribute: "title", optional: true}, null]`.
 fn generate_ctor_deps_type_from_factory_deps(
     deps: Option<&[crate::factory::R3DependencyMetadata]>,
 ) -> String {
+    use crate::output::ast::{LiteralValue, OutputExpression};
     match deps {
         None => "never".to_string(),
         Some(deps) => generate_ctor_deps_type(deps.iter().map(|d| {
-            let attribute_entry = if d.attribute_name_type.is_some() {
-                Some("attribute: string".to_string())
-            } else {
-                None
-            };
+            // As ngtsc's `createCtorDepType`: the attribute name's literal type.
+            let attribute_entry = d.attribute_name_type.as_ref().map(|name| match name {
+                OutputExpression::Literal(lit) => match &lit.value {
+                    LiteralValue::String(name) => {
+                        format!("attribute: \"{}\"", escape_dts_string(name.as_str()))
+                    }
+                    _ => "attribute: unknown".to_string(),
+                },
+                _ => "attribute: unknown".to_string(),
+            });
             (attribute_entry, d.optional, d.host, d.self_, d.skip_self)
         })),
     }

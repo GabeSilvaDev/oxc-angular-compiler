@@ -387,15 +387,18 @@ fn extract_param_dependency<'a>(
 
     // Handle @Attribute decorator
     if let Some(attr_name) = attribute_name {
+        let name = OutputExpression::Literal(Box::new_in(
+            crate::output::ast::LiteralExpr {
+                value: crate::output::ast::LiteralValue::String(attr_name),
+                source_span: None,
+            },
+            &allocator,
+        ));
+        // ngtsc's `attributeNameType` is the attribute name itself (di.ts), so it is
+        // set whatever the parameter's type and compiles to `ɵɵinjectAttribute`.
         return R3DependencyMetadata {
-            token: Some(OutputExpression::Literal(Box::new_in(
-                crate::output::ast::LiteralExpr {
-                    value: crate::output::ast::LiteralValue::String(attr_name),
-                    source_span: None,
-                },
-                &allocator,
-            ))),
-            attribute_name_type: token, // The type annotation
+            token: Some(name.clone_in(allocator)),
+            attribute_name_type: Some(name),
             host,
             optional,
             self_,
