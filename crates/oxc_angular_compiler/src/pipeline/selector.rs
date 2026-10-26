@@ -150,6 +150,10 @@ impl CssSelector {
 
         let chars: Vec<char> = selector.chars().collect();
         let len = chars.len();
+        // `i` counts chars; slices of `selector` take the byte offset of each.
+        let offsets: Vec<usize> =
+            selector.char_indices().map(|(at, _)| at).chain([selector.len()]).collect();
+        let text = |start: usize, end: usize| &selector[offsets[start]..offsets[end]];
         let mut i = 0;
 
         while i < len {
@@ -177,7 +181,7 @@ impl CssSelector {
             }
 
             // Handle :not(
-            if c == ':' && i + 4 < len && &selector[i..i + 5] == ":not(" {
+            if c == ':' && i + 4 < len && text(i, i + 5) == ":not(" {
                 // Nesting :not in a selector is not allowed - return what we have
                 if in_not {
                     Self::finalize_selector(&mut results, &mut current, false, CssSelector::new());
@@ -211,7 +215,7 @@ impl CssSelector {
                     i += 1;
                 }
                 if i > start {
-                    target.add_class_name(&selector[start..i]);
+                    target.add_class_name(text(start, i));
                 }
                 continue;
             }
@@ -224,7 +228,7 @@ impl CssSelector {
                     i += 1;
                 }
                 if i > start {
-                    target.add_attribute("id", Some(&selector[start..i]));
+                    target.add_attribute("id", Some(text(start, i)));
                 }
                 continue;
             }
@@ -237,7 +241,7 @@ impl CssSelector {
                 while i < len && chars[i] != '=' && chars[i] != ']' {
                     i += 1;
                 }
-                let raw_attr_name = selector[attr_start..i].trim();
+                let raw_attr_name = text(attr_start, i).trim();
                 // Unescape attribute name (like Angular's unescapeAttribute)
                 let attr_name = Self::unescape_attribute(raw_attr_name);
 
@@ -257,7 +261,7 @@ impl CssSelector {
                         while i < len && chars[i] != q {
                             i += 1;
                         }
-                        let attr_value = &selector[value_start..i];
+                        let attr_value = text(value_start, i);
                         target.add_attribute(&attr_name, Some(attr_value));
                         if i < len {
                             i += 1; // Skip closing quote
@@ -266,7 +270,7 @@ impl CssSelector {
                         while i < len && chars[i] != ']' {
                             i += 1;
                         }
-                        let attr_value = selector[value_start..i].trim();
+                        let attr_value = text(value_start, i).trim();
                         target.add_attribute(&attr_name, Some(attr_value));
                     }
                 } else {
@@ -286,7 +290,7 @@ impl CssSelector {
                 while i < len && Self::is_ident_char(chars[i]) {
                     i += 1;
                 }
-                target.set_element(&selector[start..i]);
+                target.set_element(text(start, i));
                 continue;
             }
 
@@ -542,6 +546,18 @@ mod tests {
         let selectors = CssSelector::parse("[name=value]");
         assert_eq!(selectors.len(), 1);
         assert_eq!(selectors[0].attrs, vec!["name", "value"]);
+    }
+
+    #[test]
+    fn test_parse_non_ascii() {
+        let selectors = CssSelector::parse("[slot=título]");
+        assert_eq!(selectors[0].attrs, vec!["slot", "título"]);
+        let selectors = CssSelector::parse("[lang='ção'].ação#é");
+        assert_eq!(selectors[0].attrs, vec!["lang", "ção", "id", "é"]);
+        assert_eq!(selectors[0].class_names, vec!["ação"]);
+        let selectors = CssSelector::parse("x-é:not([é=ü])");
+        assert_eq!(selectors[0].element, Some("x-é".to_string()));
+        assert_eq!(selectors[0].not_selectors[0].attrs, vec!["é", "ü"]);
     }
 
     #[test]

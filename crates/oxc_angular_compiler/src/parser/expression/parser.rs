@@ -752,7 +752,9 @@ impl<'a> Parser<'a> {
                 self.peek().map(|t| t.index).unwrap_or(self.source.len() as u32)
             };
 
-        let value_source = &self.source[expr_start as usize..value_end as usize];
+        // A value that fails to parse ends before it starts: Angular's `substring` swaps the two.
+        let value_source =
+            &self.source[expr_start.min(value_end) as usize..expr_start.max(value_end) as usize];
         let ast_with_source = ASTWithSource {
             ast: value,
             source: Some(Ident::from_in(value_source, &self.allocator)),
