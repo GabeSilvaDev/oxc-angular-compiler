@@ -627,6 +627,7 @@ impl<'a> HtmlToR3Transform<'a> {
         let i18n_meta = if let Some(attr) = i18n_attr {
             // Element has its own i18n attribute - parse it as a Message with message string
             let instance_id = self.allocate_i18n_message_instance_id();
+            self.check_i18n_meta_comment(attr.value.as_str(), attr.span);
             let mut meta = parse_i18n_meta_with_message(
                 &self.allocator,
                 attr.value.as_str(),
@@ -3327,6 +3328,7 @@ impl<'a> HtmlToR3Transform<'a> {
                 let instance_id = self.allocate_i18n_message_instance_id();
                 let (message_string, nodes, mut legacy_message) =
                     self.create_attribute_i18n_message(target);
+                self.check_i18n_meta_comment(attr.value.as_str(), attr.span);
                 let mut meta = parse_i18n_meta_with_message(
                     self.allocator,
                     attr.value.as_str(),
@@ -5150,6 +5152,15 @@ impl<'a> HtmlToR3Transform<'a> {
             },
             &self.allocator,
         ))
+    }
+
+    /// Reports an `i18n` / `i18n-*` meaning or description that would end the JSDoc comment the
+    /// message is emitted under, or start one, as Angular's `tagToString` throws on it.
+    fn check_i18n_meta_comment(&mut self, value: &str, span: Span) {
+        let ParsedI18nMeta { meaning, description, .. } = parse_i18n_meta(value);
+        if [meaning, description].iter().any(|text| text.contains("/*") || text.contains("*/")) {
+            self.report_error(r#"JSDoc text cannot contain "/*" and "*/""#, span);
+        }
     }
 
     /// Reports a parse error at the given span.

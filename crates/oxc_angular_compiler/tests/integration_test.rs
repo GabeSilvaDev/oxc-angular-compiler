@@ -5902,6 +5902,40 @@ fn test_i18n_legacy_message_ids_untrimmed_attribute_and_nested_icu() {
     assert_contains(&js, ":ICU@@5870918674674044418:");
 }
 
+/// A meaning or description goes in a JSDoc comment, so `*/` in it would end the comment and
+/// leave the rest as code. Angular's `tagToString` throws `JSDoc text cannot contain "/*" and
+/// "*/"`, and the template is reported with that error instead of compiled.
+#[test]
+fn test_i18n_meta_that_would_close_its_jsdoc_comment_is_an_error() {
+    for template in [
+        r#"<p i18n="m|d */ steal() /*">Hello</p>"#,
+        r#"<img i18n-alt="*/ } steal(); { /*|d" alt="Logo" />"#,
+        r#"<p i18n="m /* x|d">Hello</p>"#,
+    ] {
+        let allocator = Allocator::default();
+        let source = format!(
+            "import {{ Component }} from '@angular/core';\n\
+             @Component({{ selector: 'app-repro', template: `{template}` }})\n\
+             export class Repro {{}}\n"
+        );
+        let result = transform_angular_file(&allocator, "repro.ts", &source, None, None);
+        let messages: Vec<String> = result.diagnostics.iter().map(|d| d.to_string()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains(r#"JSDoc text cannot contain "/*" and "*/""#)),
+            "{template}: {messages:?}"
+        );
+        assert!(!result.code.contains("/**"), "{}", result.code);
+    }
+}
+
+/// `@` in a meaning or description is escaped, as Angular's `tagToString` does, so it does not
+/// start a JSDoc tag.
+#[test]
+fn test_i18n_meta_at_sign_is_escaped_in_jsdoc() {
+    let js = compile_i18n_component(r#"<p i18n="m@x|mail a@b.c">Hello</p>"#);
+    assert_contains(&js, r"/** @desc mail a\@b.c @meaning m\@x */");
+}
+
 /// `consts` with i18n initializers is an arrow function with a block body, and a message is
 /// a native `$localize` tagged template. Angular 22.2 `ngc` (ES2022):
 ///   consts: () => { let i18n_0; ... i18n_0 = $localize `:@@close:Close`; } return [...]; }
