@@ -42,11 +42,12 @@ enum SchemaKind {
     V21_2_7,
     /// 21.2.14 only. Namespaced keys but no `:svg:a|href` yet.
     V21_2_14,
-    /// 19.2.23+, 20.3.22+, 21.2.15+, 22.0.0. Namespaced keys with
-    /// `:svg:a|href`. `script|src` and `script|href` are gone.
+    /// 19.2.23+, 20.3.22–20.3.27, 21.2.15–21.2.19, 22.0.0. Namespaced keys
+    /// with `:svg:a|href`. `script|src` and `script|href` are gone.
     V22,
-    /// 22.0.1 / 22.1.0-next.0. `href` / `xlink:href` are URL sinks on every
-    /// MathML element (`:math:*`), and lookups try the `:ns:*` key.
+    /// 20.3.28+, 21.2.20+, 22.0.1 / 22.1.0-next.0. `href` / `xlink:href` are
+    /// URL sinks on every MathML element (`:math:*`), and lookups try the
+    /// `:ns:*` key.
     V22_0_1,
     /// 22.0.2+ / 22.1.0-next.1+ through 22.2.1. Adds iframe `credentialless`
     /// and falls back from the `:svg:` / `:math:` keys to the HTML keys.
@@ -137,8 +138,14 @@ fn security_profile(version: Option<crate::AngularVersion>) -> SecurityProfile {
         },
         _ => (SchemaKind::Legacy, false),
     };
+    // The 20.3.28 / 21.2.20 backports carried the `:math:*` keys.
+    let kind = if kind == SchemaKind::V22 && version.matches_any_mathml_href() {
+        SchemaKind::V22_0_1
+    } else {
+        kind
+    };
 
-    let namespaced = matches!(kind, SchemaKind::V21_2_14 | SchemaKind::V22);
+    let namespaced = matches!(kind, SchemaKind::V21_2_14 | SchemaKind::V22 | SchemaKind::V22_0_1);
     // `:svg:style` stripping existed only in 19.2.23, 20.3.22 and 21.2.14.
     let strip_svg_style = matches!(kind, SchemaKind::V21_2_14)
         || (version.major == 20 && version.minor == 3 && version.patch == 22)
@@ -149,7 +156,7 @@ fn security_profile(version: Option<crate::AngularVersion>) -> SecurityProfile {
         // `normalizeTagName` in `securityContext` landed with the schema
         // backports that carried `:svg:a|href` (19.2.23 / 20.3.22 / 21.2.15);
         // 21.2.14 has namespaced keys but no normalizer.
-        normalizes_tag_names: matches!(kind, SchemaKind::V22),
+        normalizes_tag_names: matches!(kind, SchemaKind::V22 | SchemaKind::V22_0_1),
         strip_svg_script: namespaced,
         strip_svg_style,
         iframe_src_i18n,
@@ -937,10 +944,11 @@ pub fn calc_security_context_for_unknown_element(property: &str) -> SecurityCont
     reduce_security_contexts(&collect_host_contexts("", property, None))
 }
 
-/// Security context of a host binding on the latest schema (v22).
+/// Security context of a host binding on the latest schema.
 ///
-/// Mirrors `calcPossibleSecurityContexts` plus the host ingest filter that drops
-/// `NONE` and the `{URL, RESOURCE_URL}` pair in `resolve_sanitizers.ts`.
+/// Mirrors `calcHostBindingSecurityContexts` plus the reduction in
+/// `resolve_sanitizers.ts` (`NONE` dropped, URL kinds next to `NONE` or to
+/// each other collapse to `UrlOrResourceUrl`).
 pub fn host_binding_security_context(selector: &str, prop_name: &str) -> SecurityContext {
     host_binding_security_context_for(selector, prop_name, None)
 }
@@ -1534,10 +1542,13 @@ mod tests {
 
     #[test]
     fn test_host_comma_selector_merges_url_kinds() {
+        // The declaring-selector half; the full host lookup widens `href` to
+        // every concrete host anyway.
         assert_eq!(
-            host_binding_security_context("a, base", "href"),
+            declaring_selector_context("a, base", "href"),
             SecurityContext::UrlOrResourceUrl
         );
+        assert_eq!(declaring_selector_context("a", "href"), SecurityContext::Url);
     }
 
     fn v21_2_7() -> Option<crate::AngularVersion> {

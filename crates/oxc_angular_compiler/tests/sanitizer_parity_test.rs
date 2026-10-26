@@ -134,8 +134,8 @@ fn any_mathml_element_href_is_a_url() {
         ),
         r#"ɵɵattribute("href",ctx.u,i0.ɵɵsanitizeUrl);i0.ɵɵadvance();i0.ɵɵattribute("href",ctx.u,i0.ɵɵsanitizeUrl)"#,
         r#"ɵɵattribute("href",ctx.u);i0.ɵɵadvance();i0.ɵɵattribute("href",ctx.u)"#,
-        &["22.0.1", "22.1.0-next.0"],
-        &["21.2.25", "22.0.0"],
+        &["20.3.28", "21.2.20", "21.2.25", "22.0.1", "22.1.0-next.0"],
+        &["19.2.25", "20.3.27", "21.2.19", "22.0.0"],
     );
 }
 

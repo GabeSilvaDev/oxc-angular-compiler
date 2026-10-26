@@ -328,9 +328,14 @@ impl AngularVersion {
     /// Check if this version treats `href` / `xlink:href` of every MathML
     /// element as a URL sink (`:math:*`), not only a fixed element list.
     ///
-    /// `angular/angular@3927a5b271`, first in 22.0.1 and 22.1.0-next.0.
+    /// `angular/angular@3927a5b271`, first in 22.0.1 and 22.1.0-next.0. The
+    /// 20.3.28 / 21.2.20 backports of the concrete-host fix
+    /// (`angular/angular@2f96c8020f`, `angular/angular@6afe6fa781`) carry it
+    /// too; the 19.2.x line never got it.
     pub fn matches_any_mathml_href(&self) -> bool {
         self.fixed_since(&[
+            Self::new(20, 3, 28),
+            Self::new(21, 2, 20),
             Self::new(22, 0, 1),
             Self::new(22, 1, 0).with_prerelease(Prerelease::Next(0)),
         ])
@@ -1090,8 +1095,12 @@ mod tests {
 
         assert!(parse("22.1.0-next.1").uses_22_0_2_security_schema());
         assert!(!parse("22.1.0-next.0").uses_22_0_2_security_schema());
-        assert!(parse("22.1.0-next.0").matches_any_mathml_href());
-        assert!(!parse("21.2.25").matches_any_mathml_href());
+        for version in ["20.3.28", "21.2.20", "21.2.25", "22.0.1", "22.1.0-next.0"] {
+            assert!(parse(version).matches_any_mathml_href(), "{version}");
+        }
+        for version in ["19.2.25", "20.3.27", "21.2.19", "22.0.0"] {
+            assert!(!parse(version).matches_any_mathml_href(), "{version}");
+        }
         assert!(parse("22.2.0-next.5").validates_svg_animation_outside_svg());
         assert!(!parse("22.2.0-next.4").validates_svg_animation_outside_svg());
         assert!(!parse("22.0.8").validates_svg_animation_outside_svg());
