@@ -4,10 +4,7 @@
 //! on TypeScript class declarations.
 
 use oxc_allocator::{Allocator, Box, Vec};
-use oxc_ast::ast::{
-    Argument, Class, ClassElement, Decorator, Expression, MethodDefinitionKind, ObjectPropertyKind,
-    PropertyKey,
-};
+use oxc_ast::ast::{Argument, Class, Decorator, Expression, ObjectPropertyKind, PropertyKey};
 use oxc_span::Span;
 use oxc_str::Ident;
 
@@ -269,14 +266,7 @@ fn extract_constructor_deps<'a>(
     consts: Option<&StringConsts<'_>>,
 ) -> Option<Vec<'a, R3DependencyMetadata<'a>>> {
     // Find the constructor method
-    let Some(constructor) = class.body.body.iter().find_map(|element| {
-        if let ClassElement::MethodDefinition(method) = element {
-            if method.kind == MethodDefinitionKind::Constructor {
-                return Some(method);
-            }
-        }
-        None
-    }) else {
+    let Some(constructor) = crate::util::find_constructor(class) else {
         // No constructor: a class with a superclass inherits its factory
         // (`None`), one without gets an implicit no-arg constructor.
         // See: packages/compiler-cli/src/ngtsc/annotations/common/src/di.ts:47-52

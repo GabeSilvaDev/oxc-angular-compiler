@@ -300,14 +300,7 @@ fn extract_constructor_deps<'a>(
     consts: &StringConsts<'a>,
 ) -> Option<Vec<'a, R3DependencyMetadata<'a>>> {
     // Find the constructor method
-    let constructor = class.body.body.iter().find_map(|element| {
-        if let ClassElement::MethodDefinition(method) = element {
-            if method.kind == MethodDefinitionKind::Constructor {
-                return Some(method);
-            }
-        }
-        None
-    });
+    let constructor = crate::util::find_constructor(class);
 
     match constructor {
         Some(ctor) => {
@@ -1670,21 +1663,8 @@ pub fn param_decorator_errors<'a>(
         return std::vec::Vec::new();
     }
 
-    class
-        .body
-        .body
-        .iter()
-        .filter_map(|element| match element {
-            // Upstream picks the first constructor *with a body*
-            // (typescript.ts `findConstructorDeclaration`): an overload
-            // signature's parameters are not checked.
-            ClassElement::MethodDefinition(m)
-                if m.kind == MethodDefinitionKind::Constructor && m.value.body.is_some() =>
-            {
-                Some(m)
-            }
-            _ => None,
-        })
+    crate::util::find_constructor(class)
+        .into_iter()
         .flat_map(|ctor| ctor.value.params.items.iter())
         .flat_map(|param| param.decorators.iter())
         .filter(|d| super::is_angular_core_decorator(d, Some(consts)))

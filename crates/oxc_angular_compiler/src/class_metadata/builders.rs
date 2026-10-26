@@ -6,8 +6,8 @@
 use oxc_allocator::{Allocator, Box, Vec as AllocVec};
 use oxc_ast::ast::{
     BindingPattern, ChainElement, Class, ClassElement, Declaration, Decorator, Expression,
-    FormalParameter, MethodDefinitionKind, ObjectPropertyKind, PropertyKey, Statement,
-    TSNamespaceDeclarationBody, TSType, TSTypeName, VariableDeclaration,
+    FormalParameter, ObjectPropertyKind, PropertyKey, Statement, TSNamespaceDeclarationBody,
+    TSType, TSTypeName, VariableDeclaration,
 };
 use oxc_span::GetSpan;
 use oxc_str::Ident;
@@ -440,14 +440,7 @@ pub fn build_ctor_params_metadata_in<'a>(
     // purely from the type annotation (`typeToValue`), never the DI token.
     let _ = constructor_deps;
     // Find constructor
-    let constructor = class.body.body.iter().find_map(|element| {
-        if let ClassElement::MethodDefinition(method) = element
-            && method.kind == MethodDefinitionKind::Constructor
-        {
-            return method.value.params.items.as_slice().into();
-        }
-        None
-    })?;
+    let constructor = crate::util::find_constructor(class)?.value.params.items.as_slice();
 
     // Names the type annotation may resolve to locally but not in value space:
     // interfaces, type aliases, `const enum`s, and the class's type parameters —

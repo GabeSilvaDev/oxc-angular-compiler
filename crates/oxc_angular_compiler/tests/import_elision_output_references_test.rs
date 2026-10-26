@@ -176,9 +176,10 @@ export class AppComponent { constructor(@Inject(LOCALE_ID) public locale: string
 }
 
 #[test]
-fn ctor_overload_keeps_implementation_param_decorators() {
-    // Angular compliance case r3_view_compiler_di/di/ctor_overload.ts
-    assert_kept(
+fn ctor_overload_implementation_param_decorators_are_elided() {
+    // Angular compliance case r3_view_compiler_di/di/ctor_overload.ts: the factory reads the
+    // implementation, so its `@Optional()` is compiled into the flags and stripped.
+    let code = compile(
         r#"
 import {Injectable, Optional} from '@angular/core';
 class MyDependency {}
@@ -189,8 +190,11 @@ export class MyService {
   constructor(dep: MyDependency, @Optional() optionalDep?: MyOptionalDependency) {}
 }
 "#,
-        &["Optional"],
     );
+    assert!(!imports(&code, "Optional"), "{code}");
+    assert!(!uses(&code, "Optional"), "{code}");
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("ɵɵinject(MyOptionalDependency,8)"), "{code}");
 }
 
 #[test]

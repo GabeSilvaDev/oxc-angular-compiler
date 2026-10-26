@@ -1038,15 +1038,7 @@ struct JitNonAngularMemberDecorator {
 /// also skips that walk, and our single-file transform is closer to LOCAL
 /// mode than to a full reflector.
 fn class_has_own_constructor_params(class: &oxc_ast::ast::Class<'_>) -> bool {
-    use oxc_ast::ast::{ClassElement, MethodDefinitionKind};
-    class.body.body.iter().any(|element| {
-        if let ClassElement::MethodDefinition(method) = element {
-            method.kind == MethodDefinitionKind::Constructor
-                && !method.value.params.items.is_empty()
-        } else {
-            false
-        }
-    })
+    crate::util::find_constructor(class).is_some_and(|ctor| !ctor.value.params.items.is_empty())
 }
 
 /// Return the `@Service` decorator on a class iff the `Service` identifier
@@ -1263,16 +1255,7 @@ fn extract_jit_ctor_params(
     class: &oxc_ast::ast::Class<'_>,
     consts: &crate::directive::StringConsts<'_>,
 ) -> (std::vec::Vec<JitCtorParam>, std::vec::Vec<String>) {
-    use oxc_ast::ast::{ClassElement, MethodDefinitionKind};
-
-    let constructor = class.body.body.iter().find_map(|element| {
-        if let ClassElement::MethodDefinition(method) = element {
-            if method.kind == MethodDefinitionKind::Constructor {
-                return Some(method);
-            }
-        }
-        None
-    });
+    let constructor = crate::util::find_constructor(class);
 
     let Some(ctor) = constructor else {
         return (std::vec::Vec::new(), std::vec::Vec::new());
@@ -3315,15 +3298,8 @@ pub fn transform_angular_file(
         // __param, so their imports must be kept — the same result
         // TypeScript's elision produces on ngtsc's rewritten AST.
         let mut param_idents = JitCtorParamIdentifiers::default();
-        for element in &class.body.body {
-            if let oxc_ast::ast::ClassElement::MethodDefinition(method) = element
-                && method.kind == oxc_ast::ast::MethodDefinitionKind::Constructor
-            {
-                oxc_ast_visit::Visit::visit_formal_parameters(
-                    &mut param_idents,
-                    &method.value.params,
-                );
-            }
+        if let Some(ctor) = crate::util::find_constructor(class) {
+            oxc_ast_visit::Visit::visit_formal_parameters(&mut param_idents, &ctor.value.params);
         }
         for name in param_idents.0 {
             import_elision_mut.preserve(name);
@@ -4569,7 +4545,7 @@ pub fn transform_angular_file(
 
     // The analyzer counts an Angular constructor parameter decorator, and the Angular decorator of a `declare`
     // property, as removed on every class with an Angular class decorator. One the walk above left in place (a
-    // component whose template is missing, a constructor after the first) keeps what it references.
+    // component whose template is missing, a constructor other than the implementation) keeps what it references.
     {
         let stripped: rustc_hash::FxHashSet<Span> =
             decorator_spans_to_remove.iter().copied().collect();

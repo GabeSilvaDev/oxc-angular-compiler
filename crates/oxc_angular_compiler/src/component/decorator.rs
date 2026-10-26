@@ -664,14 +664,7 @@ fn extract_constructor_deps<'a>(
     consts: &StringConsts<'a>,
 ) -> Option<Vec<'a, R3DependencyMetadata<'a>>> {
     // Find the constructor method
-    let constructor = class.body.body.iter().find_map(|element| {
-        if let ClassElement::MethodDefinition(method) = element {
-            if method.kind == MethodDefinitionKind::Constructor {
-                return Some(method);
-            }
-        }
-        None
-    });
+    let constructor = crate::util::find_constructor(class);
 
     match constructor {
         Some(ctor) => {
@@ -907,14 +900,7 @@ fn for_each_constructor_param_decorator<'a>(
     class: &'a Class<'a>,
     mut f: impl FnMut(&'a Decorator<'a>),
 ) {
-    let constructor = class.body.body.iter().find_map(|element| match element {
-        ClassElement::MethodDefinition(method)
-            if method.kind == MethodDefinitionKind::Constructor =>
-        {
-            Some(method)
-        }
-        _ => None,
-    });
+    let constructor = crate::util::find_constructor(class);
     for param in constructor.into_iter().flat_map(|ctor| &ctor.value.params.items) {
         param.decorators.iter().for_each(&mut f);
     }

@@ -42,8 +42,8 @@
 use std::path::Path;
 
 use oxc_ast::ast::{
-    BindingIdentifier, ClassElement, Expression, ImportDeclarationSpecifier, MethodDefinitionKind,
-    Program, Statement, StringLiteral, TSType,
+    BindingIdentifier, ClassElement, Expression, ImportDeclarationSpecifier, Program, Statement,
+    StringLiteral, TSType,
 };
 use oxc_ast_visit::Visit;
 use oxc_semantic::{ReferenceId, Semantic, SemanticBuilder, SymbolFlags};
@@ -311,13 +311,7 @@ impl<'a> ImportElisionAnalyzer<'a> {
             return;
         }
         let type_params = crate::class_metadata::type_param_names_of(class);
-        for element in &class.body.body {
-            let ClassElement::MethodDefinition(method) = element else {
-                continue;
-            };
-            if method.kind != MethodDefinitionKind::Constructor {
-                continue;
-            }
+        if let Some(method) = crate::util::find_constructor(class) {
             for param in &method.value.params.items {
                 let Some(annotation) = &param.type_annotation else {
                     continue;
@@ -554,8 +548,9 @@ impl<'a> ImportElisionAnalyzer<'a> {
     /// them and compiles nothing that names them. Only on a class the transform compiles (one with an Angular
     /// class decorator, see [`crate::directive::angular_class_decorator`]):
     ///
-    /// - an Angular constructor parameter decorator of the first constructor (the one
-    ///   `collect_constructor_decorator_spans` strips and the factory reads), with the root of `@Inject(X)` /
+    /// - an Angular constructor parameter decorator of the constructor implementation (the one
+    ///   `collect_constructor_decorator_spans` strips and the factory reads, see
+    ///   [`crate::util::find_constructor`]), with the root of `@Inject(X)` /
     ///   `@Inject(X.sub)`: the factory names `X` through a namespace import (`i1.X.sub`), while any other
     ///   argument (`TOKEN['sub']`, `forwardRef(() => TOKEN)`) is copied as written
     /// - the Angular member decorator itself on a `declare` property, not its arguments: a query predicate
@@ -622,14 +617,7 @@ impl<'a> ImportElisionAnalyzer<'a> {
             }) {
                 continue;
             }
-            let constructor = class.body.body.iter().find_map(|element| match element {
-                ClassElement::MethodDefinition(method)
-                    if method.kind == MethodDefinitionKind::Constructor =>
-                {
-                    Some(method)
-                }
-                _ => None,
-            });
+            let constructor = crate::util::find_constructor(class);
             for param in constructor.into_iter().flat_map(|ctor| &ctor.value.params.items) {
                 for decorator in &param.decorators {
                     // by what it resolves to: `@I(TOKEN)` for `import { Inject as I }` is removed too
