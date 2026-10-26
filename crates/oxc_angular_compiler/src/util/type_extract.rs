@@ -5,7 +5,11 @@
 //! `null` literal type nodes out of a union before resolving the remaining type
 //! as an injection token.
 
-use oxc_ast::ast::TSType;
+use oxc_allocator::{Allocator, Box};
+use oxc_ast::ast::{TSType, TSTypeName};
+use oxc_str::Ident;
+
+use crate::output::ast::{OutputExpression, ReadPropExpr, ReadVarExpr};
 
 /// Resolves a TypeScript type annotation to the concrete type usable as a DI
 /// injection token.
@@ -52,4 +56,53 @@ fn unwrap_parens<'a, 'b>(ts_type: &'b TSType<'a>) -> &'b TSType<'a> {
         current = &paren.type_annotation;
     }
     current
+}
+
+/// The value a DI token's type name refers to, as written: `Foo` → `Foo`,
+/// `ns.one.One` → `ns.one.One`. `this` has no value: `None`.
+///
+/// Mirrors `entityNameToValue` in
+/// `packages/compiler-cli/src/ngtsc/reflection/src/type_to_value.ts`.
+pub fn type_name_to_value_expr<'a>(
+    allocator: &'a Allocator,
+    name: &TSTypeName<'a>,
+) -> Option<OutputExpression<'a>> {
+    match name {
+        TSTypeName::IdentifierReference(id) => Some(OutputExpression::ReadVar(Box::new_in(
+            ReadVarExpr { name: id.name, source_span: None },
+            &allocator,
+        ))),
+        TSTypeName::QualifiedName(qualified) => {
+            let receiver = type_name_to_value_expr(allocator, &qualified.left)?;
+            Some(OutputExpression::ReadProp(Box::new_in(
+                ReadPropExpr {
+                    receiver: Box::new_in(receiver, &allocator),
+                    name: qualified.right.name,
+                    optional: false,
+                    source_span: None,
+                },
+                &allocator,
+            )))
+        }
+        TSTypeName::ThisExpression(_) => None,
+    }
+}
+
+/// Fold `members` onto `base` as property reads: `base.a.b`.
+pub fn read_member_path<'a>(
+    allocator: &'a Allocator,
+    base: OutputExpression<'a>,
+    members: &[Ident<'a>],
+) -> OutputExpression<'a> {
+    members.iter().fold(base, |receiver, name| {
+        OutputExpression::ReadProp(Box::new_in(
+            ReadPropExpr {
+                receiver: Box::new_in(receiver, &allocator),
+                name: *name,
+                optional: false,
+                source_span: None,
+            },
+            &allocator,
+        ))
+    })
 }

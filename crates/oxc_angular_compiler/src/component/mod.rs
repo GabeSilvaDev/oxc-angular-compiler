@@ -26,6 +26,7 @@ pub(crate) use decorator::find_component_decorator;
 pub use definition::{
     ComponentDefinitions, const_value_to_expression, generate_component_definitions,
 };
+pub(crate) use dependency::create_token_expression;
 pub use dependency::{
     FactoryTarget, InjectFlags, R3DependencyMetadata, compile_inject_dependencies,
     generate_factory_di_args, get_inject_fn_name,

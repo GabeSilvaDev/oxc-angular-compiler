@@ -555,9 +555,9 @@ impl<'a> ImportElisionAnalyzer<'a> {
     /// class decorator, see [`crate::directive::angular_class_decorator`]):
     ///
     /// - an Angular constructor parameter decorator of the first constructor (the one
-    ///   `collect_constructor_decorator_spans` strips and the factory reads), with the argument of `@Inject(X)`
-    ///   when it is a bare identifier: the factory names `X` through a namespace import (`i1.X`), while any other
-    ///   argument (`TOKEN.sub`, `forwardRef(() => TOKEN)`) is copied as written
+    ///   `collect_constructor_decorator_spans` strips and the factory reads), with the root of `@Inject(X)` /
+    ///   `@Inject(X.sub)`: the factory names `X` through a namespace import (`i1.X.sub`), while any other
+    ///   argument (`TOKEN['sub']`, `forwardRef(() => TOKEN)`) is copied as written
     /// - the Angular member decorator itself on a `declare` property, not its arguments: a query predicate
     ///   (`viewQuery(Foo)`) or an input `transform` is compiled into the definition by its local name
     ///
@@ -584,6 +584,23 @@ impl<'a> ImportElisionAnalyzer<'a> {
                     Expression::CallExpression(call) => self.visit_expression(&call.callee),
                     expression => self.visit_expression(expression),
                 }
+            }
+        }
+        /// The name a token resolves through: `TOKEN` in `TOKEN` or `TOKEN.a?.b`, like
+        /// `resolve_factory_dep_namespaces` does. `(TOKEN).a` or `TOKEN['a']` is copied as written.
+        fn member_chain_root<'b, 'a>(
+            expression: &'b Expression<'a>,
+        ) -> Option<&'b oxc_ast::ast::IdentifierReference<'a>> {
+            match expression {
+                Expression::Identifier(id) => Some(id),
+                Expression::StaticMemberExpression(member) => member_chain_root(&member.object),
+                Expression::ChainExpression(chain) => match &chain.expression {
+                    oxc_ast::ast::ChainElement::StaticMemberExpression(member) => {
+                        member_chain_root(&member.object)
+                    }
+                    _ => None,
+                },
+                _ => None,
             }
         }
         let mut references = References::default();
@@ -624,8 +641,11 @@ impl<'a> ImportElisionAnalyzer<'a> {
                     references.visit_callee(decorator);
                     if name == "Inject"
                         && let Expression::CallExpression(call) = &decorator.expression
-                        && let Some(oxc_ast::ast::Argument::Identifier(token)) =
-                            call.arguments.first()
+                        && let Some(token) = call
+                            .arguments
+                            .first()
+                            .and_then(oxc_ast::ast::Argument::as_expression)
+                            .and_then(member_chain_root)
                     {
                         references.visit_identifier_reference(token);
                     }

@@ -84,13 +84,29 @@ export class B { constructor(@Inject(TOKEN) v: unknown) {} }
 }
 
 #[test]
-fn inject_member_expression_keeps_object() {
-    // The factory emits `ɵɵinject(TOKEN.sub)` with the local name.
+fn inject_member_expression_reads_off_namespace_import() {
+    // The factory reads `TOKEN.sub` off the namespace import (`i1.TOKEN.sub`).
+    for (arg, member) in [("TOKEN.sub", "i1.TOKEN.sub"), ("TOKEN?.a.b", "i1.TOKEN?.a.b")] {
+        let code = compile(&format!(
+            r#"
+import {{ Injectable, Inject }} from "@angular/core";
+import {{ TOKEN }} from "./tokens";
+@Injectable() export class S {{ constructor(@Inject({arg}) private v: unknown) {{}} }}
+"#
+        ));
+        assert!(!imports(&code, "TOKEN"), "{code}");
+        assert!(code.contains(member), "{code}");
+    }
+}
+
+#[test]
+fn inject_computed_member_keeps_object() {
+    // The factory copies `TOKEN['sub']` as written, with the local name.
     assert_kept(
         r#"
 import { Injectable, Inject } from "@angular/core";
 import { TOKEN } from "./tokens";
-@Injectable() export class S { constructor(@Inject(TOKEN.sub) private v: unknown) {} }
+@Injectable() export class S { constructor(@Inject(TOKEN['sub']) private v: unknown) {} }
 "#,
         &["TOKEN"],
     );

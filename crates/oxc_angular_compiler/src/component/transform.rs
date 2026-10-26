@@ -708,6 +708,9 @@ fn module_export_name_to_str<'a>(name: &ModuleExportName<'a>) -> Option<&'a str>
 ///
 /// This function replaces bare `ReadVar` tokens with namespace-prefixed `ReadProp` references
 /// (e.g., `Store` → `i1.Store`) for any token that has a corresponding import in the import map.
+/// A member chain is resolved through its leftmost name, like ngtsc's `typeToValue`: a
+/// qualified type `ns.one.One` reads off the namespace import (`i1.one.One`), and
+/// `mod.Foo` off the named import (`i1.mod.Foo`).
 /// This ensures the factory works correctly even after import elision.
 fn resolve_factory_dep_namespaces<'a>(
     allocator: &'a Allocator,
@@ -716,12 +719,14 @@ fn resolve_factory_dep_namespaces<'a>(
     namespace_registry: &mut NamespaceRegistry<'a>,
 ) {
     for dep in deps.iter_mut() {
-        let Some(ref token) = dep.token else { continue };
+        let Some(token) = dep.token.as_mut() else { continue };
+        let is_member_chain = matches!(token, OutputExpression::ReadProp(_));
+        let root = member_chain_root(token);
         // Only process bare variable references (ReadVar)
-        let OutputExpression::ReadVar(var) = token else { continue };
-        let name = &var.name;
+        let OutputExpression::ReadVar(var) = root else { continue };
+        let name = var.name;
         // Look up this identifier in the import map
-        let Some(import_info) = import_map.get(name) else { continue };
+        let Some(import_info) = import_map.get(&name) else { continue };
         if import_info.is_type_only {
             // Type-only imports (`import type { X }` / `import { type X }`) are erased
             // at runtime, so they cannot be used as DI tokens. Flag the dep so the
@@ -733,23 +738,36 @@ fn resolve_factory_dep_namespaces<'a>(
             continue;
         }
         // Replace with namespace-prefixed reference: i1.Store instead of Store
-        let namespace = namespace_registry.get_or_assign(&import_info.source_module);
-        dep.token = Some(OutputExpression::ReadProp(oxc_allocator::Box::new_in(
-            ReadPropExpr {
-                receiver: oxc_allocator::Box::new_in(
-                    OutputExpression::ReadVar(oxc_allocator::Box::new_in(
-                        ReadVarExpr { name: namespace, source_span: None },
-                        &allocator,
-                    )),
-                    &allocator,
-                ),
-                // Export name when aliased (`Foo as Bar` → `i1.Foo`).
-                name: import_info.imported_name.clone().unwrap_or_else(|| name.clone()),
-                optional: false,
+        let namespace = OutputExpression::ReadVar(oxc_allocator::Box::new_in(
+            ReadVarExpr {
+                name: namespace_registry.get_or_assign(&import_info.source_module),
                 source_span: None,
             },
             &allocator,
-        )));
+        ));
+        *root = if is_member_chain && !import_info.is_named_import {
+            // `ns.X` for `import * as ns`: the emitted namespace import is `ns` itself.
+            namespace
+        } else {
+            OutputExpression::ReadProp(oxc_allocator::Box::new_in(
+                ReadPropExpr {
+                    receiver: oxc_allocator::Box::new_in(namespace, &allocator),
+                    // Export name when aliased (`Foo as Bar` → `i1.Foo`).
+                    name: import_info.imported_name.unwrap_or(name),
+                    optional: false,
+                    source_span: None,
+                },
+                &allocator,
+            ))
+        };
+    }
+}
+
+/// The leftmost expression of a property-read chain: `ns` in `ns.one.One`.
+fn member_chain_root<'b, 'a>(expr: &'b mut OutputExpression<'a>) -> &'b mut OutputExpression<'a> {
+    match expr {
+        OutputExpression::ReadProp(prop) => member_chain_root(&mut prop.receiver),
+        other => other,
     }
 }
 
@@ -5302,6 +5320,7 @@ fn compile_component_partial<'a>(
     view_queries: &[R3QueryMetadata<'a>],
     content_queries: &[R3QueryMetadata<'a>],
     pool_starting_index: u32,
+    namespace_registry: &mut NamespaceRegistry<'a>,
 ) -> FullCompilationResult {
     let inputs = crate::partial::PartialComponentInputs {
         template,
@@ -5319,6 +5338,7 @@ fn compile_component_partial<'a>(
         allocator,
         core_namespace,
         metadata,
+        namespace_registry,
     );
 
     // Detect `@defer` block presence by a cheap string scan — partial
@@ -5523,6 +5543,7 @@ fn compile_component_full<'a>(
             &view_queries,
             &content_queries,
             pool_starting_index,
+            namespace_registry,
         ));
     }
 

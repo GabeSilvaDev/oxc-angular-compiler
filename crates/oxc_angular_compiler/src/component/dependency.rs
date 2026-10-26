@@ -51,6 +51,14 @@ pub struct R3DependencyMetadata<'a> {
     /// alias, or it resolves to `undefined` at runtime.
     pub token_imported_name: Option<Ident<'a>>,
 
+    /// The members read off `token` for a qualified type (`ns.one.One` → token
+    /// `ns`, members `[one, One]`). Empty for a plain name.
+    pub token_member_path: &'a [Ident<'a>],
+
+    /// Whether `token` is a namespace import (`import * as ns`) whose members
+    /// are read: the emitted namespace import (`i1`) then stands for it.
+    pub token_is_namespace_import: bool,
+
     /// For `@Attribute()` dependencies, the attribute name.
     /// `None` for regular dependencies.
     pub attribute_name: Option<Ident<'a>>,
@@ -88,6 +96,8 @@ impl<'a> R3DependencyMetadata<'a> {
             token_source_module: None,
             has_named_import: false,
             token_imported_name: None,
+            token_member_path: &[],
+            token_is_namespace_import: false,
             attribute_name: None,
             host: false,
             optional: false,
@@ -105,6 +115,8 @@ impl<'a> R3DependencyMetadata<'a> {
             token_source_module: None,
             has_named_import: false,
             token_imported_name: None,
+            token_member_path: &[],
+            token_is_namespace_import: false,
             attribute_name: None,
             host: false,
             optional: false,
@@ -125,6 +137,8 @@ impl<'a> R3DependencyMetadata<'a> {
             token_source_module: None,
             has_named_import: false,
             token_imported_name: None,
+            token_member_path: &[],
+            token_is_namespace_import: false,
             attribute_name: None,
             host: false,
             optional: false,
@@ -166,6 +180,8 @@ impl<'a> R3DependencyMetadata<'a> {
             token_source_module: None,
             has_named_import: false,
             token_imported_name: None,
+            token_member_path: &[],
+            token_is_namespace_import: false,
             attribute_name: Some(attribute_name),
             host: false,
             optional: false,
@@ -374,7 +390,7 @@ fn compile_inject_dependency<'a>(
 ///
 /// This mimics Angular's import reuse behavior where existing named imports
 /// are reused rather than generating new namespace imports.
-fn create_token_expression<'a>(
+pub fn create_token_expression<'a>(
     allocator: &'a Allocator,
     dep: &R3DependencyMetadata<'a>,
     token_name: &Ident<'a>,
@@ -393,36 +409,43 @@ fn create_token_expression<'a>(
             // Reuse existing named import - use bare token name
             // This matches Angular's behavior: import { DIALOG_DATA } from "@angular/cdk/dialog"
             // allows using `DIALOG_DATA` directly instead of `i1.DIALOG_DATA`
-            return OutputExpression::ReadVar(Box::new_in(
+            let token = OutputExpression::ReadVar(Box::new_in(
                 ReadVarExpr { name: token_name.clone(), source_span: None },
                 &allocator,
             ));
+            return crate::util::read_member_path(allocator, token, dep.token_member_path);
         }
 
         // Imported dependency without named import - use namespace.TokenName (e.g., i1.AuthService)
-        let namespace = namespace_registry.get_or_assign(source_module);
-        OutputExpression::ReadProp(Box::new_in(
+        let namespace = OutputExpression::ReadVar(Box::new_in(
+            ReadVarExpr {
+                name: namespace_registry.get_or_assign(source_module),
+                source_span: None,
+            },
+            &allocator,
+        ));
+        if dep.token_is_namespace_import {
+            // `ns.one.One` for `import * as ns` → `i1.one.One`
+            return crate::util::read_member_path(allocator, namespace, dep.token_member_path);
+        }
+        let token = OutputExpression::ReadProp(Box::new_in(
             ReadPropExpr {
-                receiver: Box::new_in(
-                    OutputExpression::ReadVar(Box::new_in(
-                        ReadVarExpr { name: namespace, source_span: None },
-                        &allocator,
-                    )),
-                    &allocator,
-                ),
+                receiver: Box::new_in(namespace, &allocator),
                 // Export name when aliased (`Foo as Bar` → `i1.Foo`).
                 name: dep.token_imported_name.clone().unwrap_or_else(|| token_name.clone()),
                 optional: false,
                 source_span: None,
             },
             &allocator,
-        ))
+        ));
+        crate::util::read_member_path(allocator, token, dep.token_member_path)
     } else {
         // Local dependency - use bare token name
-        OutputExpression::ReadVar(Box::new_in(
+        let token = OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name: token_name.clone(), source_span: None },
             &allocator,
-        ))
+        ));
+        crate::util::read_member_path(allocator, token, dep.token_member_path)
     }
 }
 
