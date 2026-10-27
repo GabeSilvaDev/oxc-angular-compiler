@@ -337,7 +337,7 @@ pub fn compile_declare_component_from_metadata<'a>(
         ));
     }
 
-    if meta.preserve_whitespaces {
+    if meta.preserve_whitespaces == Some(true) {
         entries.push(LiteralMapEntry::new(
             Ident::from("preserveWhitespaces"),
             bool_lit(allocator, true),

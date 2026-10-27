@@ -76,6 +76,15 @@ fn keeps_whitespace_the_decorator_preserves() {
 }
 
 #[test]
+fn keeps_whitespace_the_project_option_preserves() {
+    let source = component("", "<div>\n  <span> {{ name }} </span>\n</div>");
+    let options = hmr(TransformOptions { preserve_whitespaces: Some(true), ..Default::default() });
+    let update = update(&source, &options, None);
+    assert_template_matches_transform(&update, &transform(&source, &options, None));
+    assert!(update.template_js.contains(r#"ɵɵtext(1,"\n  ")"#), "{}", update.template_js);
+}
+
+#[test]
 fn names_i18n_messages_after_the_file() {
     let source = component("", "<p i18n>Hello {{ name }}</p>");
     let options = hmr(TransformOptions { i18n_use_external_ids: false, ..Default::default() });

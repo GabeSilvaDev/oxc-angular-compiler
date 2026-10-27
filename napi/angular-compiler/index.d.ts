@@ -1113,7 +1113,8 @@ export interface TransformOptions {
    */
   changeDetection?: string
   /**
-   * Whether to preserve whitespace in templates.
+   * Project-wide `preserveWhitespaces` (`angularCompilerOptions`): the
+   * default for components whose decorator does not set it.
    * Defaults to false if not specified.
    */
   preserveWhitespaces?: boolean

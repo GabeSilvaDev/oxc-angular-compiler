@@ -141,6 +141,13 @@ export interface PluginOptions {
    * ```
    */
   compilationMode?: 'full' | 'partial'
+
+  /**
+   * Project-wide `preserveWhitespaces`, like `angularCompilerOptions.preserveWhitespaces`
+   * in the tsconfig: the default for components whose decorator does not set
+   * `preserveWhitespaces`. Default: `false`.
+   */
+  preserveWhitespaces?: boolean
 }
 
 // Match all TypeScript files - we'll filter by @Component/@Directive decorator in the handler
@@ -293,6 +300,7 @@ export function angular(options: PluginOptions = {}): Plugin[] {
     angularVersion: options.angularVersion,
     emitClassMetadata: options.emitClassMetadata ?? true,
     compilationMode: options.compilationMode ?? 'full',
+    preserveWhitespaces: options.preserveWhitespaces,
     tsconfig: options.tsconfig,
   }
 
@@ -552,6 +560,7 @@ export function angular(options: PluginOptions = {}): Plugin[] {
       minifyComponentStyles: getMinifyComponentStyles(context),
       emitClassMetadata: pluginOptions.emitClassMetadata,
       compilationMode: pluginOptions.compilationMode,
+      preserveWhitespaces: pluginOptions.preserveWhitespaces,
       // Evaluate decorator metadata imported from other files the way
       // ngtsc's program-wide checker does (`inputs: INPUTS`, `@Input(OPTS)`,
       // `templateUrl: TEMPLATE_URL`). Read files land in

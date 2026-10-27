@@ -137,7 +137,10 @@ pub struct TransformOptions {
     /// Override the change detection strategy.
     pub change_detection: Option<super::metadata::ChangeDetectionStrategy>,
 
-    /// Override the preserve whitespaces setting.
+    /// Project-wide `preserveWhitespaces` (`angularCompilerOptions`): the
+    /// default for components whose decorator does not set it. The
+    /// template-only compiles (`compile_template_to_js_with_options`,
+    /// `compile_template_for_hmr`) use it as the template's value.
     pub preserve_whitespaces: Option<bool>,
 
     /// Host bindings metadata for the component.
@@ -5454,11 +5457,18 @@ fn compile_component_full<'a>(
 
     let mut diagnostics = Vec::new();
 
+    // The decorator's `preserveWhitespaces` wins over the project-wide option
+    // (`parseTemplateDeclaration` in ngtsc's component resources.ts). Written
+    // back so the partial declaration carries the resolved value too.
+    let preserve_whitespaces =
+        metadata.preserve_whitespaces.or(options.preserve_whitespaces).unwrap_or(false);
+    metadata.preserve_whitespaces = Some(preserve_whitespaces);
+
     // Stage 1: Parse HTML
     // Build parse options from component metadata
     // Angular always forces tokenizeExpansionForms: true in parseTemplate()
     let parse_options = ParseTemplateOptions {
-        preserve_whitespaces: metadata.preserve_whitespaces,
+        preserve_whitespaces,
         // Enable modern syntax features (block syntax, let declarations)
         enable_block_syntax: true,
         enable_let_syntax: true,

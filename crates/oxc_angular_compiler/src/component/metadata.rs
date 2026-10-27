@@ -532,8 +532,10 @@ pub struct ComponentMetadata<'a> {
     /// which is split into an array and emitted as `exportAs: ["foo", "bar"]`.
     pub export_as: Vec<'a, Ident<'a>>,
 
-    /// Whether to preserve whitespace in templates.
-    pub preserve_whitespaces: bool,
+    /// The decorator's `preserveWhitespaces`, or `None` when it does not set
+    /// one and the project-wide `TransformOptions::preserve_whitespaces`
+    /// applies.
+    pub preserve_whitespaces: Option<bool>,
 
     /// Constructor parameter dependencies for DI.
     ///
@@ -951,7 +953,7 @@ impl<'a> ComponentMetadata<'a> {
             host: None,
             imports: Vec::new_in(&allocator),
             export_as: Vec::new_in(&allocator),
-            preserve_whitespaces: false,
+            preserve_whitespaces: None,
             constructor_deps: None,
             inputs: Vec::new_in(&allocator),
             outputs: Vec::new_in(&allocator),

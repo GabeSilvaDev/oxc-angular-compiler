@@ -207,7 +207,7 @@ pub fn extract_component_metadata<'a>(
                 }
                 "preserveWhitespaces" => {
                     metadata.preserve_whitespaces =
-                        extract_boolean_value(&prop.value).unwrap_or(false);
+                        Some(extract_boolean_value(&prop.value).unwrap_or(false));
                 }
                 "animations" => {
                     // Extract animations expression as full OutputExpression
@@ -1659,7 +1659,7 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert!(meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, Some(true));
         });
     }
 
@@ -1675,12 +1675,12 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert!(!meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, Some(false));
         });
     }
 
     #[test]
-    fn test_preserve_whitespaces_defaults_to_false() {
+    fn test_preserve_whitespaces_unset() {
         let code = r#"
             import {Component} from '@angular/core';
             @Component({
@@ -1690,7 +1690,7 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert!(!meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, None);
         });
     }
 
@@ -1823,7 +1823,7 @@ mod tests {
             assert_eq!(meta.imports.len(), 1);
             assert_eq!(meta.export_as.len(), 1);
             assert_eq!(meta.export_as[0].as_str(), "complete");
-            assert!(meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, Some(true));
             assert_eq!(meta.schemas.len(), 1);
         });
     }

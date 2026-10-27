@@ -177,7 +177,8 @@ pub struct TransformOptions {
     /// Defaults to "Default" if not specified.
     pub change_detection: Option<String>,
 
-    /// Whether to preserve whitespace in templates.
+    /// Project-wide `preserveWhitespaces` (`angularCompilerOptions`): the
+    /// default for components whose decorator does not set it.
     /// Defaults to false if not specified.
     pub preserve_whitespaces: Option<bool>,
 
@@ -2178,7 +2179,7 @@ pub fn extract_component_metadata_sync(
                                 .join(","),
                         )
                     },
-                    preserve_whitespaces: metadata.preserve_whitespaces,
+                    preserve_whitespaces: metadata.preserve_whitespaces.unwrap_or(false),
                     providers,
                     view_providers,
                     animations,
