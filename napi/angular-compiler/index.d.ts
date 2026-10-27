@@ -30,7 +30,7 @@ export interface BrowserTransformOptions {
   /** Generate a source map (default: false) */
   sourcemap?: boolean
   /** `async`/`await`, async generators and `for await` as generators, for zone.js (default: true) */
-  lowerAsync?: boolean
+  downlevelAsync?: boolean
 }
 
 /** Result of `transformForBrowser`. */
@@ -1046,8 +1046,8 @@ export declare function transformForBrowser(
 
 /**
  * TypeScript stripped as `tsc` does it with Angular's settings (`experimentalDecorators`,
- * `useDefineForClassFields: false`, target ES2022) and `async` lowered to generators, which zone.js needs;
- * JavaScript gets only the lowering. Runtime helpers are imported from `@oxc-project/runtime`.
+ * `useDefineForClassFields: false`, target ES2022) and `async` downleveled to generators, which zone.js needs;
+ * JavaScript gets only the downleveling. Runtime helpers are imported from `@oxc-project/runtime`.
  */
 export declare function transformForBrowserSync(
   code: string,

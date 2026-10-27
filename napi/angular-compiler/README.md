@@ -204,6 +204,7 @@ interface PluginOptions {
   // Features
   jit?: boolean
   liveReload?: boolean
+  // Default: zoneless unless zone.js is installed (see below)
   zoneless?: boolean
   sourceMap?: boolean | { scripts?: boolean; vendor?: boolean }
 
@@ -236,6 +237,22 @@ interface PluginOptions {
 - `"auto"` or `undefined`: follow the resolved Vite minification settings
 
 For `"auto"`, the plugin uses `build.cssMinify` when it is set, otherwise it falls back to `build.minify`. In dev, `"auto"` defaults to `false`.
+
+### zone.js and `async`/`await`
+
+zone.js cannot track native `await`. Unless the app is zoneless, the plugin
+downlevels `async` functions, async generators and `for await` in application code
+to generators, as the Angular CLI does for apps with `zone.js` in their
+polyfills, so `fakeAsync` with `tick()`/`flushMicrotasks()` drives code that
+awaits, and change detection runs after an `await`. The helpers are imported
+from `@oxc-project/runtime`, which Vite resolves. Server (SSR) transforms and
+`node_modules` are left as they are. Vitest's `node` environment transforms as
+SSR, so run zone.js specs in `jsdom`, `happy-dom` or the browser.
+
+Without `zoneless`, an app is taken to be zoneless when no `node_modules` above
+the Vite root contains `zone.js`. Set `zoneless: true` to keep `async` native in a
+zoneless app that still has zone.js installed, or `zoneless: false` to force the
+downleveling.
 
 ### Library builds (`.d.ts`)
 

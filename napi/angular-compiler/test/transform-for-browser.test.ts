@@ -3,7 +3,7 @@ import { describe, it, expect } from 'vitest'
 import { transformForBrowser, transformForBrowserSync } from '../index.js'
 
 describe('transformForBrowser', () => {
-  it('lowers async functions, async generators and for await to generators for zone.js', async () => {
+  it('downlevels async functions, async generators and for await to generators for zone.js', async () => {
     const result = await transformForBrowser(
       `export async function load(urls) { for await (const r of urls) await r; }
 export async function* pages() { yield 1; }`,
@@ -14,11 +14,11 @@ export async function* pages() { yield 1; }`,
     expect(result.code).toContain('@oxc-project/runtime/helpers/asyncToGenerator')
   })
 
-  it("keeps async native with lowerAsync: false, and leaves JavaScript's class fields alone", () => {
+  it("keeps async native with downlevelAsync: false, and leaves JavaScript's class fields alone", () => {
     const result = transformForBrowserSync(
       `export class A { b = 1; static s = 2; async f() { await 1; } }`,
       'a.mjs',
-      { lowerAsync: false },
+      { downlevelAsync: false },
     )
     expect(result.code).toContain('async f()')
     expect(result.code).toMatch(/b = 1;[\s\S]*static s = 2/)
@@ -53,7 +53,7 @@ export async function* pages() { yield 1; }`,
     expect(code).toContain('E[E["B"] = 1] = "B"')
   })
 
-  it('lowers await using before async', () => {
+  it('downlevels await using before async', () => {
     const { code, errors } = transformForBrowserSync(
       `export async function f(r) { await using x = r; return 1; }`,
       'f.mjs',

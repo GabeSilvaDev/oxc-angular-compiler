@@ -3280,7 +3280,7 @@ pub fn link_angular_package(
 }
 
 // =============================================================================
-// Browser transform (TypeScript and async lowering for zone.js)
+// Browser transform (TypeScript and async downleveling for zone.js)
 // =============================================================================
 
 /// Options for `transformForBrowser`.
@@ -3290,7 +3290,7 @@ pub struct BrowserTransformOptions {
     /// Generate a source map (default: false)
     pub sourcemap: Option<bool>,
     /// `async`/`await`, async generators and `for await` as generators, for zone.js (default: true)
-    pub lower_async: Option<bool>,
+    pub downlevel_async: Option<bool>,
 }
 
 /// Result of `transformForBrowser`.
@@ -3305,8 +3305,8 @@ pub struct BrowserTransformResult {
 }
 
 /// TypeScript stripped as `tsc` does it with Angular's settings (`experimentalDecorators`,
-/// `useDefineForClassFields: false`, target ES2022) and `async` lowered to generators, which zone.js needs;
-/// JavaScript gets only the lowering. Runtime helpers are imported from `@oxc-project/runtime`.
+/// `useDefineForClassFields: false`, target ES2022) and `async` downleveled to generators, which zone.js needs;
+/// JavaScript gets only the downleveling. Runtime helpers are imported from `@oxc-project/runtime`.
 #[napi]
 pub fn transform_for_browser_sync(
     code: String,
@@ -3325,7 +3325,7 @@ pub fn transform_for_browser_sync(
         &filename,
         &RustOptions {
             sourcemap: options.sourcemap.unwrap_or(false),
-            lower_async: options.lower_async.unwrap_or(true),
+            downlevel_async: options.downlevel_async.unwrap_or(true),
         },
     );
     BrowserTransformResult {
