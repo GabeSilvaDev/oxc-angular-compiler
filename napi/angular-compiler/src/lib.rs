@@ -160,6 +160,15 @@ pub struct TransformOptions {
     /// >= v22, legacy when the version is unknown).
     pub legacy_optional_chaining: Option<bool>,
 
+    /// The `enableI18nLegacyMessageIdFormat` Angular compiler option
+    /// (`angularCompilerOptions.enableI18nLegacyMessageIdFormat` in `tsconfig.json`).
+    ///
+    /// When `true`, `$localize` messages carry their legacy ids
+    /// (`:@@custom␟<sha1>␟<decimal>:text`), for translation files keyed by legacy ids.
+    /// Defaults to `false`, as in the `tsconfig.json` that `ng new` generates.
+    #[napi(js_name = "enableI18nLegacyMessageIdFormat")]
+    pub enable_i18n_legacy_message_id_format: Option<bool>,
+
     // Component metadata fields for full compilation testing
     // These mirror Angular's @Component decorator options.
     /// The CSS selector that identifies this component in a template.
@@ -265,6 +274,9 @@ impl From<TransformOptions> for RustTransformOptions {
             i18n_use_external_ids: options.i18n_use_external_ids.unwrap_or(true),
             angular_version: options.angular_version.map(Into::into),
             legacy_optional_chaining: options.legacy_optional_chaining,
+            enable_i18n_legacy_message_id_format: options
+                .enable_i18n_legacy_message_id_format
+                .unwrap_or(false),
             // Component metadata overrides
             selector: options.selector,
             standalone: options.standalone,

@@ -148,6 +148,16 @@ export interface PluginOptions {
    * `preserveWhitespaces`. Default: `false`.
    */
   preserveWhitespaces?: boolean
+
+  /**
+   * Angular's `enableI18nLegacyMessageIdFormat` compiler option: `$localize`
+   * messages carry their legacy ids (`:@@custom␟<sha1>␟<decimal>:text`).
+   *
+   * Enable it when the translation files are keyed by legacy message ids
+   * (extracted with the legacy format). Default: `false`, as in the
+   * `tsconfig.json` that `ng new` generates.
+   */
+  enableI18nLegacyMessageIdFormat?: boolean
 }
 
 // Match all TypeScript files - we'll filter by @Component/@Directive decorator in the handler
@@ -301,6 +311,7 @@ export function angular(options: PluginOptions = {}): Plugin[] {
     emitClassMetadata: options.emitClassMetadata ?? true,
     compilationMode: options.compilationMode ?? 'full',
     preserveWhitespaces: options.preserveWhitespaces,
+    enableI18nLegacyMessageIdFormat: options.enableI18nLegacyMessageIdFormat ?? false,
     tsconfig: options.tsconfig,
   }
 
@@ -561,6 +572,7 @@ export function angular(options: PluginOptions = {}): Plugin[] {
       emitClassMetadata: pluginOptions.emitClassMetadata,
       compilationMode: pluginOptions.compilationMode,
       preserveWhitespaces: pluginOptions.preserveWhitespaces,
+      enableI18nLegacyMessageIdFormat: pluginOptions.enableI18nLegacyMessageIdFormat,
       // Evaluate decorator metadata imported from other files the way
       // ngtsc's program-wide checker does (`inputs: INPUTS`, `@Input(OPTS)`,
       // `templateUrl: TEMPLATE_URL`). Read files land in

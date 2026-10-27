@@ -169,6 +169,7 @@ interface TransformOptions {
 
   // i18n (note the capital N, as the N-API bindings generate it)
   i18NUseExternalIds?: boolean
+  enableI18nLegacyMessageIdFormat?: boolean
 
   // Final component style output
   minifyComponentStyles?: boolean
@@ -311,9 +312,11 @@ The Vite plugin consists of these sub-plugins:
 - External message IDs
 - File-based naming
 
-Not supported: legacy message IDs (Angular's `enableI18nLegacyMessageIdFormat`) and
-`i18nNormalizeLineEndingsInICUs`. `$localize` messages carry no legacy IDs, so translations
-keyed only by legacy IDs are not applied; translations keyed by the current message IDs are.
+- Legacy message IDs: `enableI18nLegacyMessageIdFormat: true` (also a Vite plugin option) makes
+  `$localize` messages carry them, for translation files keyed by legacy IDs. Off by default, as
+  in the `tsconfig.json` that `ng new` generates.
+
+Not supported: `i18nNormalizeLineEndingsInICUs`.
 
 ## Platform Support
 

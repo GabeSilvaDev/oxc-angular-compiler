@@ -1095,6 +1095,15 @@ export interface TransformOptions {
    * >= v22, legacy when the version is unknown).
    */
   legacyOptionalChaining?: boolean
+  /**
+   * The `enableI18nLegacyMessageIdFormat` Angular compiler option
+   * (`angularCompilerOptions.enableI18nLegacyMessageIdFormat` in `tsconfig.json`).
+   *
+   * When `true`, `$localize` messages carry their legacy ids
+   * (`:@@custom␟<sha1>␟<decimal>:text`), for translation files keyed by legacy ids.
+   * Defaults to `false`, as in the `tsconfig.json` that `ng new` generates.
+   */
+  enableI18nLegacyMessageIdFormat?: boolean
   /** The CSS selector that identifies this component in a template. */
   selector?: string
   /**

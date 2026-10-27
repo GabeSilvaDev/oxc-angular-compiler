@@ -229,6 +229,14 @@ pub struct TransformOptions {
     /// `Full` (default) targets applications; `Partial` targets library
     /// builds, where consumers run the linker to expand declarations.
     pub compilation_mode: crate::CompilationMode,
+
+    /// Angular's `enableI18nLegacyMessageIdFormat` compiler option: write each i18n
+    /// message's legacy ids in its `$localize` metadata
+    /// (`:@@custom␟<sha1>␟<decimal>:text`), for translation files keyed by legacy ids.
+    ///
+    /// Default: `false`, as in the `tsconfig.json` that `ng new` generates. ngtsc itself
+    /// defaults to `true` when the option is not set.
+    pub enable_i18n_legacy_message_id_format: bool,
 }
 
 /// Input for host metadata when passed via TransformOptions.
@@ -284,6 +292,7 @@ impl Default for TransformOptions {
             emit_class_metadata: true,
             minify_component_styles: false,
             compilation_mode: crate::CompilationMode::Full,
+            enable_i18n_legacy_message_id_format: false,
         }
     }
 }
@@ -5490,12 +5499,13 @@ fn compile_component_full<'a>(
 
     // Stage 1.5: Remove whitespace if not preserving
     // This must happen before R3 transform, matching Angular's pipeline
+    let untrimmed: &'a [crate::ast::html::HtmlNode<'a>] = allocator.alloc(html_result.nodes);
     let nodes = if parse_options.preserve_whitespaces {
-        &html_result.nodes
+        untrimmed
     } else {
         // Apply whitespace removal with preserveSignificantWhitespace=true
         // (Angular uses true for template compilation, false for message extraction)
-        let processed = remove_whitespaces(allocator, &html_result.nodes, true);
+        let processed = remove_whitespaces(allocator, untrimmed, true);
         // We need to leak this to get a reference with the right lifetime
         // since we're in a function that returns Result
         allocator.alloc(processed) as &_
@@ -5505,8 +5515,10 @@ fn compile_component_full<'a>(
     let r3_transform_options = R3TransformOptions {
         collect_comment_nodes: parse_options.collect_comment_nodes,
         angular_version: options.angular_version,
+        enable_i18n_legacy_message_id_format: options.enable_i18n_legacy_message_id_format,
     };
-    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
+    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options)
+        .with_untrimmed_nodes(untrimmed);
     let r3_result = transformer.transform(nodes);
 
     if !r3_result.errors.is_empty() {
@@ -6161,6 +6173,7 @@ pub fn compile_component_template<'a>(
     let r3_transform_options = R3TransformOptions {
         collect_comment_nodes: parse_options.collect_comment_nodes,
         angular_version: None,
+        ..R3TransformOptions::default()
     };
     let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
     let r3_result = transformer.transform(nodes);
@@ -6251,10 +6264,11 @@ pub fn compile_template_to_js_with_options<'a>(
     }
 
     // Stage 1.5: Remove whitespace if not preserving (default behavior)
+    let untrimmed: &'a [crate::ast::html::HtmlNode<'a>] = allocator.alloc(html_result.nodes);
     let nodes = if parse_options.preserve_whitespaces {
-        &html_result.nodes
+        untrimmed
     } else {
-        let processed = remove_whitespaces(allocator, &html_result.nodes, true);
+        let processed = remove_whitespaces(allocator, untrimmed, true);
         allocator.alloc(processed) as &_
     };
 
@@ -6262,8 +6276,10 @@ pub fn compile_template_to_js_with_options<'a>(
     let r3_transform_options = R3TransformOptions {
         collect_comment_nodes: parse_options.collect_comment_nodes,
         angular_version: options.angular_version,
+        enable_i18n_legacy_message_id_format: options.enable_i18n_legacy_message_id_format,
     };
-    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
+    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options)
+        .with_untrimmed_nodes(untrimmed);
     let r3_result = transformer.transform(nodes);
 
     if !r3_result.errors.is_empty() {
@@ -6435,10 +6451,11 @@ pub fn compile_template_for_hmr<'a>(
     }
 
     // Stage 1.5: Remove whitespace if not preserving
+    let untrimmed: &'a [crate::ast::html::HtmlNode<'a>] = allocator.alloc(html_result.nodes);
     let nodes = if parse_options.preserve_whitespaces {
-        &html_result.nodes
+        untrimmed
     } else {
-        let processed = remove_whitespaces(allocator, &html_result.nodes, true);
+        let processed = remove_whitespaces(allocator, untrimmed, true);
         allocator.alloc(processed) as &_
     };
 
@@ -6446,8 +6463,10 @@ pub fn compile_template_for_hmr<'a>(
     let r3_transform_options = R3TransformOptions {
         collect_comment_nodes: parse_options.collect_comment_nodes,
         angular_version: options.angular_version,
+        enable_i18n_legacy_message_id_format: options.enable_i18n_legacy_message_id_format,
     };
-    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
+    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options)
+        .with_untrimmed_nodes(untrimmed);
     let r3_result = transformer.transform(nodes);
 
     if !r3_result.errors.is_empty() {
@@ -7184,6 +7203,7 @@ pub fn compile_template_for_linker<'a>(
     let r3_transform_options = R3TransformOptions {
         collect_comment_nodes: parse_options.collect_comment_nodes,
         angular_version,
+        ..R3TransformOptions::default()
     };
     let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
     let r3_result = transformer.transform(nodes);

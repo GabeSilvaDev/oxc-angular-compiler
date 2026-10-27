@@ -488,28 +488,16 @@ impl I18nMessageFactory {
         // Build ICU cases (ordered for consistent serialization)
         let mut cases: IndexMap<String, Node> = IndexMap::default();
         for case in &expansion.cases {
-            let mut case_nodes = self.visit_all(&case.expansion, context, visit_fn);
-            let case_node = if case_nodes.len() == 1 {
-                case_nodes.pop().unwrap_or_else(|| {
-                    let case_span = ParseSourceSpan::from_offsets(
-                        &context.source_file,
-                        case.expansion_span.start,
-                        case.expansion_span.end,
-                        None,
-                        None,
-                    );
-                    Node::Container(Container::new(Vec::new(), case_span))
-                })
-            } else {
-                let case_span = ParseSourceSpan::from_offsets(
-                    &context.source_file,
-                    case.expansion_span.start,
-                    case.expansion_span.end,
-                    None,
-                    None,
-                );
-                Node::Container(Container::new(case_nodes, case_span))
-            };
+            // Angular wraps every case in a Container, which digests serialize as `[...]`.
+            let case_nodes = self.visit_all(&case.expansion, context, visit_fn);
+            let case_span = ParseSourceSpan::from_offsets(
+                &context.source_file,
+                case.expansion_span.start,
+                case.expansion_span.end,
+                None,
+                None,
+            );
+            let case_node = Node::Container(Container::new(case_nodes, case_span));
             cases.insert(case.value.to_string(), case_node);
         }
 
