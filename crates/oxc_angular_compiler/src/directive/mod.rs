@@ -55,7 +55,7 @@ pub(crate) use property_decorators::{
     angular_class_decorator, angular_core_identifier, angular_member_decorator,
     angular_param_decorator, decorator_written_name, is_angular_core_decorator,
     parse_decorator_queries, try_parse_signal_input, try_parse_signal_model,
-    try_parse_signal_output, unwrap_initializer_api_expr,
+    try_parse_signal_output, try_unwrap_forward_ref, unwrap_initializer_api_expr,
 };
 pub use property_decorators::{
     extract_class_queries, extract_content_queries, extract_host_bindings, extract_host_listeners,

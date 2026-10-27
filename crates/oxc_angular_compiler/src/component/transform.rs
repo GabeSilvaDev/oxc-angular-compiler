@@ -5636,15 +5636,22 @@ fn compile_component_full<'a>(
         && let Some(import_elision) = import_elision
         && !options.hmr
         && let Some(OutputExpression::LiteralArray(raw_imports)) = &metadata.raw_imports
-        && raw_imports.entries.iter().all(|entry| matches!(entry, OutputExpression::ReadVar(_)))
+        && raw_imports.entries.len() == metadata.import_entry_classes.len()
+        && raw_imports
+            .entries
+            .iter()
+            .zip(&metadata.import_entry_classes)
+            .all(|(entry, class)| class.is_some() || matches!(entry, OutputExpression::ReadVar(_)))
         && super::defer_resolver::template_has_defer_block(&r3_result.nodes)
     {
         let candidates: Vec<_> = metadata
-            .imports
+            .import_entry_classes
             .iter()
+            .flatten()
+            .copied()
             .filter_map(|name| {
                 let selector = deferrable_selector(name.as_str())?;
-                Some((*name, crate::pipeline::selector::CssSelector::parse(&selector)))
+                Some((name, crate::pipeline::selector::CssSelector::parse(&selector)))
             })
             .collect();
         let deferred =
@@ -5668,8 +5675,9 @@ fn compile_component_full<'a>(
             let is_deferred = |name: &str| deferred.iter().any(|d| d.as_str() == name);
             metadata.imports.retain(|name| !is_deferred(name.as_str()));
             if let Some(OutputExpression::LiteralArray(raw_imports)) = &mut metadata.raw_imports {
-                raw_imports.entries.retain(|entry| {
-                    !matches!(entry, OutputExpression::ReadVar(var) if is_deferred(var.name.as_str()))
+                let mut classes = metadata.import_entry_classes.iter();
+                raw_imports.entries.retain(|_| {
+                    !classes.next().copied().flatten().is_some_and(|name| is_deferred(&name))
                 });
             }
             implicitly_deferred_imports = deferred.iter().map(ToString::to_string).collect();
