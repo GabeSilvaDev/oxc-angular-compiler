@@ -76,16 +76,7 @@ pub(crate) fn angular_core_decorator(
         expr => expr,
     };
     let name = match callee {
-        Expression::Identifier(id) => match consts {
-            Some(consts) => {
-                let import = consts.scope().import(&id.name)?;
-                if import.module != CORE {
-                    return None;
-                }
-                import.imported?
-            }
-            None => id.name.as_str(),
-        },
+        Expression::Identifier(id) => return angular_core_identifier(&id.name, consts, names),
         Expression::StaticMemberExpression(m) => match &m.object {
             Expression::Identifier(ns) if is_core_namespace(consts, &ns.name) => {
                 m.property.name.as_str()
@@ -93,6 +84,27 @@ pub(crate) fn angular_core_decorator(
             _ => return None,
         },
         _ => return None,
+    };
+    names.iter().copied().find(|n| *n == name)
+}
+
+/// Which of Angular's `names` the identifier `name` is: with the file `consts`
+/// was collected from, only one imported from `@angular/core` (under any
+/// alias), like ngtsc's `reflector.getImportOfIdentifier`; without it, by name.
+pub(crate) fn angular_core_identifier(
+    name: &str,
+    consts: Option<&super::StringConsts<'_>>,
+    names: &[&'static str],
+) -> Option<&'static str> {
+    let name = match consts {
+        Some(consts) => {
+            let import = consts.scope().import(name)?;
+            if import.module != CORE {
+                return None;
+            }
+            import.imported?
+        }
+        None => name,
     };
     names.iter().copied().find(|n| *n == name)
 }
