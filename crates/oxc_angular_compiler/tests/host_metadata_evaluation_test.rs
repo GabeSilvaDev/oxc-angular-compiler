@@ -373,28 +373,79 @@ fn dynamic_value_of_a_binding() {
     assert_error(make, "{ style: make() }", "Style binding must be string");
 }
 
-/// ngtsc emits a plain attribute's dynamic value as an expression in `hostAttrs`
-/// (`["role", make()]`). That is not supported here, and is reported instead of dropped.
+/// ngtsc emits a plain attribute's dynamic value as it is written, in `hostAttrs`
+/// (`["role", make()]`). That includes a value computed from an import whose file has no
+/// readable value (ngtsc_spec.ts: "should accept dynamic host attribute bindings"), but not
+/// the import itself, see [`host_that_depends_on_an_import`].
 #[test]
 fn dynamic_value_of_a_plain_attribute() {
-    let message = |key: &str| {
-        format!(
-            "Decorator host metadata must be a string -> string object, but the value of \
-             '{key}' could not be determined statically. OXC does not support dynamic \
-             host attribute values."
-        )
-    };
-    assert_error("declare function make(): string;", "{ role: make() }", &message("role"));
-    assert_error("", "{ role: NOPE }", &message("role"));
+    let make = "declare function make(): string;";
+    for decorator in ["Component", "Directive"] {
+        for (preamble, host, attrs) in [
+            (make, "{ role: make() }", r#"hostAttrs:["role",make()]"#),
+            ("", "{ role: NOPE }", r#"hostAttrs:["role",NOPE]"#),
+            (
+                &format!("{make} const S = {{ title: make() }};"),
+                "{ ...S, id: 'a' }",
+                r#"hostAttrs:["title",make(),"id","a"]"#,
+            ),
+            (
+                "import { SHARED } from './other';",
+                "{ role: SHARED + '!' }",
+                r#"hostAttrs:["role",(SHARED+"!")]"#,
+            ),
+            (
+                "import * as ns from './other';",
+                "{ role: ns.foo.bar }",
+                r#"hostAttrs:["role",ns.foo.bar]"#,
+            ),
+            (
+                "import { foo } from './other';\nconst test = foo.bar();",
+                "{ 'test': test }",
+                r#"hostAttrs:["test",test]"#,
+            ),
+        ] {
+            let definition = host_definition(decorator, preamble, host);
+            assert!(definition.contains(attrs), "for `host: {host}`: {definition}");
+        }
+    }
+}
+
+/// A partial declaration carries the expression in `host.attributes`.
+#[test]
+fn dynamic_value_of_a_plain_attribute_partial() {
+    for decorator in ["Component", "Directive"] {
+        let source = source(decorator, "declare function make(): string;", "{ role: make() }");
+        let allocator = Allocator::default();
+        let options = TransformOptions {
+            compilation_mode: oxc_angular_compiler::CompilationMode::Partial,
+            ..Default::default()
+        };
+        let result = transform_angular_file(&allocator, "/x/a.ts", &source, Some(&options), None);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let compact: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("host:{attributes:{role:make()}}"), "{compact}");
+    }
+}
+
+/// A dynamic attribute value with no expression to emit where the metadata is
+/// compiled: one that uses the parameters of a function the metadata calls.
+#[test]
+fn dynamic_value_of_a_plain_attribute_out_of_scope() {
     assert_error(
-        "declare function make(): string; const S = { title: make() };",
-        "{ ...S, id: 'a' }",
-        &message("title"),
+        "declare function make(): string;\nfunction h(v: string) { return { role: v + make() }; }",
+        "h('a')",
+        "Decorator host metadata must be a string -> string object, but the value of 'role' \
+         could not be determined statically, and OXC can't emit the expression it is written \
+         as where the metadata is compiled.",
     );
 }
 
 /// ngtsc reads another file to evaluate an import. One file at a time, that is an error
-/// that says so.
+/// that says so. A plain attribute set to the import itself (`SHARED`, `ns.SHARED`) is one
+/// too: with no readable value in the other file, ngtsc rejects it in full and local
+/// compilation mode alike ("found unparseable value"), unlike a value computed from it
+/// (see above).
 #[test]
 fn host_that_depends_on_an_import() {
     let imported = |subject: &str| {
@@ -403,12 +454,19 @@ fn host_that_depends_on_an_import() {
              OXC compiles one file at a time and cannot evaluate values from other files."
         )
     };
-    let preamble = "import { SHARED } from './other';";
+    let preamble =
+        "import { SHARED } from './other';\nimport * as ns from './other';\nconst R = SHARED;";
     for (decorator, subject) in [("Component", "@Component.host"), ("Directive", "@Directive.host")]
     {
-        for host in
-            ["SHARED", "{ ...SHARED, role: 'x' }", "{ role: SHARED }", "{ '(click)': SHARED }"]
-        {
+        for host in [
+            "SHARED",
+            "{ ...SHARED, role: 'x' }",
+            "{ role: SHARED }",
+            "{ role: (SHARED as string) }",
+            "{ role: R }",
+            "{ role: ns.SHARED }",
+            "{ '(click)': SHARED }",
+        ] {
             let source = source(decorator, preamble, host);
             let (_, diagnostics) = compile(&source);
             let [diagnostic] = diagnostics.as_slice() else {

@@ -567,9 +567,17 @@ fn compile_host_metadata<'a>(
     let mut entries: Vec<'a, LiteralMapEntry<'a>> = Vec::new_in(&allocator);
 
     if !host.attributes.is_empty() {
+        let mut attr_entries: Vec<'a, LiteralMapEntry<'a>> = Vec::new_in(&allocator);
+        for (key, value) in &host.attributes {
+            let quoted = is_unsafe_object_key(key.as_str());
+            attr_entries.push(LiteralMapEntry::new(key.clone(), value.clone_in(allocator), quoted));
+        }
         entries.push(LiteralMapEntry::new(
             Ident::from("attributes"),
-            ident_pairs_to_string_map(allocator, &host.attributes),
+            OutputExpression::LiteralMap(Box::new_in(
+                LiteralMapExpr { entries: attr_entries, source_span: None },
+                &allocator,
+            )),
             false,
         ));
     }

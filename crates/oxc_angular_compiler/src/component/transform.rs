@@ -6806,9 +6806,9 @@ fn convert_host_metadata_to_input<'a>(
         });
     }
 
-    // Convert static attributes: "role" -> OutputExpression::Literal
-    // This matches TypeScript which uses `o.literal(value)` for host attributes.
-    // They are in the order `merge_host_bindings` put them in.
+    // Static attributes are already the expressions `hostAttrs` holds, in the
+    // order `merge_host_bindings` put them in. The static style and class
+    // become string literals, like `o.literal(value)` upstream.
     let literal = |value: &Ident<'a>| {
         crate::output::ast::OutputExpression::Literal(oxc_allocator::Box::new_in(
             crate::output::ast::LiteralExpr {
@@ -6820,7 +6820,7 @@ fn convert_host_metadata_to_input<'a>(
     };
     let mut attributes = crate::pipeline::ingest::HostAttributes::default();
     for (key, value) in &host.attributes {
-        attributes.insert(*key, literal(value));
+        attributes.insert(*key, value.clone_in(allocator));
     }
 
     // Like Angular's `createHostBindingsFunction`, a non-empty static style,
@@ -6942,10 +6942,15 @@ fn convert_host_metadata_input_to_host_metadata<'a>(
             .push((Ident::from_in(k.as_str(), &allocator), Ident::from_in(v.as_str(), &allocator)));
     }
 
-    let mut attributes: OxcVec<'a, (Ident<'a>, Ident<'a>)> = OxcVec::new_in(&allocator);
+    let mut attributes: OxcVec<'a, (Ident<'a>, OutputExpression<'a>)> = OxcVec::new_in(&allocator);
     for (k, v) in &input.attributes {
-        attributes
-            .push((Ident::from_in(k.as_str(), &allocator), Ident::from_in(v.as_str(), &allocator)));
+        attributes.push((
+            Ident::from_in(k.as_str(), &allocator),
+            crate::output::ast::OutputAstBuilder::string(
+                allocator,
+                Ident::from_in(v.as_str(), &allocator),
+            ),
+        ));
     }
 
     let mut listeners: OxcVec<'a, (Ident<'a>, Ident<'a>)> = OxcVec::new_in(&allocator);

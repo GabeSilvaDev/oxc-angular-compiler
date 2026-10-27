@@ -249,6 +249,15 @@ export class X { go() {} t = ''; on = true; w = ''; }
     })
   })
 
+  it('reports a dynamic attribute value as the expression it is emitted as', () => {
+    expect(
+      hostOf(`declare const foo: any`, `{ role: foo.bar(), 'aria-label': 'L' }`)?.attributes,
+    ).toEqual([
+      ['role', 'foo.bar()'],
+      ['aria-label', 'L'],
+    ])
+  })
+
   it('reports the same host for a spread', () => {
     expect(hostOf(`const ALL = { ${ENTRIES} };`, '{ ...ALL }')).toEqual(literal)
     expect(

@@ -895,8 +895,10 @@ pub struct HostMetadata<'a> {
     /// Host property bindings: `{ '[class.active]': 'isActive' }`
     pub properties: Vec<'a, (Ident<'a>, Ident<'a>)>,
 
-    /// Host attribute bindings: `{ 'role': 'button' }`
-    pub attributes: Vec<'a, (Ident<'a>, Ident<'a>)>,
+    /// Static host attributes: `{ 'role': 'button' }`, as the expressions
+    /// `hostAttrs` holds (a string literal, or the expression ngtsc emits for
+    /// a value it can't evaluate).
+    pub attributes: Vec<'a, (Ident<'a>, OutputExpression<'a>)>,
 
     /// Host event listeners: `{ '(click)': 'onClick()' }`
     pub listeners: Vec<'a, (Ident<'a>, Ident<'a>)>,

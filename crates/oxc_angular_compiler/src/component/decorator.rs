@@ -18,8 +18,9 @@ use super::metadata::{
 };
 use super::transform::ImportMap;
 use crate::directive::{
-    HostKey, MemberHostBindings, StringConsts, evaluate_host_directives, extract_input_metadata_in,
-    extract_output_metadata_in, merge_by_class_property, merge_host_bindings, parse_decorator_io,
+    HostKey, HostValue, MemberHostBindings, StringConsts, evaluate_host_directives,
+    extract_input_metadata_in, extract_output_metadata_in, merge_by_class_property,
+    merge_host_bindings, parse_decorator_io,
 };
 use crate::output::oxc_converter::convert_oxc_expression;
 use crate::util::is_metadata_property;
@@ -170,7 +171,8 @@ pub fn extract_component_metadata<'a>(
                     // an invalid one must not be applied here where it would
                     // be dropped silently.
                     if !prop.computed {
-                        metadata.host = extract_host_metadata(allocator, &prop.value, consts);
+                        metadata.host =
+                            extract_host_metadata(allocator, &prop.value, source_text, consts);
                     }
                 }
                 "imports" => {
@@ -544,6 +546,7 @@ fn extract_change_detection(expr: &Expression<'_>) -> ChangeDetectionStrategy {
 fn extract_host_metadata<'a>(
     allocator: &'a Allocator,
     expr: &'a Expression<'a>,
+    source_text: Option<&'a str>,
     consts: &StringConsts<'a>,
 ) -> Option<HostMetadata<'a>> {
     // An unusable host is reported by `decorator_io_errors`.
@@ -552,12 +555,19 @@ fn extract_host_metadata<'a>(
 
     let mut host = HostMetadata::new(allocator);
     for (key, value) in entries {
-        match HostKey::of(key.as_str()) {
+        let kind = HostKey::of(key.as_str());
+        if matches!(kind, HostKey::Attribute) {
+            host.attributes.push((key, value.to_output(allocator, source_text)?));
+            continue;
+        }
+        // Only a plain attribute has an expression value.
+        let HostValue::String(value) = value else { continue };
+        match kind {
             HostKey::Property => host.properties.push((key, value)),
             HostKey::Listener => host.listeners.push((key, value)),
             HostKey::Class => host.class_attr = Some(value),
             HostKey::Style => host.style_attr = Some(value),
-            HostKey::Attribute => host.attributes.push((key, value)),
+            HostKey::Attribute => {}
         }
     }
     Some(host)

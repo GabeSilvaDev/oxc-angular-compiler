@@ -1933,6 +1933,7 @@ pub fn extract_component_metadata_sync(
     source: String,
     file_path: String,
 ) -> Vec<ExtractedComponentMetadata> {
+    use oxc_angular_compiler::output::ast::{LiteralValue, OutputExpression};
     use oxc_angular_compiler::output::emitter::JsEmitter;
     use oxc_angular_compiler::{
         ChangeDetectionStrategy as RustChangeDetection, QueryPredicate,
@@ -2010,10 +2011,21 @@ pub fn extract_component_metadata_sync(
                         .iter()
                         .map(|(k, v)| vec![k.to_string(), v.to_string()])
                         .collect(),
+                    // A static attribute is its string; a dynamic one
+                    // (`role: make()`) is the expression `hostAttrs` emits.
                     attributes: h
                         .attributes
                         .iter()
-                        .map(|(k, v)| vec![k.to_string(), v.to_string()])
+                        .map(|(k, v)| {
+                            let value = match v {
+                                OutputExpression::Literal(lit) => match &lit.value {
+                                    LiteralValue::String(s) => s.to_string(),
+                                    _ => emitter.emit_expression(v),
+                                },
+                                _ => emitter.emit_expression(v),
+                            };
+                            vec![k.to_string(), value]
+                        })
                         .collect(),
                     listeners: h
                         .listeners
