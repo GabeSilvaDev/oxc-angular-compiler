@@ -736,6 +736,14 @@ impl<'a> Parser<'a> {
         }
 
         let value = self.parse_pipe_for_template_binding();
+        // A token that starts no expression is left unread, and the value is empty. Angular's
+        // `parsePrimary` reports it and skips it.
+        if self.current_end_index() < expr_start
+            && let Some(token) = self.peek()
+        {
+            let token_str = token.str_value.to_string();
+            self.error(&format!("Unexpected token {token_str}"));
+        }
         // Value source is just the expression (up to current_end_index)
         let value_end = self.current_end_index();
 
@@ -752,7 +760,9 @@ impl<'a> Parser<'a> {
                 self.peek().map(|t| t.index).unwrap_or(self.source.len() as u32)
             };
 
-        let value_source = &self.source[expr_start as usize..value_end as usize];
+        // A value that fails to parse ends before it starts: Angular's `substring` swaps the two.
+        let value_source =
+            &self.source[expr_start.min(value_end) as usize..expr_start.max(value_end) as usize];
         let ast_with_source = ASTWithSource {
             ast: value,
             source: Some(Ident::from_in(value_source, &self.allocator)),

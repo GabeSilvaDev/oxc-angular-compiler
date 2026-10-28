@@ -1138,6 +1138,41 @@ mod parse_template_bindings {
         result.bindings
     }
 
+    #[test]
+    fn should_report_a_value_that_fails_to_parse() {
+        for value in ["b; in/", "let é of ü; trackBy: ñ"] {
+            let allocator = Allocator::default();
+            let key = TemplateBindingIdentifier {
+                source: oxc_str::Ident::from("a"),
+                span: oxc_angular_compiler::ast::expression::AbsoluteSourceSpan::new(0, 1),
+            };
+            let result = Parser::new(&allocator, value).parse_template_bindings(key);
+            assert!(!result.errors.is_empty(), "{value}");
+        }
+    }
+
+    #[test]
+    fn should_report_a_token_that_starts_no_value() {
+        for (value, token) in [
+            ("let i of xs; trackBy: }", "}"),
+            ("b; c: )", ")"),
+            ("b; c ]", "]"),
+            ("let i of xs; trackBy: =>", "=>"),
+        ] {
+            let allocator = Allocator::default();
+            let key = TemplateBindingIdentifier {
+                source: oxc_str::Ident::from("a"),
+                span: oxc_angular_compiler::ast::expression::AbsoluteSourceSpan::new(0, 1),
+            };
+            let result = Parser::new(&allocator, value).parse_template_bindings(key);
+            let messages: Vec<_> = result.errors.iter().map(String::as_str).collect();
+            assert!(
+                messages.iter().any(|m| m.starts_with(&format!("Unexpected token {token} "))),
+                "{value}: {messages:?}"
+            );
+        }
+    }
+
     // NOTE: Many tests below document the CURRENT behavior of the Rust implementation.
     // Some behaviors differ from Angular's TypeScript implementation.
     // Tests marked with TODO comments indicate expected Angular behavior for future fixes.
