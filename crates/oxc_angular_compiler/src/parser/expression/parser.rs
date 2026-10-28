@@ -736,6 +736,14 @@ impl<'a> Parser<'a> {
         }
 
         let value = self.parse_pipe_for_template_binding();
+        // A token that starts no expression is left unread, and the value is empty. Angular's
+        // `parsePrimary` reports it and skips it.
+        if self.current_end_index() < expr_start
+            && let Some(token) = self.peek()
+        {
+            let token_str = token.str_value.to_string();
+            self.error(&format!("Unexpected token {token_str}"));
+        }
         // Value source is just the expression (up to current_end_index)
         let value_end = self.current_end_index();
 
