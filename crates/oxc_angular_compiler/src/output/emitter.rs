@@ -517,13 +517,14 @@ impl JsEmitter {
                 // Format JSDoc comment with @desc, @meaning, and @suppress tags
                 // See: packages/compiler/src/output/output_jit_trusted_types.ts
                 ctx.print("/**");
+                // `@` in the text is escaped, as Angular's `tagToString` does, so it starts no tag.
                 if let Some(ref desc) = jsdoc.description {
                     ctx.print(" @desc ");
-                    ctx.print(desc.as_str());
+                    ctx.print(&desc.as_str().replace('@', "\\@"));
                 }
                 if let Some(ref meaning) = jsdoc.meaning {
                     ctx.print(" @meaning ");
-                    ctx.print(meaning.as_str());
+                    ctx.print(&meaning.as_str().replace('@', "\\@"));
                 }
                 if jsdoc.suppress_msg_descriptions {
                     ctx.print(" @suppress {msgDescriptions}");

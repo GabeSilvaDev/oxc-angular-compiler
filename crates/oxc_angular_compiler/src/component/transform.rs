@@ -5822,6 +5822,11 @@ fn compile_component_full<'a>(
 
     let compiled = compile_template(&mut job);
 
+    if !job.emit_errors.is_empty() {
+        diagnostics.append(&mut job.emit_errors);
+        return Err(diagnostics);
+    }
+
     // Stage 6: Compile host bindings (if any)
     // Pass the template pool's current index to ensure host binding constants
     // continue from where template compilation left off (avoiding duplicate names)
@@ -6203,6 +6208,11 @@ pub fn compile_component_template<'a>(
     // Collect any diagnostics from the compilation job
     diagnostics.extend(job.diagnostics.into_iter());
 
+    if !job.emit_errors.is_empty() {
+        diagnostics.append(&mut job.emit_errors);
+        return Err(diagnostics);
+    }
+
     Ok((compiled.template_fn, diagnostics))
 }
 
@@ -6337,6 +6347,11 @@ pub fn compile_template_to_js_with_options<'a>(
 
     // Collect any diagnostics from the compilation job
     diagnostics.extend(job.diagnostics.into_iter());
+
+    if !job.emit_errors.is_empty() {
+        diagnostics.append(&mut job.emit_errors);
+        return Err(diagnostics);
+    }
 
     let emitter = JsEmitter::new();
 
@@ -6527,6 +6542,11 @@ pub fn compile_template_for_hmr<'a>(
 
     // Collect any diagnostics from the compilation job
     diagnostics.extend(job.diagnostics.into_iter());
+
+    if !job.emit_errors.is_empty() {
+        diagnostics.append(&mut job.emit_errors);
+        return Err(diagnostics);
+    }
 
     // A pipeline error means the emitted code is already wrong — an update
     // module must not be generated from it, and `decls`/`vars` may not be
@@ -7277,6 +7297,11 @@ pub fn compile_template_for_linker<'a>(
 
     // Collect diagnostics
     diagnostics.extend(job.diagnostics.into_iter());
+
+    if !job.emit_errors.is_empty() {
+        diagnostics.append(&mut job.emit_errors);
+        return Err(diagnostics);
+    }
 
     // Extract numeric metadata from the compilation job
     let decls = job.root.decl_count.unwrap_or(0);

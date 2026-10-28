@@ -5,7 +5,8 @@
 
 use oxc_allocator::Allocator;
 use oxc_angular_compiler::{
-    AngularVersion, R3Node, ResolvedResources, TransformOptions as ComponentTransformOptions,
+    AngularVersion, CompilationMode, R3Node, ResolvedResources,
+    TransformOptions as ComponentTransformOptions,
     output::ast::FunctionExpr,
     output::emitter::JsEmitter,
     parser::html::HtmlParser,
@@ -5900,6 +5901,73 @@ fn test_i18n_legacy_message_ids_untrimmed_attribute_and_nested_icu() {
         ":\u{241F}fdcdea1a7f33029e14caa37c9d251f13df6a7a2a\u{241F}4036101079907737726:A ",
     );
     assert_contains(&js, ":ICU@@5870918674674044418:");
+}
+
+/// A meaning or description goes in a JSDoc comment, so `*/` in it would end the comment and
+/// leave the rest as code. Angular's `tagToString` throws `JSDoc text cannot contain "/*" and
+/// "*/"`, and the template is reported with that error instead of compiled.
+#[test]
+fn test_i18n_meta_that_would_close_its_jsdoc_comment_is_an_error() {
+    for template in [
+        r#"<p i18n="m|d */ steal() /*">Hello</p>"#,
+        r#"<img i18n-alt="*/ } steal(); { /*|d" alt="Logo" />"#,
+        r#"<p i18n="m /* x|d">Hello</p>"#,
+    ] {
+        let allocator = Allocator::default();
+        let source = format!(
+            "import {{ Component }} from '@angular/core';\n\
+             @Component({{ selector: 'app-repro', template: `{template}` }})\n\
+             export class Repro {{}}\n"
+        );
+        let result = transform_angular_file(&allocator, "repro.ts", &source, None, None);
+        let messages: Vec<String> = result.diagnostics.iter().map(|d| d.to_string()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains(r#"JSDoc text cannot contain "/*" and "*/""#)),
+            "{template}: {messages:?}"
+        );
+        assert!(!result.code.contains("/**"), "{}", result.code);
+    }
+}
+
+/// Angular throws only when it prints the JSDoc, so `*/` is fine where no message is emitted,
+/// and in partial compilation, which emits the template source. Angular 22.2 `ngc` compiles
+/// each of these.
+#[test]
+fn test_i18n_meta_that_would_close_its_jsdoc_comment_is_fine_with_no_message() {
+    let full = ComponentTransformOptions::default();
+    let partial = ComponentTransformOptions {
+        compilation_mode: CompilationMode::Partial,
+        ..ComponentTransformOptions::default()
+    };
+    for (template, options) in [
+        (r#"<p i18n="*/x"></p>"#, &full),
+        (r#"<p i18n="*/x">   </p>"#, &full),
+        (r#"<p i18n="*/x"><!-- c --></p>"#, &full),
+        (r#"<ng-container i18n="*/x"></ng-container>"#, &full),
+        (r#"<ng-content i18n="*/x"></ng-content>"#, &full),
+        (r#"<p title="a" i18n-title="*/x" i18n-title="ok">x</p>"#, &full),
+        (r#"<img i18n-alt="*/x" />"#, &full),
+        (r#"<img i18n-alt="*/x" [alt]="alt" />"#, &full),
+        (r#"<p i18n="m|d */ steal() /*">Hello</p>"#, &partial),
+    ] {
+        let allocator = Allocator::default();
+        let source = format!(
+            "import {{ Component }} from '@angular/core';\n\
+             @Component({{ selector: 'app-repro', template: `{template}` }})\n\
+             export class Repro {{ alt = ''; }}\n"
+        );
+        let result = transform_angular_file(&allocator, "repro.ts", &source, Some(options), None);
+        assert!(!result.has_errors(), "{template}: {:?}", result.diagnostics);
+        assert!(result.code.contains("Repro"), "{}", result.code);
+    }
+}
+
+/// `@` in a meaning or description is escaped, as Angular's `tagToString` does, so it does not
+/// start a JSDoc tag.
+#[test]
+fn test_i18n_meta_at_sign_is_escaped_in_jsdoc() {
+    let js = compile_i18n_component(r#"<p i18n="m@x|mail a@b.c">Hello</p>"#);
+    assert_contains(&js, r"/** @desc mail a\@b.c @meaning m\@x */");
 }
 
 /// `consts` with i18n initializers is an arrow function with a block body, and a message is

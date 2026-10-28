@@ -8,6 +8,7 @@
 use std::ptr::NonNull;
 
 use oxc_allocator::Vec as ArenaVec;
+use oxc_diagnostics::OxcDiagnostic;
 use oxc_str::Ident;
 use rustc_hash::FxHashMap;
 
@@ -202,6 +203,7 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
             &file_based_i18n_suffix,
             job.i18n_use_external_ids,
             &mut i18n_var_counter,
+            &mut job.emit_errors,
         );
 
         if let Some(block_xref) = msg_info.i18n_block {
@@ -475,6 +477,7 @@ fn collect_message<'a>(
     file_suffix: &str,
     use_external_ids: bool,
     counter: &mut usize,
+    errors: &mut std::vec::Vec<OxcDiagnostic>,
 ) -> (String, ArenaVec<'a, OutputStatement<'a>>) {
     let mut all_statements = ArenaVec::new_in(&allocator);
 
@@ -494,6 +497,7 @@ fn collect_message<'a>(
                 file_suffix,
                 use_external_ids,
                 counter,
+                errors,
             );
             all_statements.extend(sub_statements);
 
@@ -541,6 +545,16 @@ fn collect_message<'a>(
         use_external_ids,
     );
     *counter += 1;
+
+    // The meaning and description go into a JSDoc comment, so, as Angular's `tagToString` throws,
+    // neither may end that comment or start another.
+    if [&msg_info.description, &msg_info.meaning]
+        .into_iter()
+        .flatten()
+        .any(|text| text.contains("/*") || text.contains("*/"))
+    {
+        errors.push(OxcDiagnostic::error(r#"JSDoc text cannot contain "/*" and "*/""#));
+    }
 
     // Create metadata for JSDoc
     let meta = if msg_info.description.is_some() || msg_info.meaning.is_some() {

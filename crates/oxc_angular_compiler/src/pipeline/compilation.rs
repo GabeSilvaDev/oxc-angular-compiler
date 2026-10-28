@@ -235,6 +235,11 @@ pub struct ComponentCompilationJob<'a> {
     pub has_hoisted_arrow_functions: bool,
     /// Diagnostics collected during compilation.
     pub diagnostics: std::vec::Vec<OxcDiagnostic>,
+    /// Errors that make the generated code unsafe to emit.
+    ///
+    /// Unlike `diagnostics`, which full compilation drops, every entry point returns these as an
+    /// error.
+    pub emit_errors: std::vec::Vec<OxcDiagnostic>,
 }
 
 impl<'a> ComponentCompilationJob<'a> {
@@ -287,6 +292,7 @@ impl<'a> ComponentCompilationJob<'a> {
             core_namespace: Ident::from(crate::r3::CORE_ALIAS),
             has_hoisted_arrow_functions: false,
             diagnostics: std::vec::Vec::new(),
+            emit_errors: std::vec::Vec::new(),
         }
     }
 
