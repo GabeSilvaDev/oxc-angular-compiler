@@ -34,6 +34,9 @@ impl SelectorFlags {
     }
 }
 
+/// A `start..end` range of char indices into a selector.
+type CharRange = (usize, usize);
+
 /// A parsed CSS selector.
 #[derive(Debug, Default)]
 pub struct CssSelector {
@@ -150,6 +153,10 @@ impl CssSelector {
 
         let chars: Vec<char> = selector.chars().collect();
         let len = chars.len();
+        // `i` counts chars; slices of `selector` take the byte offset of each.
+        let offsets: Vec<usize> =
+            selector.char_indices().map(|(at, _)| at).chain([selector.len()]).collect();
+        let text = |start: usize, end: usize| &selector[offsets[start]..offsets[end]];
         let mut i = 0;
 
         while i < len {
@@ -177,7 +184,7 @@ impl CssSelector {
             }
 
             // Handle :not(
-            if c == ':' && i + 4 < len && &selector[i..i + 5] == ":not(" {
+            if c == ':' && i + 4 < len && text(i, i + 5) == ":not(" {
                 // Nesting :not in a selector is not allowed - return what we have
                 if in_not {
                     Self::finalize_selector(&mut results, &mut current, false, CssSelector::new());
@@ -211,7 +218,7 @@ impl CssSelector {
                     i += 1;
                 }
                 if i > start {
-                    target.add_class_name(&selector[start..i]);
+                    target.add_class_name(text(start, i));
                 }
                 continue;
             }
@@ -224,69 +231,30 @@ impl CssSelector {
                     i += 1;
                 }
                 if i > start {
-                    target.add_attribute("id", Some(&selector[start..i]));
+                    target.add_attribute("id", Some(text(start, i)));
                 }
                 continue;
             }
 
-            // Handle attribute selector
-            if c == '[' {
-                i += 1;
-                let attr_start = i;
-                // Find attribute name (may contain escape sequences like \$)
-                while i < len && chars[i] != '=' && chars[i] != ']' {
-                    i += 1;
-                }
-                let raw_attr_name = selector[attr_start..i].trim();
+            // Handle attribute selector. When it does not match, Angular's regexp goes on from
+            // the char after the `[`, as an unknown char.
+            if c == '['
+                && let Some((name, value, end)) = Self::attribute_at(&chars, i + 1)
+            {
                 // Unescape attribute name (like Angular's unescapeAttribute)
-                let attr_name = Self::unescape_attribute(raw_attr_name);
-
-                if i < len && chars[i] == '=' {
-                    i += 1;
-                    // Skip optional quote
-                    let quote = if i < len && (chars[i] == '"' || chars[i] == '\'') {
-                        let q = chars[i];
-                        i += 1;
-                        Some(q)
-                    } else {
-                        None
-                    };
-
-                    let value_start = i;
-                    if let Some(q) = quote {
-                        while i < len && chars[i] != q {
-                            i += 1;
-                        }
-                        let attr_value = &selector[value_start..i];
-                        target.add_attribute(&attr_name, Some(attr_value));
-                        if i < len {
-                            i += 1; // Skip closing quote
-                        }
-                    } else {
-                        while i < len && chars[i] != ']' {
-                            i += 1;
-                        }
-                        let attr_value = selector[value_start..i].trim();
-                        target.add_attribute(&attr_name, Some(attr_value));
-                    }
-                } else {
-                    target.add_attribute(&attr_name, None);
-                }
-
-                // Skip closing bracket
-                if i < len && chars[i] == ']' {
-                    i += 1;
-                }
+                let attr_name = Self::unescape_attribute(text(name.0, name.1));
+                target.add_attribute(&attr_name, value.map(|(start, end)| text(start, end)));
+                i = end;
                 continue;
             }
 
             // Handle element name (identifier at current position)
-            if Self::is_ident_start(c) {
+            if Self::is_ident_char(c) {
                 let start = i;
                 while i < len && Self::is_ident_char(chars[i]) {
                     i += 1;
                 }
-                target.set_element(&selector[start..i]);
+                target.set_element(text(start, i));
                 continue;
             }
 
@@ -340,12 +308,49 @@ impl CssSelector {
         result
     }
 
-    fn is_ident_start(c: char) -> bool {
-        c.is_ascii_alphabetic() || c == '_' || c == '-' || c > '\x7f'
+    /// `[-\w]`, the chars of a name in Angular's selector regexp. `\w` has no `u` flag there, so
+    /// it is ASCII only: `.ação` is the class `a` and then the element `o`.
+    fn is_ident_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-'
     }
 
-    fn is_ident_char(c: char) -> bool {
-        c.is_ascii_alphanumeric() || c == '_' || c == '-' || c > '\x7f'
+    /// Angular's attribute production, `\[([-.\w*\\$]+)(?:=(["']?)([^\]"']*)\5)?\]`, from just
+    /// after the `[`: the char ranges of the name and of the value, and the index after the `]`.
+    fn attribute_at(chars: &[char], start: usize) -> Option<(CharRange, Option<CharRange>, usize)> {
+        let mut i = start;
+        while chars
+            .get(i)
+            .is_some_and(|&c| Self::is_ident_char(c) || matches!(c, '.' | '*' | '\\' | '$'))
+        {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let name = (start, i);
+        match chars.get(i)? {
+            ']' => Some((name, None, i + 1)),
+            '=' => {
+                i += 1;
+                let quote = chars.get(i).copied().filter(|c| matches!(c, '"' | '\''));
+                if quote.is_some() {
+                    i += 1;
+                }
+                let value_start = i;
+                while chars.get(i).is_some_and(|c| !matches!(c, ']' | '"' | '\'')) {
+                    i += 1;
+                }
+                let value = (value_start, i);
+                if let Some(quote) = quote {
+                    if chars.get(i) != Some(&quote) {
+                        return None;
+                    }
+                    i += 1;
+                }
+                (chars.get(i) == Some(&']')).then_some((name, Some(value), i + 1))
+            }
+            _ => None,
+        }
     }
 
     fn finalize_selector(
@@ -542,6 +547,34 @@ mod tests {
         let selectors = CssSelector::parse("[name=value]");
         assert_eq!(selectors.len(), 1);
         assert_eq!(selectors[0].attrs, vec!["name", "value"]);
+    }
+
+    /// As Angular's selector regexp reads them: values keep any char, names only `[-\w]` (ASCII).
+    #[test]
+    fn test_parse_non_ascii() {
+        let selectors = CssSelector::parse("[slot=título]");
+        assert_eq!(selectors[0].attrs, vec!["slot", "título"]);
+        let selectors = CssSelector::parse("[lang='ção'].ação#é");
+        assert_eq!(selectors[0].attrs, vec!["lang", "ção"]);
+        assert_eq!(selectors[0].class_names, vec!["a"]);
+        assert_eq!(selectors[0].element, Some("o".to_string()));
+        let selectors = CssSelector::parse("x-é:not([é=ü])");
+        assert_eq!(selectors[0].element, Some("x-".to_string()));
+        let not = &selectors[0].not_selectors[0];
+        assert!(not.element.is_none() && not.attrs.is_empty() && not.class_names.is_empty());
+    }
+
+    /// An attribute that does not match Angular's production is read on from the char after `[`.
+    #[test]
+    fn test_parse_attribute_like_angular() {
+        let selectors = CssSelector::parse("[slot= olá ]");
+        assert_eq!(selectors[0].attrs, vec!["slot", " olá "]);
+        let selectors = CssSelector::parse("[ a ]");
+        assert_eq!(selectors[0].element, Some("a".to_string()));
+        assert!(selectors[0].attrs.is_empty());
+        let selectors = CssSelector::parse("[a=\"b]");
+        assert_eq!(selectors[0].element, Some("b".to_string()));
+        assert!(selectors[0].attrs.is_empty());
     }
 
     #[test]
