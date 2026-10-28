@@ -5,7 +5,8 @@
 
 use oxc_allocator::Allocator;
 use oxc_angular_compiler::{
-    AngularVersion, R3Node, ResolvedResources, TransformOptions as ComponentTransformOptions,
+    AngularVersion, CompilationMode, R3Node, ResolvedResources,
+    TransformOptions as ComponentTransformOptions,
     output::ast::FunctionExpr,
     output::emitter::JsEmitter,
     parser::html::HtmlParser,
@@ -5925,6 +5926,39 @@ fn test_i18n_meta_that_would_close_its_jsdoc_comment_is_an_error() {
             "{template}: {messages:?}"
         );
         assert!(!result.code.contains("/**"), "{}", result.code);
+    }
+}
+
+/// Angular throws only when it prints the JSDoc, so `*/` is fine where no message is emitted,
+/// and in partial compilation, which emits the template source. Angular 22.2 `ngc` compiles
+/// each of these.
+#[test]
+fn test_i18n_meta_that_would_close_its_jsdoc_comment_is_fine_with_no_message() {
+    let full = ComponentTransformOptions::default();
+    let partial = ComponentTransformOptions {
+        compilation_mode: CompilationMode::Partial,
+        ..ComponentTransformOptions::default()
+    };
+    for (template, options) in [
+        (r#"<p i18n="*/x"></p>"#, &full),
+        (r#"<p i18n="*/x">   </p>"#, &full),
+        (r#"<p i18n="*/x"><!-- c --></p>"#, &full),
+        (r#"<ng-container i18n="*/x"></ng-container>"#, &full),
+        (r#"<ng-content i18n="*/x"></ng-content>"#, &full),
+        (r#"<p title="a" i18n-title="*/x" i18n-title="ok">x</p>"#, &full),
+        (r#"<img i18n-alt="*/x" />"#, &full),
+        (r#"<img i18n-alt="*/x" [alt]="alt" />"#, &full),
+        (r#"<p i18n="m|d */ steal() /*">Hello</p>"#, &partial),
+    ] {
+        let allocator = Allocator::default();
+        let source = format!(
+            "import {{ Component }} from '@angular/core';\n\
+             @Component({{ selector: 'app-repro', template: `{template}` }})\n\
+             export class Repro {{ alt = ''; }}\n"
+        );
+        let result = transform_angular_file(&allocator, "repro.ts", &source, Some(options), None);
+        assert!(!result.has_errors(), "{template}: {:?}", result.diagnostics);
+        assert!(result.code.contains("Repro"), "{}", result.code);
     }
 }
 
