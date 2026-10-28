@@ -643,14 +643,14 @@ fn test_link_escapes_metadata_strings() {
 export class P {}
 P.ɵpipe = i0.ɵɵngDeclarePipe({ minVersion: "14.0.0", version: "21.0.0", ngImport: i0, type: P, isStandalone: true, name: 'a"+x+"' });
 export class D {}
-D.ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "21.0.0", ngImport: i0, type: D, isStandalone: true, selector: "[t='a\"b']", inputs: { 'a.b"c': "c" }, host: { classAttribute: 'k"+x+"' }, controlCreate: { passThroughInput: 'f"+x+"' } });
+D.ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "21.0.0", ngImport: i0, type: D, isStandalone: true, selector: "[t='a\\b']", inputs: { 'a.b"c': "c" }, host: { classAttribute: 'k"+x+"' }, controlCreate: { passThroughInput: 'f"+x+"' } });
 "#;
     let allocator = Allocator::default();
     let result = link(&allocator, code, "test.mjs");
     assert!(result.linked);
     for expected in [
         r#"name: "a\"+x+\"""#,
-        r#"selectors: [["", "t", "a\"b"]]"#,
+        r#"selectors: [["", "t", "a\\b"]]"#,
         r#"inputs: { "a.b\"c": "c" }"#,
         r#"hostAttrs: [1, "k\"+x+\""]"#,
         r#"ɵɵControlFeature("f\"+x+\"")"#,
