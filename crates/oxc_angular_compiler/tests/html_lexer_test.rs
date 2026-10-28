@@ -1901,6 +1901,30 @@ mod edge_cases {
     use super::*;
 
     #[test]
+    fn should_end_the_input_at_a_nul_character() {
+        // Angular's cursor reads NUL as `$EOF`, so nothing after it is read.
+        assert_eq!(
+            tokenize_and_humanize_parts("<b>a</b>\0<i>{{ b }}</i>"),
+            vec![
+                (HtmlTokenType::TagOpenStart, vec![String::new(), "b".to_string()]),
+                (HtmlTokenType::TagOpenEnd, vec![]),
+                (HtmlTokenType::Text, vec!["a".to_string()]),
+                (HtmlTokenType::TagClose, vec![String::new(), "b".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+        assert_eq!(
+            tokenize_and_humanize_parts("{{ a\0 }}"),
+            vec![
+                (HtmlTokenType::Text, vec![String::new()]),
+                (HtmlTokenType::Interpolation, vec!["{{".to_string(), " a".to_string()]),
+                (HtmlTokenType::Text, vec![String::new()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
     fn should_handle_empty_input() {
         let result = tokenize("");
 

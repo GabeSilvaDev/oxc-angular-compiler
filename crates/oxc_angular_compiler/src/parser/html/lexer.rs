@@ -706,6 +706,10 @@ impl<'a> HtmlLexer<'a> {
 
     /// Tokenizes the input.
     pub fn tokenize(mut self) -> HtmlTokenizeResult {
+        // Angular's cursor reads NUL as `$EOF` (0), so the input ends at the first one.
+        if let Some(nul) = self.input[self.index as usize..self.length as usize].find('\0') {
+            self.length = self.index + nul as u32;
+        }
         while self.index < self.length {
             self.scan_token();
         }

@@ -1177,6 +1177,16 @@ mod errors {
     use super::*;
 
     #[test]
+    fn should_skip_a_nul_character_like_whitespace() {
+        // Angular's `scanToken` skips every character up to the space.
+        let tokens = lex("a\0b");
+        assert_eq!(tokens.len(), 2);
+        expect_identifier_token(&tokens[0], 0, 1, "a");
+        expect_identifier_token(&tokens[1], 2, 3, "b");
+        assert!(lex("'a\0b'").iter().any(super::TokenInfo::is_error));
+    }
+
+    #[test]
     fn should_report_unterminated_string() {
         let tokens = lex(r#""hello"#);
         assert!(tokens.iter().any(super::TokenInfo::is_error));
