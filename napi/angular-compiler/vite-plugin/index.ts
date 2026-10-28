@@ -31,6 +31,7 @@ import {
   type AngularVersion,
 } from '#binding'
 
+import { asyncDownlevelPlugin } from './angular-async-downlevel-plugin.js'
 import { buildOptimizerPlugin } from './angular-build-optimizer-plugin.js'
 import { jitPlugin } from './angular-jit-plugin.js'
 import { angularLinkerPlugin } from './angular-linker-plugin.js'
@@ -59,7 +60,17 @@ export interface PluginOptions {
   /** Enable source map generation. */
   sourceMap?: boolean | { scripts?: boolean; vendor?: boolean }
 
-  /** Enable zoneless mode. */
+  /**
+   * Whether the app runs without zone.js.
+   *
+   * Unless it is zoneless, `async`/`await`, async generators and `for await` in
+   * application code are downleveled to generators, as the Angular CLI does, so
+   * zone.js can track them (`fakeAsync`/`tick()`, change detection after an
+   * `await`). Server (SSR) transforms keep them native.
+   *
+   * Default: zoneless unless `zone.js` is installed in a `node_modules` above the
+   * Vite root.
+   */
   zoneless?: boolean
 
   /**
@@ -141,6 +152,23 @@ export interface PluginOptions {
    * ```
    */
   compilationMode?: 'full' | 'partial'
+
+  /**
+   * Project-wide `preserveWhitespaces`, like `angularCompilerOptions.preserveWhitespaces`
+   * in the tsconfig: the default for components whose decorator does not set
+   * `preserveWhitespaces`. Default: `false`.
+   */
+  preserveWhitespaces?: boolean
+
+  /**
+   * Angular's `enableI18nLegacyMessageIdFormat` compiler option: `$localize`
+   * messages carry their legacy ids (`:@@custom␟<sha1>␟<decimal>:text`).
+   *
+   * Enable it when the translation files are keyed by legacy message ids
+   * (extracted with the legacy format). Default: `false`, as in the
+   * `tsconfig.json` that `ng new` generates.
+   */
+  enableI18nLegacyMessageIdFormat?: boolean
 }
 
 // Match all TypeScript files - we'll filter by @Component/@Directive decorator in the handler
@@ -288,11 +316,12 @@ export function angular(options: PluginOptions = {}): Plugin[] {
     // Like Angular CLI's `normalizeSourceMaps`, vendor maps are off unless the
     // object form turns them on; `sourceMap: true` only covers scripts.
     vendorSourceMap: typeof options.sourceMap === 'object' && (options.sourceMap.vendor ?? false),
-    zoneless: options.zoneless ?? false,
     fileReplacements,
     angularVersion: options.angularVersion,
     emitClassMetadata: options.emitClassMetadata ?? true,
     compilationMode: options.compilationMode ?? 'full',
+    preserveWhitespaces: options.preserveWhitespaces,
+    enableI18nLegacyMessageIdFormat: options.enableI18nLegacyMessageIdFormat ?? false,
     tsconfig: options.tsconfig,
   }
 
@@ -552,6 +581,8 @@ export function angular(options: PluginOptions = {}): Plugin[] {
       minifyComponentStyles: getMinifyComponentStyles(context),
       emitClassMetadata: pluginOptions.emitClassMetadata,
       compilationMode: pluginOptions.compilationMode,
+      preserveWhitespaces: pluginOptions.preserveWhitespaces,
+      enableI18nLegacyMessageIdFormat: pluginOptions.enableI18nLegacyMessageIdFormat,
       // Evaluate decorator metadata imported from other files the way
       // ngtsc's program-wide checker does (`inputs: INPUTS`, `@Input(OPTS)`,
       // `templateUrl: TEMPLATE_URL`). Read files land in
@@ -1674,6 +1705,10 @@ export function angular(options: PluginOptions = {}): Plugin[] {
     }),
     ssrManifestPlugin({
       ssrEntry: options.ssrEntry,
+    }),
+    asyncDownlevelPlugin({
+      zoneless: options.zoneless,
+      sourcemap: pluginOptions.sourceMap,
     }),
   ].filter(Boolean) as Plugin[]
 }

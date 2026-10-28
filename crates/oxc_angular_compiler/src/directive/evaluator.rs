@@ -938,6 +938,34 @@ impl<'a> FileScope<'a> {
         self.imports.get(name).copied()
     }
 
+    /// Whether `expr`, written at the top level, names an import itself: the
+    /// binding (`X`), a member of a namespace import (`ns.X`), or a variable
+    /// initialized with one (`const R = X`). ngtsc resolves those to a
+    /// `Reference`, not to the `DynamicValue` of a value computed from an import
+    /// (`X.y`, `f()`).
+    pub(crate) fn names_import(&self, expr: &Expression<'_>) -> bool {
+        let mut expr = expr.get_inner_expression();
+        // A chain of variables, each initialized with the next.
+        for _ in 0..64 {
+            match expr {
+                Expression::Identifier(id) => {
+                    if let Some(import) = self.import(&id.name) {
+                        // A namespace import itself is the module, not a reference.
+                        return import.imported.is_some();
+                    }
+                    let Some(init) = self.initializer(&id.name) else { return false };
+                    expr = init.get_inner_expression();
+                }
+                Expression::StaticMemberExpression(m) => {
+                    return matches!(m.object.get_inner_expression(), Expression::Identifier(ns)
+                        if self.import(&ns.name).is_some_and(|import| import.imported.is_none()));
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// The expression the top-level variable `name` is initialized with: its
     /// initializer or, destructured from an object or array literal, the part
     /// it binds (`transform` in `const { transform } = { transform: f }` is `f`).

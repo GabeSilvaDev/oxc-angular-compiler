@@ -30,7 +30,7 @@ export interface BrowserTransformOptions {
   /** Generate a source map (default: false) */
   sourcemap?: boolean
   /** `async`/`await`, async generators and `for await` as generators, for zone.js (default: true) */
-  lowerAsync?: boolean
+  downlevelAsync?: boolean
 }
 
 /** Result of `transformForBrowser`. */
@@ -1046,8 +1046,8 @@ export declare function transformForBrowser(
 
 /**
  * TypeScript stripped as `tsc` does it with Angular's settings (`experimentalDecorators`,
- * `useDefineForClassFields: false`, target ES2022) and `async` lowered to generators, which zone.js needs;
- * JavaScript gets only the lowering. Runtime helpers are imported from `@oxc-project/runtime`.
+ * `useDefineForClassFields: false`, target ES2022) and `async` downleveled to generators, which zone.js needs;
+ * JavaScript gets only the downleveling. Runtime helpers are imported from `@oxc-project/runtime`.
  */
 export declare function transformForBrowserSync(
   code: string,
@@ -1095,6 +1095,15 @@ export interface TransformOptions {
    * >= v22, legacy when the version is unknown).
    */
   legacyOptionalChaining?: boolean
+  /**
+   * The `enableI18nLegacyMessageIdFormat` Angular compiler option
+   * (`angularCompilerOptions.enableI18nLegacyMessageIdFormat` in `tsconfig.json`).
+   *
+   * When `true`, `$localize` messages carry their legacy ids
+   * (`:@@custom␟<sha1>␟<decimal>:text`), for translation files keyed by legacy ids.
+   * Defaults to `false`, as in the `tsconfig.json` that `ng new` generates.
+   */
+  enableI18nLegacyMessageIdFormat?: boolean
   /** The CSS selector that identifies this component in a template. */
   selector?: string
   /**
@@ -1113,7 +1122,8 @@ export interface TransformOptions {
    */
   changeDetection?: string
   /**
-   * Whether to preserve whitespace in templates.
+   * Project-wide `preserveWhitespaces` (`angularCompilerOptions`): the
+   * default for components whose decorator does not set it.
    * Defaults to false if not specified.
    */
   preserveWhitespaces?: boolean

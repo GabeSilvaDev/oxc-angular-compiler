@@ -29,7 +29,7 @@ pub use compiler::{
 pub(crate) use decorator::evaluate_host_directives;
 pub(crate) use decorator::find_directive_decorator;
 pub(crate) use decorator::{
-    HostKey, angular_decorator_config, evaluate_host_metadata, evaluate_string_value,
+    HostKey, HostValue, angular_decorator_config, evaluate_host_metadata, evaluate_string_value,
     evaluate_style_urls, evaluate_styles, extract_string_value, styles_error,
 };
 pub(crate) use decorator::{
@@ -52,10 +52,10 @@ pub use metadata::{
     R3HostMetadata, R3InputMetadata, R3QueryMetadata,
 };
 pub(crate) use property_decorators::{
-    angular_class_decorator, angular_member_decorator, angular_param_decorator,
-    decorator_written_name, is_angular_core_decorator, parse_decorator_queries,
-    try_parse_signal_input, try_parse_signal_model, try_parse_signal_output,
-    unwrap_initializer_api_expr,
+    angular_class_decorator, angular_core_identifier, angular_member_decorator,
+    angular_param_decorator, decorator_written_name, is_angular_core_decorator,
+    parse_decorator_queries, try_parse_signal_input, try_parse_signal_model,
+    try_parse_signal_output, try_unwrap_forward_ref, unwrap_initializer_api_expr,
 };
 pub use property_decorators::{
     extract_class_queries, extract_content_queries, extract_host_bindings, extract_host_listeners,

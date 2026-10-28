@@ -399,8 +399,9 @@ export class A { go() {} }
         }
     }
 
-    // An export that can't be read statically reports the entry, upstream
-    // would emit its expression for a plain attribute (a declared divergence).
+    // An export that can't be read statically reports the entry: upstream
+    // emits its expression for a plain attribute, which is written in the
+    // other file and can't be emitted in this one (a declared divergence).
     create_test_file(
         dir.path(),
         "app/bad.ts",
@@ -443,4 +444,26 @@ export class X {}
         "{}",
         define_call(&result.code, "X")
     );
+}
+
+/// A host attribute computed from an import ngtsc can't evaluate either is
+/// emitted as written (ngtsc_spec.ts: "should accept dynamic host attribute
+/// bindings").
+#[test]
+fn dynamic_host_attribute_from_an_unreadable_import() {
+    let dir = TempDir::new().unwrap();
+    create_test_file(dir.path(), "app/other.d.ts", "export declare const foo: any;");
+    let result = transform(
+        &dir,
+        r#"import { Component } from '@angular/core';
+import { foo } from './other';
+const test = foo.bar();
+@Component({ selector: 'test', template: '', host: { 'test': test } })
+export class TestCmp {}
+"#,
+        &resolve_options(),
+    );
+    assert!(!result.has_errors(), "{}", error_messages(&result));
+    let definition = define_call(&result.code, "TestCmp");
+    assert!(definition.contains(r#"hostAttrs:["test",test]"#), "{definition}");
 }

@@ -18,8 +18,9 @@ use super::metadata::{
 };
 use super::transform::ImportMap;
 use crate::directive::{
-    HostKey, MemberHostBindings, StringConsts, evaluate_host_directives, extract_input_metadata_in,
-    extract_output_metadata_in, merge_by_class_property, merge_host_bindings, parse_decorator_io,
+    HostKey, HostValue, MemberHostBindings, StringConsts, evaluate_host_directives,
+    extract_input_metadata_in, extract_output_metadata_in, merge_by_class_property,
+    merge_host_bindings, parse_decorator_io, try_unwrap_forward_ref,
 };
 use crate::output::oxc_converter::convert_oxc_expression;
 use crate::util::is_metadata_property;
@@ -170,7 +171,8 @@ pub fn extract_component_metadata<'a>(
                     // an invalid one must not be applied here where it would
                     // be dropped silently.
                     if !prop.computed {
-                        metadata.host = extract_host_metadata(allocator, &prop.value, consts);
+                        metadata.host =
+                            extract_host_metadata(allocator, &prop.value, source_text, consts);
                     }
                 }
                 "imports" => {
@@ -178,6 +180,8 @@ pub fn extract_component_metadata<'a>(
                     // For standalone components, we need:
                     // 1. The identifier list for local analysis
                     metadata.imports = extract_identifier_array(allocator, &prop.value);
+                    metadata.import_entry_classes =
+                        extract_import_entry_classes(allocator, &prop.value, consts);
                     // 2. The raw expression to pass to ɵɵgetComponentDepsFactory in RuntimeResolved mode
                     metadata.raw_imports =
                         convert_oxc_expression(allocator, &prop.value, source_text);
@@ -207,7 +211,7 @@ pub fn extract_component_metadata<'a>(
                 }
                 "preserveWhitespaces" => {
                     metadata.preserve_whitespaces =
-                        extract_boolean_value(&prop.value).unwrap_or(false);
+                        Some(extract_boolean_value(&prop.value).unwrap_or(false));
                 }
                 "animations" => {
                     // Extract animations expression as full OutputExpression
@@ -487,6 +491,28 @@ fn extract_identifier_array<'a>(
     result
 }
 
+/// The class each element of an array literal names, by position: `X`, or
+/// `forwardRef(() => X)` with `@angular/core`'s `forwardRef`.
+fn extract_import_entry_classes<'a>(
+    allocator: &'a Allocator,
+    expr: &'a Expression<'a>,
+    consts: &StringConsts<'_>,
+) -> Vec<'a, Option<Ident<'a>>> {
+    let mut result = Vec::new_in(&allocator);
+    if let Expression::ArrayExpression(arr) = expr {
+        for element in &arr.elements {
+            let class = element.as_expression().and_then(|element| {
+                match try_unwrap_forward_ref(element, Some(consts)).unwrap_or(element) {
+                    Expression::Identifier(id) => Some(id.name),
+                    _ => None,
+                }
+            });
+            result.push(class);
+        }
+    }
+    result
+}
+
 /// Extract ViewEncapsulation from an expression.
 fn extract_encapsulation(expr: &Expression<'_>) -> ViewEncapsulation {
     // Look for patterns like:
@@ -544,6 +570,7 @@ fn extract_change_detection(expr: &Expression<'_>) -> ChangeDetectionStrategy {
 fn extract_host_metadata<'a>(
     allocator: &'a Allocator,
     expr: &'a Expression<'a>,
+    source_text: Option<&'a str>,
     consts: &StringConsts<'a>,
 ) -> Option<HostMetadata<'a>> {
     // An unusable host is reported by `decorator_io_errors`.
@@ -552,12 +579,19 @@ fn extract_host_metadata<'a>(
 
     let mut host = HostMetadata::new(allocator);
     for (key, value) in entries {
-        match HostKey::of(key.as_str()) {
+        let kind = HostKey::of(key.as_str());
+        if matches!(kind, HostKey::Attribute) {
+            host.attributes.push((key, value.to_output(allocator, source_text)?));
+            continue;
+        }
+        // Only a plain attribute has an expression value.
+        let HostValue::String(value) = value else { continue };
+        match kind {
             HostKey::Property => host.properties.push((key, value)),
             HostKey::Listener => host.listeners.push((key, value)),
             HostKey::Class => host.class_attr = Some(value),
             HostKey::Style => host.style_attr = Some(value),
-            HostKey::Attribute => host.attributes.push((key, value)),
+            HostKey::Attribute => {}
         }
     }
     Some(host)
@@ -1659,7 +1693,7 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert!(meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, Some(true));
         });
     }
 
@@ -1675,12 +1709,12 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert!(!meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, Some(false));
         });
     }
 
     #[test]
-    fn test_preserve_whitespaces_defaults_to_false() {
+    fn test_preserve_whitespaces_unset() {
         let code = r#"
             import {Component} from '@angular/core';
             @Component({
@@ -1690,7 +1724,7 @@ mod tests {
             class TestComponent {}
         "#;
         assert_metadata(code, |meta| {
-            assert!(!meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, None);
         });
     }
 
@@ -1823,7 +1857,7 @@ mod tests {
             assert_eq!(meta.imports.len(), 1);
             assert_eq!(meta.export_as.len(), 1);
             assert_eq!(meta.export_as[0].as_str(), "complete");
-            assert!(meta.preserve_whitespaces);
+            assert_eq!(meta.preserve_whitespaces, Some(true));
             assert_eq!(meta.schemas.len(), 1);
         });
     }

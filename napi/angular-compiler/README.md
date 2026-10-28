@@ -169,6 +169,7 @@ interface TransformOptions {
 
   // i18n (note the capital N, as the N-API bindings generate it)
   i18NUseExternalIds?: boolean
+  enableI18nLegacyMessageIdFormat?: boolean
 
   // Final component style output
   minifyComponentStyles?: boolean
@@ -178,6 +179,7 @@ interface TransformOptions {
   standalone?: boolean
   encapsulation?: 'Emulated' | 'None' | 'ShadowDom'
   changeDetection?: 'Default' | 'OnPush'
+  // Default for components that do not set their own (project-wide option)
   preserveWhitespaces?: boolean
 
   // Cross-file elision
@@ -202,6 +204,7 @@ interface PluginOptions {
   // Features
   jit?: boolean
   liveReload?: boolean
+  // Default: zoneless unless zone.js is installed (see below)
   zoneless?: boolean
   sourceMap?: boolean | { scripts?: boolean; vendor?: boolean }
 
@@ -220,6 +223,10 @@ interface PluginOptions {
 
   // Template hook, applied during both the initial build and HMR
   templateTransform?: (content: string, filePath: string) => string
+
+  // Project-wide default (`angularCompilerOptions.preserveWhitespaces`);
+  // a component's own `preserveWhitespaces` wins (default: false)
+  preserveWhitespaces?: boolean
 }
 ```
 
@@ -230,6 +237,22 @@ interface PluginOptions {
 - `"auto"` or `undefined`: follow the resolved Vite minification settings
 
 For `"auto"`, the plugin uses `build.cssMinify` when it is set, otherwise it falls back to `build.minify`. In dev, `"auto"` defaults to `false`.
+
+### zone.js and `async`/`await`
+
+zone.js cannot track native `await`. Unless the app is zoneless, the plugin
+downlevels `async` functions, async generators and `for await` in application code
+to generators, as the Angular CLI does for apps with `zone.js` in their
+polyfills, so `fakeAsync` with `tick()`/`flushMicrotasks()` drives code that
+awaits, and change detection runs after an `await`. The helpers are imported
+from `@oxc-project/runtime`, which Vite resolves. Server (SSR) transforms and
+`node_modules` are left as they are. Vitest's `node` environment transforms as
+SSR, so run zone.js specs in `jsdom`, `happy-dom` or the browser.
+
+Without `zoneless`, an app is taken to be zoneless when no `node_modules` above
+the Vite root contains `zone.js`. Set `zoneless: true` to keep `async` native in a
+zoneless app that still has zone.js installed, or `zoneless: false` to force the
+downleveling.
 
 ### Library builds (`.d.ts`)
 
@@ -306,9 +329,11 @@ The Vite plugin consists of these sub-plugins:
 - External message IDs
 - File-based naming
 
-Not supported: legacy message IDs (Angular's `enableI18nLegacyMessageIdFormat`) and
-`i18nNormalizeLineEndingsInICUs`. `$localize` messages carry no legacy IDs, so translations
-keyed only by legacy IDs are not applied; translations keyed by the current message IDs are.
+- Legacy message IDs: `enableI18nLegacyMessageIdFormat: true` (also a Vite plugin option) makes
+  `$localize` messages carry them, for translation files keyed by legacy IDs. Off by default, as
+  in the `tsconfig.json` that `ng new` generates.
+
+Not supported: `i18nNormalizeLineEndingsInICUs`.
 
 ## Platform Support
 

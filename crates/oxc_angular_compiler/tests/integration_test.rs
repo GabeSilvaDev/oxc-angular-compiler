@@ -5812,6 +5812,96 @@ fn test_i18n_meta_is_trimmed_once() {
     assert_contains(&js, r#"$localize `:m | d @@ custom:Custom`"#);
 }
 
+/// Compiles `template` with `enableI18nLegacyMessageIdFormat` set to `legacy_ids`.
+fn compile_with_legacy_ids(template: &str, legacy_ids: bool) -> String {
+    let allocator = Allocator::default();
+    let source = format!(
+        "import {{ Component }} from '@angular/core';\n\
+         @Component({{ selector: 'test', template: `{template}` }})\n\
+         export class FooCmp {{ age = 1; }}\n"
+    );
+    let options = ComponentTransformOptions {
+        enable_i18n_legacy_message_id_format: legacy_ids,
+        ..Default::default()
+    };
+    let result = transform_angular_file(&allocator, "test.ts", &source, Some(&options), None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    result.code
+}
+
+/// Ports of ngtsc_spec.ts "should render legacy ids when `enableI18nLegacyMessageIdFormat` is
+/// not false" and "should render custom id and legacy ids if `enableI18nLegacyMessageIdFormat`
+/// is not false": `$localize` metadata carries `computeDigest` and `computeDecimalDigest`.
+#[test]
+fn test_i18n_legacy_message_ids() {
+    let js = compile_with_legacy_ids("<div i18n>Some text</div>", true);
+    assert_contains(
+        &js,
+        "`:\u{241F}5dbba0a3da8dff890e20cf76eb075d58900fbcd3\u{241F}8321000940098097247:Some text`",
+    );
+    let js = compile_with_legacy_ids(r#"<div i18n="@@custom">Some text</div>"#, true);
+    assert_contains(
+        &js,
+        ":@@custom\u{241F}5dbba0a3da8dff890e20cf76eb075d58900fbcd3\u{241F}8321000940098097247:Some text",
+    );
+    // Port of "should not render legacy ids when `enableI18nLegacyMessageIdFormat` is set to
+    // false" (the option's default here).
+    let js = compile_with_legacy_ids("<div i18n>Some text</div>", false);
+    assert!(!js.contains(":Some text"), "No metadata block expected:\n{js}");
+}
+
+/// Port of ngtsc_spec.ts "should also render legacy ids for ICUs when normal messages are using
+/// legacy ids". An ICU case is a Container in the digest (`10 {[ten]}`), and a sub-message with
+/// legacy ids is not named on its parent's placeholder (`:ICU:`, not `:ICU@@<id>:`).
+#[test]
+fn test_i18n_legacy_message_ids_for_icus() {
+    let js = compile_with_legacy_ids(
+        r#"<div i18n="@@custom">Some text {age, plural, 10 {ten} other {other}}</div>"#,
+        true,
+    );
+    assert_contains(
+        &js,
+        ":\u{241F}720ba589d043a0497ac721ff972f41db0c919efb\u{241F}3221232817843005870:{VAR_PLURAL, plural, 10 {ten} other {other}}",
+    );
+    assert_contains(
+        &js,
+        ":@@custom\u{241F}dcb6170595f5d548a3d00937e87d11858f51ad04\u{241F}7419139165339437596:Some text ${i18n_0}:ICU:`",
+    );
+}
+
+/// Legacy ids are computed on the template before whitespace removal (Angular's first
+/// `I18nMetaVisitor` pass), and attribute messages get them too. An ICU inside a nested element
+/// keeps `@@<id>` on its placeholder: Angular's meta visitor has no `currentMessage` there.
+/// Expected output taken from Angular 22.2 `ngc` with `enableI18nLegacyMessageIdFormat: true`.
+#[test]
+fn test_i18n_legacy_message_ids_untrimmed_attribute_and_nested_icu() {
+    let js = compile_with_legacy_ids(
+        "<div i18n>\n  Hello {{ age }} <b>  bold  </b>\n</div><span i18n-title=\"m|d\" title=\"Hi\"></span>",
+        true,
+    );
+    assert_contains(
+        &js,
+        ":m|d\u{241F}3e8c275a028ed08a56597c20302086a73b3c2444\u{241F}734253441491849243:Hi`",
+    );
+    let js = compile_with_legacy_ids(
+        "<div i18n>\n  Hello {{ age }} <b>  bold  </b>\n  {age, plural, =1 {  one  } other {more}}\n</div>",
+        true,
+    );
+    assert_contains(
+        &js,
+        ":\u{241F}6f97a687705293112816b7887ddf53335836fca9\u{241F}424462909704063534: Hello ",
+    );
+    let js = compile_with_legacy_ids(
+        "<div i18n>A <b>{age, plural, 10 {ten} other {other}}</b></div>",
+        true,
+    );
+    assert_contains(
+        &js,
+        ":\u{241F}fdcdea1a7f33029e14caa37c9d251f13df6a7a2a\u{241F}4036101079907737726:A ",
+    );
+    assert_contains(&js, ":ICU@@5870918674674044418:");
+}
+
 /// `consts` with i18n initializers is an arrow function with a block body, and a message is
 /// a native `$localize` tagged template. Angular 22.2 `ngc` (ES2022):
 ///   consts: () => { let i18n_0; ... i18n_0 = $localize `:@@close:Close`; } return [...]; }

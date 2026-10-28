@@ -99,6 +99,7 @@ pub fn collect_i18n_consts(job: &mut ComponentCompilationJob<'_>) {
                                 .associated_message_id
                                 .as_ref()
                                 .map(ToString::to_string),
+                            legacy_ids: msg_op.legacy_ids.iter().map(ToString::to_string).collect(),
                             needs_postprocessing: msg_op.needs_postprocessing,
                             sub_messages: msg_op.sub_messages.iter().copied().collect(),
                         },
@@ -451,6 +452,7 @@ struct MessageInfo {
     message_id: Option<String>,
     message_string: Option<String>,
     associated_message_id: Option<String>,
+    legacy_ids: Vec<String>,
     needs_postprocessing: bool,
     sub_messages: Vec<XrefId>,
 }
@@ -568,6 +570,7 @@ fn collect_message<'a>(
         msg_info.description.clone(),
         msg_info.meaning.clone(),
         msg_info.custom_id.clone(),
+        &msg_info.legacy_ids,
         &associated_message_ids,
     );
 
@@ -699,6 +702,7 @@ fn create_localize_expression<'a>(
     description: Option<String>,
     meaning: Option<String>,
     custom_id: Option<String>,
+    legacy_ids: &[String],
     associated_message_ids: &FxHashMap<String, String>,
 ) -> OutputExpression<'a> {
     // Parse message_string to extract text parts and placeholder names in order
@@ -718,9 +722,9 @@ fn create_localize_expression<'a>(
         params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
     // First message part: includes metadata block + first text segment
-    // Format: ":meaning|description@@customId:text"
+    // Format: ":meaning|description@@customId␟legacyId:text"
     let first_text = text_parts.first().map(|s| s.as_str()).unwrap_or("");
-    push_part(serialize_i18n_head(first_text, &meaning, &description, &custom_id));
+    push_part(serialize_i18n_head(first_text, &meaning, &description, &custom_id, legacy_ids));
 
     // Subsequent parts: ":PLACEHOLDER_NAME:text"
     for (i, placeholder) in placeholder_order.iter().enumerate() {
@@ -739,7 +743,7 @@ fn create_localize_expression<'a>(
         // Text part after this placeholder
         let text_part = text_parts.get(i + 1).map(|s| s.as_str()).unwrap_or("");
         // Angular's serializeI18nTemplatePart names an ICU placeholder's sub-message when the
-        // sub-message has no legacy ids (always, in Oxc): `:ICU@@<id>:`.
+        // sub-message has no legacy ids: `:ICU@@<id>:`.
         let meta_block = match associated_message_ids.get(placeholder) {
             Some(id) => format!("{formatted_name}@@{id}"),
             None => formatted_name.clone(),
@@ -825,12 +829,13 @@ fn parse_message_string(message: &str) -> (Vec<String>, Vec<String>) {
 }
 
 /// Serialize the i18n head (first message part) with its metadata block
-/// (`meaning|description@@customId`), as Angular's `serializeI18nHead`.
+/// (`meaning|description@@customId␟legacyId…`), as Angular's `serializeI18nHead`.
 fn serialize_i18n_head(
     text: &str,
     meaning: &Option<String>,
     description: &Option<String>,
     custom_id: &Option<String>,
+    legacy_ids: &[String],
 ) -> (String, String) {
     let mut meta_block = description.clone().unwrap_or_default();
     if let Some(meaning) = meaning.as_deref().filter(|m| !m.is_empty()) {
@@ -838,6 +843,9 @@ fn serialize_i18n_head(
     }
     if let Some(id) = custom_id.as_deref().filter(|id| !id.is_empty()) {
         meta_block = format!("{meta_block}@@{id}");
+    }
+    for legacy_id in legacy_ids {
+        meta_block = format!("{meta_block}\u{241F}{legacy_id}");
     }
     create_cooked_raw_string(&meta_block, text)
 }

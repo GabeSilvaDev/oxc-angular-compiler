@@ -135,6 +135,10 @@ pub fn extract_i18n_messages(job: &mut ComponentCompilationJob<'_>) {
                                 message_string: metadata.and_then(|m| m.message_string.clone()),
                                 associated_message_id: metadata
                                     .and_then(|m| m.associated_message_id),
+                                legacy_ids: oxc_allocator::Vec::from_iter_in(
+                                    metadata.into_iter().flat_map(|m| m.legacy_ids.iter().copied()),
+                                    &allocator,
+                                ),
                                 needs_postprocessing,
                                 sub_messages: oxc_allocator::Vec::new_in(&allocator),
                             });

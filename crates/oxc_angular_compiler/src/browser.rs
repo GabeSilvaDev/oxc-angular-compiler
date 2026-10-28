@@ -1,6 +1,6 @@
-//! TypeScript stripped as `tsc` does it under Angular's settings, and `async` lowered for zone.js.
+//! TypeScript stripped as `tsc` does it under Angular's settings, and `async` downleveled for zone.js.
 //!
-//! This is what a bundler without per-feature lowering needs to build an Angular app that runs zone.js: zone.js
+//! This is what a bundler without per-feature downleveling needs to build an Angular app that runs zone.js: zone.js
 //! cannot see native `await`, so the Angular CLI turns `async` functions into generators (esbuild's `supported`
 //! option) and leaves everything else native.
 
@@ -30,7 +30,7 @@ pub struct BrowserTransformOptions {
     pub sourcemap: bool,
     /// `async` functions and generators, and `for await`, as generators (default: false; the napi binding
     /// defaults to true). Helpers are imported from `@oxc-project/runtime`.
-    pub lower_async: bool,
+    pub downlevel_async: bool,
 }
 
 /// Result of [`transform_for_browser`].
@@ -44,12 +44,12 @@ pub struct BrowserTransformResult {
     pub errors: Vec<OxcDiagnostic>,
 }
 
-/// Strips TypeScript and lowers `async`, as the Angular CLI does for an app that runs zone.js.
+/// Strips TypeScript and downlevels `async`, as the Angular CLI does for an app that runs zone.js.
 ///
 /// TypeScript files get `experimentalDecorators` and `useDefineForClassFields: false` semantics, as `tsc` emits them
 /// for target ES2022: fields are assigned in the constructor after parameter properties, statics in static blocks,
-/// and `#private` members stay native. JavaScript keeps its class fields. `using` declarations are lowered in
-/// TypeScript files (as `tsc` does) and wherever `async` is lowered (`await using` cannot live in a generator).
+/// and `#private` members stay native. JavaScript keeps its class fields. `using` declarations are downleveled in
+/// TypeScript files (as `tsc` does) and wherever `async` is downleveled (`await using` cannot live in a generator).
 pub fn transform_for_browser(
     allocator: &Allocator,
     code: &str,
@@ -81,11 +81,11 @@ pub fn transform_for_browser(
     }
 
     let mut env = EnvOptions::default();
-    if options.lower_async {
+    if options.downlevel_async {
         env.es2017 = ES2017Options { async_to_generator: true };
         env.es2018 = ES2018Options { async_generator_functions: true, ..env.es2018 };
     }
-    if options.lower_async || typescript {
+    if options.downlevel_async || typescript {
         env.es2026 = ES2026Options { explicit_resource_management: true };
     }
     // No class-properties plugin: with `set_public_class_fields`, the TypeScript transform alone moves fields with an
@@ -223,14 +223,14 @@ mod tests {
             &allocator,
             code,
             filename,
-            &BrowserTransformOptions { sourcemap: false, lower_async: true },
+            &BrowserTransformOptions { sourcemap: false, downlevel_async: true },
         );
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         r.code
     }
 
     #[test]
-    fn lowers_async_and_for_await() {
+    fn downlevels_async_and_for_await() {
         let out = run(
             "export async function f(xs) { for await (const x of xs) await x; }\nexport async function* g() { yield 1; }",
             "a.mjs",
@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_await_using_before_async() {
+    fn downlevels_await_using_before_async() {
         let out = run("export async function f(r) { await using x = r; return 1; }", "a.mjs");
         assert!(!out.contains("using x"), "{out}");
         assert!(!out.contains("async function"), "{out}");

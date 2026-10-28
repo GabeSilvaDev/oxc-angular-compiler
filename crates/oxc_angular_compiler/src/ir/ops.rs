@@ -1149,6 +1149,8 @@ pub struct I18nMessageOp<'a> {
     pub message_string: Option<Ident<'a>>,
     /// For an ICU sub-message, its `$localize` id, written on the parent's ICU placeholder.
     pub associated_message_id: Option<Ident<'a>>,
+    /// Legacy message ids, written in the `$localize` metadata block.
+    pub legacy_ids: Vec<'a, Ident<'a>>,
     /// Whether message needs postprocessing (has params with multiple values).
     pub needs_postprocessing: bool,
     /// Sub-messages.

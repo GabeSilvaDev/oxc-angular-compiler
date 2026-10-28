@@ -137,7 +137,10 @@ pub struct TransformOptions {
     /// Override the change detection strategy.
     pub change_detection: Option<super::metadata::ChangeDetectionStrategy>,
 
-    /// Override the preserve whitespaces setting.
+    /// Project-wide `preserveWhitespaces` (`angularCompilerOptions`): the
+    /// default for components whose decorator does not set it. The
+    /// template-only compiles (`compile_template_to_js_with_options`,
+    /// `compile_template_for_hmr`) use it as the template's value.
     pub preserve_whitespaces: Option<bool>,
 
     /// Host bindings metadata for the component.
@@ -226,6 +229,14 @@ pub struct TransformOptions {
     /// `Full` (default) targets applications; `Partial` targets library
     /// builds, where consumers run the linker to expand declarations.
     pub compilation_mode: crate::CompilationMode,
+
+    /// Angular's `enableI18nLegacyMessageIdFormat` compiler option: write each i18n
+    /// message's legacy ids in its `$localize` metadata
+    /// (`:@@custom␟<sha1>␟<decimal>:text`), for translation files keyed by legacy ids.
+    ///
+    /// Default: `false`, as in the `tsconfig.json` that `ng new` generates. ngtsc itself
+    /// defaults to `true` when the option is not set.
+    pub enable_i18n_legacy_message_id_format: bool,
 }
 
 /// Input for host metadata when passed via TransformOptions.
@@ -281,6 +292,7 @@ impl Default for TransformOptions {
             emit_class_metadata: true,
             minify_component_styles: false,
             compilation_mode: crate::CompilationMode::Full,
+            enable_i18n_legacy_message_id_format: false,
         }
     }
 }
@@ -5454,11 +5466,18 @@ fn compile_component_full<'a>(
 
     let mut diagnostics = Vec::new();
 
+    // The decorator's `preserveWhitespaces` wins over the project-wide option
+    // (`parseTemplateDeclaration` in ngtsc's component resources.ts). Written
+    // back so the partial declaration carries the resolved value too.
+    let preserve_whitespaces =
+        metadata.preserve_whitespaces.or(options.preserve_whitespaces).unwrap_or(false);
+    metadata.preserve_whitespaces = Some(preserve_whitespaces);
+
     // Stage 1: Parse HTML
     // Build parse options from component metadata
     // Angular always forces tokenizeExpansionForms: true in parseTemplate()
     let parse_options = ParseTemplateOptions {
-        preserve_whitespaces: metadata.preserve_whitespaces,
+        preserve_whitespaces,
         // Enable modern syntax features (block syntax, let declarations)
         enable_block_syntax: true,
         enable_let_syntax: true,
@@ -5480,12 +5499,13 @@ fn compile_component_full<'a>(
 
     // Stage 1.5: Remove whitespace if not preserving
     // This must happen before R3 transform, matching Angular's pipeline
+    let untrimmed: &'a [crate::ast::html::HtmlNode<'a>] = allocator.alloc(html_result.nodes);
     let nodes = if parse_options.preserve_whitespaces {
-        &html_result.nodes
+        untrimmed
     } else {
         // Apply whitespace removal with preserveSignificantWhitespace=true
         // (Angular uses true for template compilation, false for message extraction)
-        let processed = remove_whitespaces(allocator, &html_result.nodes, true);
+        let processed = remove_whitespaces(allocator, untrimmed, true);
         // We need to leak this to get a reference with the right lifetime
         // since we're in a function that returns Result
         allocator.alloc(processed) as &_
@@ -5495,8 +5515,10 @@ fn compile_component_full<'a>(
     let r3_transform_options = R3TransformOptions {
         collect_comment_nodes: parse_options.collect_comment_nodes,
         angular_version: options.angular_version,
+        enable_i18n_legacy_message_id_format: options.enable_i18n_legacy_message_id_format,
     };
-    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
+    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options)
+        .with_untrimmed_nodes(untrimmed);
     let r3_result = transformer.transform(nodes);
 
     if !r3_result.errors.is_empty() {
@@ -5614,15 +5636,22 @@ fn compile_component_full<'a>(
         && let Some(import_elision) = import_elision
         && !options.hmr
         && let Some(OutputExpression::LiteralArray(raw_imports)) = &metadata.raw_imports
-        && raw_imports.entries.iter().all(|entry| matches!(entry, OutputExpression::ReadVar(_)))
+        && raw_imports.entries.len() == metadata.import_entry_classes.len()
+        && raw_imports
+            .entries
+            .iter()
+            .zip(&metadata.import_entry_classes)
+            .all(|(entry, class)| class.is_some() || matches!(entry, OutputExpression::ReadVar(_)))
         && super::defer_resolver::template_has_defer_block(&r3_result.nodes)
     {
         let candidates: Vec<_> = metadata
-            .imports
+            .import_entry_classes
             .iter()
+            .flatten()
+            .copied()
             .filter_map(|name| {
                 let selector = deferrable_selector(name.as_str())?;
-                Some((*name, crate::pipeline::selector::CssSelector::parse(&selector)))
+                Some((name, crate::pipeline::selector::CssSelector::parse(&selector)))
             })
             .collect();
         let deferred =
@@ -5646,8 +5675,9 @@ fn compile_component_full<'a>(
             let is_deferred = |name: &str| deferred.iter().any(|d| d.as_str() == name);
             metadata.imports.retain(|name| !is_deferred(name.as_str()));
             if let Some(OutputExpression::LiteralArray(raw_imports)) = &mut metadata.raw_imports {
-                raw_imports.entries.retain(|entry| {
-                    !matches!(entry, OutputExpression::ReadVar(var) if is_deferred(var.name.as_str()))
+                let mut classes = metadata.import_entry_classes.iter();
+                raw_imports.entries.retain(|_| {
+                    !classes.next().copied().flatten().is_some_and(|name| is_deferred(&name))
                 });
             }
             implicitly_deferred_imports = deferred.iter().map(ToString::to_string).collect();
@@ -6151,6 +6181,7 @@ pub fn compile_component_template<'a>(
     let r3_transform_options = R3TransformOptions {
         collect_comment_nodes: parse_options.collect_comment_nodes,
         angular_version: None,
+        ..R3TransformOptions::default()
     };
     let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
     let r3_result = transformer.transform(nodes);
@@ -6241,10 +6272,11 @@ pub fn compile_template_to_js_with_options<'a>(
     }
 
     // Stage 1.5: Remove whitespace if not preserving (default behavior)
+    let untrimmed: &'a [crate::ast::html::HtmlNode<'a>] = allocator.alloc(html_result.nodes);
     let nodes = if parse_options.preserve_whitespaces {
-        &html_result.nodes
+        untrimmed
     } else {
-        let processed = remove_whitespaces(allocator, &html_result.nodes, true);
+        let processed = remove_whitespaces(allocator, untrimmed, true);
         allocator.alloc(processed) as &_
     };
 
@@ -6252,8 +6284,10 @@ pub fn compile_template_to_js_with_options<'a>(
     let r3_transform_options = R3TransformOptions {
         collect_comment_nodes: parse_options.collect_comment_nodes,
         angular_version: options.angular_version,
+        enable_i18n_legacy_message_id_format: options.enable_i18n_legacy_message_id_format,
     };
-    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
+    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options)
+        .with_untrimmed_nodes(untrimmed);
     let r3_result = transformer.transform(nodes);
 
     if !r3_result.errors.is_empty() {
@@ -6425,10 +6459,11 @@ pub fn compile_template_for_hmr<'a>(
     }
 
     // Stage 1.5: Remove whitespace if not preserving
+    let untrimmed: &'a [crate::ast::html::HtmlNode<'a>] = allocator.alloc(html_result.nodes);
     let nodes = if parse_options.preserve_whitespaces {
-        &html_result.nodes
+        untrimmed
     } else {
-        let processed = remove_whitespaces(allocator, &html_result.nodes, true);
+        let processed = remove_whitespaces(allocator, untrimmed, true);
         allocator.alloc(processed) as &_
     };
 
@@ -6436,8 +6471,10 @@ pub fn compile_template_for_hmr<'a>(
     let r3_transform_options = R3TransformOptions {
         collect_comment_nodes: parse_options.collect_comment_nodes,
         angular_version: options.angular_version,
+        enable_i18n_legacy_message_id_format: options.enable_i18n_legacy_message_id_format,
     };
-    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
+    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options)
+        .with_untrimmed_nodes(untrimmed);
     let r3_result = transformer.transform(nodes);
 
     if !r3_result.errors.is_empty() {
@@ -6777,9 +6814,9 @@ fn convert_host_metadata_to_input<'a>(
         });
     }
 
-    // Convert static attributes: "role" -> OutputExpression::Literal
-    // This matches TypeScript which uses `o.literal(value)` for host attributes.
-    // They are in the order `merge_host_bindings` put them in.
+    // Static attributes are already the expressions `hostAttrs` holds, in the
+    // order `merge_host_bindings` put them in. The static style and class
+    // become string literals, like `o.literal(value)` upstream.
     let literal = |value: &Ident<'a>| {
         crate::output::ast::OutputExpression::Literal(oxc_allocator::Box::new_in(
             crate::output::ast::LiteralExpr {
@@ -6791,7 +6828,7 @@ fn convert_host_metadata_to_input<'a>(
     };
     let mut attributes = crate::pipeline::ingest::HostAttributes::default();
     for (key, value) in &host.attributes {
-        attributes.insert(*key, literal(value));
+        attributes.insert(*key, value.clone_in(allocator));
     }
 
     // Like Angular's `createHostBindingsFunction`, a non-empty static style,
@@ -6913,10 +6950,15 @@ fn convert_host_metadata_input_to_host_metadata<'a>(
             .push((Ident::from_in(k.as_str(), &allocator), Ident::from_in(v.as_str(), &allocator)));
     }
 
-    let mut attributes: OxcVec<'a, (Ident<'a>, Ident<'a>)> = OxcVec::new_in(&allocator);
+    let mut attributes: OxcVec<'a, (Ident<'a>, OutputExpression<'a>)> = OxcVec::new_in(&allocator);
     for (k, v) in &input.attributes {
-        attributes
-            .push((Ident::from_in(k.as_str(), &allocator), Ident::from_in(v.as_str(), &allocator)));
+        attributes.push((
+            Ident::from_in(k.as_str(), &allocator),
+            crate::output::ast::OutputAstBuilder::string(
+                allocator,
+                Ident::from_in(v.as_str(), &allocator),
+            ),
+        ));
     }
 
     let mut listeners: OxcVec<'a, (Ident<'a>, Ident<'a>)> = OxcVec::new_in(&allocator);
@@ -7174,6 +7216,7 @@ pub fn compile_template_for_linker<'a>(
     let r3_transform_options = R3TransformOptions {
         collect_comment_nodes: parse_options.collect_comment_nodes,
         angular_version,
+        ..R3TransformOptions::default()
     };
     let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
     let r3_result = transformer.transform(nodes);

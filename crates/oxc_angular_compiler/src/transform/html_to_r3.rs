@@ -138,6 +138,9 @@ pub struct TransformOptions {
     pub collect_comment_nodes: bool,
     /// Angular version being compiled. `None` uses the latest (v22) security schema.
     pub angular_version: Option<AngularVersion>,
+    /// Angular's `enableI18nLegacyMessageIdFormat`: give each i18n message its legacy ids
+    /// (`computeDigest`, `computeDecimalDigest`), which `$localize` metadata then carries.
+    pub enable_i18n_legacy_message_id_format: bool,
 }
 
 /// Inserts or updates a var entry in an ordered Vec, preserving first-insertion order.
@@ -217,6 +220,14 @@ pub struct HtmlToR3Transform<'a> {
     icu_names: IcuPlaceholderNames,
     /// Full names (`:svg:svg`) of the enclosing elements, for i18n placeholder names.
     element_full_names: std::vec::Vec<String>,
+    /// Whether i18n messages get legacy ids (`enableI18nLegacyMessageIdFormat`).
+    legacy_message_ids: bool,
+    /// The children of each element as parsed, before whitespace removal, keyed by the
+    /// element's start offset. Angular computes legacy ids on the untrimmed template.
+    untrimmed_children: FxHashMap<u32, &'a [HtmlNode<'a>]>,
+    /// Whether an ICU visited now is a direct child of an i18n element's message (Angular's
+    /// `currentMessage` in `I18nMetaVisitor.visitExpansion`), not inside a nested element.
+    in_i18n_message: bool,
     /// The template as a source file for i18n messages, built on first use and shared by
     /// every message so the template text is copied once.
     i18n_source_file: std::cell::OnceCell<std::sync::Arc<crate::util::ParseSourceFile>>,
@@ -273,8 +284,47 @@ impl<'a> HtmlToR3Transform<'a> {
             message_names: MessagePlaceholderNames::default(),
             icu_names: IcuPlaceholderNames::default(),
             element_full_names: std::vec::Vec::new(),
+            legacy_message_ids: options.enable_i18n_legacy_message_id_format,
+            untrimmed_children: FxHashMap::default(),
+            in_i18n_message: false,
             i18n_source_file: std::cell::OnceCell::new(),
         }
+    }
+
+    /// Gives the transformer the template as parsed, before whitespace removal: legacy message
+    /// ids are computed on it, as Angular's first `I18nMetaVisitor` pass does.
+    #[must_use]
+    pub fn with_untrimmed_nodes(mut self, nodes: &'a [HtmlNode<'a>]) -> Self {
+        fn index<'a>(map: &mut FxHashMap<u32, &'a [HtmlNode<'a>]>, nodes: &'a [HtmlNode<'a>]) {
+            for node in nodes {
+                match node {
+                    HtmlNode::Element(element) => {
+                        map.insert(element.span.start, &element.children);
+                        index(map, &element.children);
+                    }
+                    HtmlNode::Component(component) => index(map, &component.children),
+                    HtmlNode::Block(block) => index(map, &block.children),
+                    _ => {}
+                }
+            }
+        }
+        if self.legacy_message_ids {
+            index(&mut self.untrimmed_children, nodes);
+        }
+        self
+    }
+
+    /// Angular's `_setLegacyIds`: `[computeDigest(message), computeDecimalDigest(message)]`.
+    fn legacy_ids(&self, message: &crate::i18n::ast::Message) -> Vec<'a, Ident<'a>> {
+        let mut ids = Vec::new_in(&self.allocator);
+        if self.legacy_message_ids {
+            ids.push(Ident::from_in(crate::i18n::compute_digest(message).as_str(), self.allocator));
+            ids.push(Ident::from_in(
+                crate::i18n::compute_decimal_digest(message).as_str(),
+                self.allocator,
+            ));
+        }
+        ids
     }
 
     /// Returns the template source file that i18n messages point into.
@@ -532,41 +582,61 @@ impl<'a> HtmlToR3Transform<'a> {
         // Generate i18n message string from HTML children BEFORE transforming to R3.
         // This is needed because the message text comes from the original HTML content.
         // Ported from Angular's I18nMetaVisitor._generateI18nMessage in i18n/meta.ts.
-        let i18n_message_string = if let Some(attr) = i18n_attr {
+        let (i18n_message_string, legacy_ids) = if let Some(attr) = i18n_attr {
             if element.children.is_empty() {
-                String::new()
+                (String::new(), Vec::new_in(&self.allocator))
             } else {
                 // Use I18nMessageFactory to convert children to i18n AST and serialize
                 let factory = I18nMessageFactory::new(false, true);
                 let source_file = self.i18n_source_file();
                 let meta = parse_i18n_meta(attr.value.as_str());
+                let element_name = self.element_i18n_name(&resolved_name, host_tag.as_deref());
 
                 let message = factory.create_message(
                     &element.children,
-                    Some(self.element_i18n_name(&resolved_name, host_tag.as_deref())),
+                    Some(element_name),
                     Some(meta.meaning),
                     Some(meta.description),
                     Some(meta.custom_id),
                     None,
-                    source_file,
+                    std::sync::Arc::clone(&source_file),
                 );
                 collect_placeholder_names(&message.nodes, &mut self.message_names);
-                message.serialize()
+                // Legacy ids are computed before whitespace removal.
+                let legacy_ids = match self.untrimmed_children.get(&element.span.start) {
+                    Some(children) if self.legacy_message_ids => {
+                        self.legacy_ids(&factory.create_message(
+                            children,
+                            Some(element_name),
+                            Some(meta.meaning),
+                            Some(meta.description),
+                            Some(meta.custom_id),
+                            None,
+                            source_file,
+                        ))
+                    }
+                    _ => self.legacy_ids(&message),
+                };
+                (message.serialize(), legacy_ids)
             }
         } else {
-            String::new()
+            (String::new(), Vec::new_in(&self.allocator))
         };
 
         // Now create the i18n metadata with the generated message string
         let i18n_meta = if let Some(attr) = i18n_attr {
             // Element has its own i18n attribute - parse it as a Message with message string
             let instance_id = self.allocate_i18n_message_instance_id();
-            Some(parse_i18n_meta_with_message(
+            let mut meta = parse_i18n_meta_with_message(
                 &self.allocator,
                 attr.value.as_str(),
                 instance_id,
                 &i18n_message_string,
-            ))
+            );
+            if let I18nMeta::Message(message) = &mut meta {
+                message.legacy_ids = legacy_ids;
+            }
+            Some(meta)
         } else if self.i18n_depth > 0 {
             // Element is inside an i18n block - create a TagPlaceholder for it.
             // This matches TypeScript's behavior where child elements inside i18n blocks
@@ -601,7 +671,9 @@ impl<'a> HtmlToR3Transform<'a> {
         // Visit children
         self.element_full_names
             .push(self.element_i18n_name(&resolved_name, host_tag.as_deref()).to_string());
+        let in_i18n_message = std::mem::replace(&mut self.in_i18n_message, has_i18n);
         let children = self.visit_children(&element.children);
+        self.in_i18n_message = in_i18n_message;
         self.element_full_names.pop();
         // Consumed by the ICU child, if any; do not leak it to a later ICU.
         self.sole_icu_message = None;
@@ -849,7 +921,9 @@ impl<'a> HtmlToR3Transform<'a> {
         }
 
         // Visit children
+        let in_i18n_message = std::mem::replace(&mut self.in_i18n_message, has_i18n);
         let children = self.visit_children(&component.children);
+        self.in_i18n_message = in_i18n_message;
 
         // Decrement non_bindable depth if we incremented it
         if has_non_bindable {
@@ -1483,7 +1557,7 @@ impl<'a> HtmlToR3Transform<'a> {
         // child of an i18n element shares that element's message, so it is the message rather
         // than a sub-message of it.
         let source_file = self.i18n_source_file();
-        let icu_message = I18nMessageFactory::new(false, true).create_icu_message(
+        let mut icu_message = I18nMessageFactory::new(false, true).create_icu_message(
             expansion,
             self.element_full_names.last().map(String::as_str),
             source_file,
@@ -1494,6 +1568,16 @@ impl<'a> HtmlToR3Transform<'a> {
             &crate::i18n::ast::serialize_message_for_id(&icu_message.nodes),
             "",
         );
+        let (meta_value, instance_id, is_sub_message) = match self.sole_icu_message.take() {
+            Some((meta_value, instance_id)) => (meta_value, instance_id, false),
+            None => (String::new(), self.allocate_i18n_message_instance_id(), true),
+        };
+        // Whitespace removal leaves an ICU's content as is, so its legacy ids are those of the
+        // first pass. A sole ICU is its element's message and takes the element's meaning.
+        if !is_sub_message {
+            icu_message.meaning = parse_i18n_meta(&meta_value).meaning.to_string();
+        }
+        let legacy_ids = self.legacy_ids(&icu_message);
         // Angular builds the ICU's placeholders from the message's placeholders: `VAR_*` become
         // vars, interpolations become bound text, and element markup becomes plain text.
         let (vars, others): (std::vec::Vec<_>, std::vec::Vec<_>) =
@@ -1509,19 +1593,20 @@ impl<'a> HtmlToR3Transform<'a> {
             .map(|(name, placeholder)| (placeholder.text, name))
             .collect();
         tags.sort_by(|a, b| a.0.cmp(&b.0));
-        let (meta_value, instance_id, is_sub_message) = match self.sole_icu_message.take() {
-            Some((meta_value, instance_id)) => (meta_value, instance_id, false),
-            None => (String::new(), self.allocate_i18n_message_instance_id(), true),
-        };
         let I18nMeta::Message(mut i18n_message) =
             parse_i18n_meta_with_message(self.allocator, &meta_value, instance_id, &message_string)
         else {
             unreachable!("parse_i18n_meta_with_message always returns a Message")
         };
-        if is_sub_message {
+        // Angular's `serializeI18nTemplatePart` names the sub-message on the parent's ICU
+        // placeholder only when the sub-message has no legacy ids. The parent's
+        // `placeholderToMessage` holds the meta visitor's message, with legacy ids, only for
+        // an ICU visited with the i18n element's message as `currentMessage`.
+        if is_sub_message && (legacy_ids.is_empty() || !self.in_i18n_message) {
             i18n_message.associated_message_id =
                 Ident::from_in(associated_message_id.as_str(), self.allocator);
         }
+        i18n_message.legacy_ids = legacy_ids;
 
         // The pipeline identifies the ICU by a message holding a single IcuPlaceholder.
         let icu_type_upper = expansion.expansion_type.as_str().to_uppercase();
@@ -3240,7 +3325,8 @@ impl<'a> HtmlToR3Transform<'a> {
                     continue;
                 };
                 let instance_id = self.allocate_i18n_message_instance_id();
-                let (message_string, nodes) = self.create_attribute_i18n_message(target);
+                let (message_string, nodes, mut legacy_message) =
+                    self.create_attribute_i18n_message(target);
                 let mut meta = parse_i18n_meta_with_message(
                     self.allocator,
                     attr.value.as_str(),
@@ -3249,6 +3335,8 @@ impl<'a> HtmlToR3Transform<'a> {
                 );
                 if let I18nMeta::Message(message) = &mut meta {
                     message.nodes = nodes;
+                    legacy_message.meaning = message.meaning.to_string();
+                    message.legacy_ids = self.legacy_ids(&legacy_message);
                 }
                 i18n_attrs_meta.insert(target_attr, meta);
             }
@@ -3542,13 +3630,14 @@ impl<'a> HtmlToR3Transform<'a> {
 
     /// Builds the i18n message for a translated attribute from the attribute's value.
     ///
-    /// Returns the serialized message and its top-level nodes. An attribute message only
-    /// contains text and interpolation placeholders; the placeholder nodes give ingest the
-    /// names Angular reads from `Object.keys(message.placeholders)`.
+    /// Returns the serialized message, its top-level nodes and the message itself (for its
+    /// legacy ids). An attribute message only contains text and interpolation placeholders;
+    /// the placeholder nodes give ingest the names Angular reads from
+    /// `Object.keys(message.placeholders)`.
     fn create_attribute_i18n_message(
         &self,
         attr: &HtmlAttribute<'a>,
-    ) -> (String, Vec<'a, I18nNode<'a>>) {
+    ) -> (String, Vec<'a, I18nNode<'a>>, crate::i18n::ast::Message) {
         let message = I18nMessageFactory::new(false, true)
             .create_attribute_message(attr, self.i18n_source_file());
         let span = |s: &crate::util::ParseSourceSpan| Span::new(s.start.offset, s.end.offset);
@@ -3575,7 +3664,7 @@ impl<'a> HtmlToR3Transform<'a> {
                 node => push(node),
             }
         }
-        (message.serialize(), nodes)
+        (message.serialize(), nodes, message)
     }
 
     /// Normalizes an attribute name by stripping the data- prefix (case-insensitive).

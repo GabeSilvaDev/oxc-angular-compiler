@@ -526,14 +526,23 @@ pub struct ComponentMetadata<'a> {
     /// Component imports (for standalone components).
     pub imports: Vec<'a, Ident<'a>>,
 
+    /// The class `@defer` may lazy-load for each element of the `imports`
+    /// array literal, by position: `X`, or `forwardRef(() => X)` with
+    /// `@angular/core`'s `forwardRef` (which [`Self::imports`] leaves out),
+    /// as ngtsc resolves them through its `forwardRefResolver`; `None` for
+    /// anything else, such as `X as any`, which ngtsc keeps eager.
+    pub import_entry_classes: Vec<'a, Option<Ident<'a>>>,
+
     /// Exported names for template references.
     ///
     /// In Angular, `exportAs` can be a comma-separated string (e.g., "foo, bar"),
     /// which is split into an array and emitted as `exportAs: ["foo", "bar"]`.
     pub export_as: Vec<'a, Ident<'a>>,
 
-    /// Whether to preserve whitespace in templates.
-    pub preserve_whitespaces: bool,
+    /// The decorator's `preserveWhitespaces`, or `None` when it does not set
+    /// one and the project-wide `TransformOptions::preserve_whitespaces`
+    /// applies.
+    pub preserve_whitespaces: Option<bool>,
 
     /// Constructor parameter dependencies for DI.
     ///
@@ -893,8 +902,10 @@ pub struct HostMetadata<'a> {
     /// Host property bindings: `{ '[class.active]': 'isActive' }`
     pub properties: Vec<'a, (Ident<'a>, Ident<'a>)>,
 
-    /// Host attribute bindings: `{ 'role': 'button' }`
-    pub attributes: Vec<'a, (Ident<'a>, Ident<'a>)>,
+    /// Static host attributes: `{ 'role': 'button' }`, as the expressions
+    /// `hostAttrs` holds (a string literal, or the expression ngtsc emits for
+    /// a value it can't evaluate).
+    pub attributes: Vec<'a, (Ident<'a>, OutputExpression<'a>)>,
 
     /// Host event listeners: `{ '(click)': 'onClick()' }`
     pub listeners: Vec<'a, (Ident<'a>, Ident<'a>)>,
@@ -950,8 +961,9 @@ impl<'a> ComponentMetadata<'a> {
             change_detection: None,
             host: None,
             imports: Vec::new_in(&allocator),
+            import_entry_classes: Vec::new_in(&allocator),
             export_as: Vec::new_in(&allocator),
-            preserve_whitespaces: false,
+            preserve_whitespaces: None,
             constructor_deps: None,
             inputs: Vec::new_in(&allocator),
             outputs: Vec::new_in(&allocator),
