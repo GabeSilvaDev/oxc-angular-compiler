@@ -11,9 +11,36 @@ use rustc_hash::FxHashMap;
 
 use crate::ir::expression::IrExpression;
 use crate::output::ast::{
-    DeclareFunctionStmt, DeclareVarStmt, FunctionExpr, OutputExpression, OutputStatement,
-    ReadVarExpr, StmtModifier,
+    DeclareFunctionStmt, DeclareVarStmt, FunctionExpr, LiteralValue, OutputExpression,
+    OutputStatement, ReadVarExpr, StmtModifier, clone_output_statement,
 };
+
+/// Strings at least this long (in UTF-16 code units, like JS `length`) are
+/// shared once they are used twice; shorter ones always stay inline.
+///
+/// Ported from Angular's `POOL_INCLUSION_LENGTH_THRESHOLD_FOR_STRINGS`.
+const POOL_INCLUSION_LENGTH_THRESHOLD_FOR_STRINGS: usize = 50;
+
+/// What one class's pool hands to the next class's pool in a file.
+///
+/// ngtsc compiles every class of a file with one `ConstantPool`, so a literal,
+/// pure function or shared function pooled by one class is reused by the
+/// next, and a name one class claims is not claimed again by another. Oxc
+/// gives each class its own pool (with `_c` names chained by the starting
+/// index), so the file transform carries these over with
+/// [`ConstantPool::take_shared`] and [`ConstantPool::inherit_shared`].
+#[derive(Debug, Default, Clone)]
+pub struct SharedPool<'a> {
+    /// Literals pooled by `get_const_literal`, by key.
+    literals: FxHashMap<String, PooledLiteral<'a>>,
+    /// Pure functions pooled by `pool_pure_function`, by key.
+    shared_constants: FxHashMap<String, Ident<'a>>,
+    /// Functions declared by `get_shared_function_reference`.
+    shared_functions: std::vec::Vec<&'a OutputStatement<'a>>,
+    /// Names claimed by `unique_name` (`_forTrack`, `Cmp_Template`, ...), with
+    /// their usage counts.
+    claimed_names: FxHashMap<String, u32>,
+}
 
 /// A pool for deduplicating constant values.
 ///
@@ -30,13 +57,21 @@ pub struct ConstantPool<'a> {
     values: Vec<'a, PooledConstant<'a>>,
     /// Counter for generating unique names (_c0, _c1, etc.).
     next_name_index: u32,
-    /// Global offset for unique_name calls.
-    /// This is used to ensure unique names don't conflict when compiling
-    /// multiple components in the same file.
-    unique_name_offset: u32,
-    /// Claimed names for unique_name deduplication within a single component.
-    /// Maps base name to usage count.
+    /// Claimed names for unique_name deduplication, including the names of
+    /// the earlier classes of the file. Maps base name to usage count.
     claimed_names: FxHashMap<String, u32>,
+    /// Literals pooled by `get_const_literal`, by key.
+    literals: FxHashMap<String, PooledLiteral<'a>>,
+    /// Pure functions pooled by `pool_pure_function`, including the earlier
+    /// classes' of the file, by key.
+    shared_constants: FxHashMap<String, Ident<'a>>,
+    /// The functions declared by `get_shared_function_reference`, including
+    /// the earlier classes' of the file, whose statements may have left
+    /// `statements` already.
+    shared_functions: std::vec::Vec<&'a OutputStatement<'a>>,
+    /// Long strings an earlier class of the file used inline once, shared by
+    /// this pool. Their declaration and first use belong to that earlier class.
+    inherited_fixups: std::vec::Vec<InheritedFixup<'a>>,
     /// Statements to emit (e.g., child view functions).
     pub statements: Vec<'a, crate::output::ast::OutputStatement<'a>>,
 }
@@ -50,8 +85,11 @@ impl<'a> ConstantPool<'a> {
             arrays: FxHashMap::default(),
             values: Vec::new_in(&allocator),
             next_name_index: 0,
-            unique_name_offset: 0,
             claimed_names: FxHashMap::default(),
+            literals: FxHashMap::default(),
+            shared_constants: FxHashMap::default(),
+            shared_functions: std::vec::Vec::new(),
+            inherited_fixups: std::vec::Vec::new(),
             statements: Vec::new_in(&allocator),
         }
     }
@@ -67,9 +105,10 @@ impl<'a> ConstantPool<'a> {
     ///
     /// # Arguments
     ///
-    /// * `starting_index` - Starting index for constant names (_c0, _c1, etc.)
-    ///   AND unique names (_forTrack0, _forTrack1, etc.). Both use the same
-    ///   starting index for simplicity.
+    /// * `starting_index` - Starting index for constant names (_c0, _c1, etc.).
+    ///   Names from `unique_name` (_forTrack0, ...) are counted per base name
+    ///   instead, with the earlier classes' counts from
+    ///   [`ConstantPool::inherit_shared`].
     pub fn with_starting_index(allocator: &'a Allocator, starting_index: u32) -> Self {
         Self {
             allocator,
@@ -77,22 +116,21 @@ impl<'a> ConstantPool<'a> {
             arrays: FxHashMap::default(),
             values: Vec::new_in(&allocator),
             next_name_index: starting_index,
-            unique_name_offset: starting_index,
             claimed_names: FxHashMap::default(),
+            literals: FxHashMap::default(),
+            shared_constants: FxHashMap::default(),
+            shared_functions: std::vec::Vec::new(),
+            inherited_fixups: std::vec::Vec::new(),
             statements: Vec::new_in(&allocator),
         }
     }
 
-    /// Returns the next name index that would be used.
+    /// Returns the next `_c` constant index that would be used.
     ///
-    /// This returns the maximum of next_name_index and the total unique names
-    /// generated (offset + claimed count), ensuring proper state transfer when
-    /// compiling multiple components in the same file.
+    /// Angular numbers `_c` constants (`freshName`) apart from the other
+    /// names `uniqueName` hands out, so only constants move it.
     pub fn next_name_index(&self) -> u32 {
-        // Calculate the total unique names generated: offset + sum of all claimed counts
-        let total_unique_names: u32 =
-            self.unique_name_offset + self.claimed_names.values().sum::<u32>();
-        self.next_name_index.max(total_unique_names)
+        self.next_name_index
     }
 
     /// Returns the allocator.
@@ -223,22 +261,21 @@ impl<'a> ConstantPool<'a> {
     ///
     /// # Returns
     ///
-    /// A tuple of (index, function_name) where the function name can be used to
-    /// reference this pooled function.
+    /// The function name, which can be used to reference this pooled function.
+    /// An equal function an earlier class of the file pooled is reused, as
+    /// Angular's `getSharedConstant` does; that class declares it.
     pub fn pool_pure_function(
         &mut self,
         num_args: u32,
         body_key: &str,
         body_expr: IrExpression<'a>,
-    ) -> (u32, Ident<'a>) {
+    ) -> Ident<'a> {
         // Create a key for deduplication based on arg count and body
         let key = format!("pf:{}:{}", num_args, body_key);
 
         // Check if already pooled
-        if let Some(pooled) = self.strings.get(&key) {
-            // Return existing index and name
-            let constant = &self.values[pooled.index as usize];
-            return (pooled.index, constant.name.clone());
+        if let Some(name) = self.shared_constants.get(&key) {
+            return *name;
         }
 
         let index = self.values.len() as u32;
@@ -260,8 +297,8 @@ impl<'a> ConstantPool<'a> {
             )),
         });
 
-        self.strings.insert(key, PooledValue { index });
-        (index, name)
+        self.shared_constants.insert(key, name);
+        name
     }
 
     /// Gets or creates a shared function reference.
@@ -269,7 +306,7 @@ impl<'a> ConstantPool<'a> {
     /// This is used for defer block dependency resolver functions and track functions.
     /// The function is added to the constant pool's statements and a reference expression
     /// is returned. If an equivalent function already exists, a reference to the existing
-    /// function is returned instead.
+    /// function is returned instead, even one an earlier class of the file declared.
     ///
     /// Angular TypeScript stores ALL shared functions (both arrow and regular) in the
     /// same `statements` array, maintaining insertion order. This is critical for correct
@@ -297,8 +334,10 @@ impl<'a> ConstantPool<'a> {
         let is_arrow = matches!(fn_expr, OutputExpression::ArrowFunction(_));
 
         // Check if an equivalent function already exists in statements
-        // Angular TypeScript iterates through statements checking isEquivalent
-        for stmt in self.statements.iter() {
+        // Angular TypeScript iterates through statements checking isEquivalent.
+        // The earlier classes' shared functions come first, and this pool's
+        // may have left `statements` already.
+        for stmt in self.shared_functions.iter().copied().chain(self.statements.iter()) {
             match stmt {
                 // Arrow functions are saved as DeclareVarStmt
                 OutputStatement::DeclareVar(decl) if is_arrow => {
@@ -384,6 +423,11 @@ impl<'a> ConstantPool<'a> {
                 )));
             }
         }
+        // Keep a copy for the next classes of the file to reuse.
+        if let Some(stmt) = self.statements.last() {
+            let stmt = self.allocator.alloc(clone_output_statement(stmt, self.allocator));
+            self.shared_functions.push(stmt);
+        }
 
         // Return a ReadVar expression that references this shared function
         OutputExpression::ReadVar(Box::new_in(
@@ -395,15 +439,9 @@ impl<'a> ConstantPool<'a> {
     /// Generates a unique name with the given base name.
     ///
     /// Used by naming phases to ensure pool-wide uniqueness.
-    /// Matches Angular's `ConstantPool.uniqueName()`.
-    ///
-    /// When compiling multiple components in the same file, the global
-    /// unique_name_offset ensures unique names across all components for
-    /// "generic" names like `_forTrack` that don't include a component name.
-    ///
-    /// For component-specific names (like `ComponentName_Template`), the offset
-    /// is NOT applied because these names are already unique by virtue of
-    /// containing the component class name.
+    /// Matches Angular's `ConstantPool.uniqueName()`: each base name has its
+    /// own count, and the counts of the earlier classes of the file come in
+    /// through [`ConstantPool::inherit_shared`].
     ///
     /// # Arguments
     ///
@@ -411,20 +449,13 @@ impl<'a> ConstantPool<'a> {
     /// * `always_include_suffix` - If `true`, always append a numeric suffix.
     ///   If `false`, only append suffix if the name has been used before.
     pub fn unique_name(&mut self, base: &str, always_include_suffix: bool) -> Ident<'a> {
-        // Get the per-base-name count for deduplication within this component
+        // Get the per-base-name count for deduplication across the file
         let count = self.claimed_names.get(base).copied().unwrap_or(0);
 
-        // Only apply the global offset for "generic" names (`_forTrack`, `_c`, `arrowFn`).
-        // These names could collide across components.
-        // Component-specific names (like `ComponentName_Template`) don't need the
-        // offset because they already contain the component class name.
-        let apply_offset = base.starts_with('_') || base == "arrowFn";
-        let effective_count = if apply_offset { self.unique_name_offset + count } else { count };
-
-        let name = if effective_count == 0 && !always_include_suffix {
+        let name = if count == 0 && !always_include_suffix {
             base.to_string()
         } else {
-            format!("{}{}", base, effective_count)
+            format!("{base}{count}")
         };
 
         // Increment the per-base-name counter
@@ -433,56 +464,125 @@ impl<'a> ConstantPool<'a> {
         Ident::from(self.allocator.alloc_str(&name))
     }
 
-    /// Gets or creates a constant literal and returns a reference expression.
+    /// Gets or creates a constant literal and returns the expression to use.
     ///
-    /// This is used to share constant literals (arrays, primitives) across the output.
-    /// If `share` is true, the constant may be deduplicated with existing constants.
+    /// A short string literal is returned as is. A long string (see
+    /// `POOL_INCLUSION_LENGTH_THRESHOLD_FOR_STRINGS`) stays inline on its
+    /// first use and becomes a shared constant on its second one, unless
+    /// `force_shared` asks for the constant right away; any other literal
+    /// should be passed with `force_shared`. The inline first use is not
+    /// patched here: see [`ConstantPool::shared_literal`] and
+    /// [`ConstantPool::take_inherited_fixups`].
     ///
     /// Ported from Angular's `ConstantPool.getConstLiteral()`.
-    ///
-    /// # Arguments
-    ///
-    /// * `literal` - The literal expression to pool
-    /// * `share` - Whether to attempt deduplication (currently always adds new constant)
-    ///
-    /// # Returns
-    ///
-    /// An `OutputExpression::ReadVar` that references the pooled constant.
     pub fn get_const_literal(
         &mut self,
         literal: OutputExpression<'a>,
-        _share: bool,
+        force_shared: bool,
     ) -> OutputExpression<'a> {
-        // Generate a key from the expression for deduplication
-        let key = expression_to_key(&literal);
-
-        // Check if already pooled
-        if let Some(pooled) = self.strings.get(&key) {
-            let constant = &self.values[pooled.index as usize];
-            return OutputExpression::ReadVar(Box::new_in(
-                ReadVarExpr { name: constant.name.clone(), source_span: None },
-                &self.allocator,
-            ));
+        if matches!(literal, OutputExpression::Literal(_)) && !is_long_string_literal(&literal) {
+            return literal;
         }
 
-        // Add new constant
-        let index = self.values.len() as u32;
+        let key = expression_to_key(&literal);
+        let pooled = self.literals.get(&key).copied();
+        if let Some(PooledLiteral { name: Some(name), .. }) = pooled {
+            return self.read_var(name);
+        }
+        if pooled.is_none() && !force_shared {
+            // First use of a long string: it stays inline until a second one.
+            self.literals.insert(key, PooledLiteral { name: None, inherited: false });
+            return literal;
+        }
+
         let name = self.generate_name("_c");
+        if pooled.is_some_and(|pooled| pooled.inherited) {
+            // The inline first use is in an earlier class, so the constant
+            // has to be declared before that class.
+            self.inherited_fixups.push(InheritedFixup { name, value: literal });
+        } else {
+            let index = self.values.len() as u32;
+            self.values.push(PooledConstant {
+                name,
+                value: PooledValue { index },
+                kind: PooledConstantKind::Literal(Box::new_in(literal, &self.allocator)),
+            });
+        }
+        self.literals.insert(key, PooledLiteral { name: Some(name), inherited: false });
+        self.read_var(name)
+    }
 
-        self.values.push(PooledConstant {
-            name: name.clone(),
-            value: PooledValue { index },
-            kind: PooledConstantKind::Literal(Box::new_in(literal, &self.allocator)),
-        });
+    /// Returns the shared constant for `expr` if it is the inline first use of
+    /// a long string that a later use has shared since.
+    ///
+    /// Angular returns a `FixupExpression` for every pooled literal, which the
+    /// second use points at the new constant. Callers that may hold a first use
+    /// run it through this once all uses are pooled.
+    pub fn shared_literal(&self, expr: &OutputExpression<'a>) -> Option<OutputExpression<'a>> {
+        if !is_long_string_literal(expr) {
+            return None;
+        }
+        let name = self.literals.get(&expression_to_key(expr))?.name?;
+        Some(self.read_var(name))
+    }
 
-        self.strings.insert(key, PooledValue { index });
+    /// Takes the literals, functions and names this pool and the ones before
+    /// it pooled and claimed, to hand them to the next class's pool.
+    pub fn take_shared(&mut self) -> SharedPool<'a> {
+        SharedPool {
+            literals: std::mem::take(&mut self.literals),
+            shared_constants: std::mem::take(&mut self.shared_constants),
+            shared_functions: std::mem::take(&mut self.shared_functions),
+            claimed_names: self.claimed_names.clone(),
+        }
+    }
 
-        // Return a ReadVar expression referencing the constant
+    /// Reuses the literals and functions pooled, and avoids the names claimed,
+    /// by the earlier classes of the file.
+    pub fn inherit_shared(&mut self, shared: SharedPool<'a>) {
+        let SharedPool { mut literals, shared_constants, shared_functions, claimed_names } = shared;
+        for pooled in literals.values_mut() {
+            pooled.inherited = true;
+        }
+        self.literals = literals;
+        self.shared_constants = shared_constants;
+        self.shared_functions = shared_functions;
+        self.claimed_names.extend(claimed_names);
+    }
+
+    /// Takes the long strings an earlier class used inline once and this pool
+    /// shared. The caller declares each before that class and points its
+    /// first use at the constant.
+    pub fn take_inherited_fixups(&mut self) -> std::vec::Vec<InheritedFixup<'a>> {
+        std::mem::take(&mut self.inherited_fixups)
+    }
+
+    /// Moves the next constant name past `index`, the next name of a pool
+    /// compiled after this one (ngtsc shares one pool between them).
+    pub fn continue_from(&mut self, index: u32) {
+        self.next_name_index = self.next_name_index.max(index);
+    }
+
+    fn read_var(&self, name: Ident<'a>) -> OutputExpression<'a> {
         OutputExpression::ReadVar(Box::new_in(
             ReadVarExpr { name, source_span: None },
             &self.allocator,
         ))
     }
+}
+
+/// Whether `expr` is a string literal long enough to share.
+///
+/// Ported from Angular's `isLongStringLiteral`.
+pub fn is_long_string_literal(expr: &OutputExpression<'_>) -> bool {
+    matches!(
+        expr,
+        OutputExpression::Literal(lit) if matches!(
+            &lit.value,
+            LiteralValue::String(value)
+                if value.encode_utf16().count() >= POOL_INCLUSION_LENGTH_THRESHOLD_FOR_STRINGS
+        )
+    )
 }
 
 /// Generates a string key from an OutputExpression for deduplication.
@@ -495,7 +595,8 @@ fn expression_to_key(expr: &OutputExpression<'_>) -> String {
             LiteralValue::Undefined => "undefined".to_string(),
             LiteralValue::Boolean(b) => format!("bool:{}", b),
             LiteralValue::Number(n) => format!("num:{}", n),
-            LiteralValue::String(s) => format!("str:{}", s),
+            // Quoted and escaped, so no string can read as several entries.
+            LiteralValue::String(s) => format!("str:{s:?}"),
         },
         OutputExpression::LiteralArray(arr) => {
             let entries: std::vec::Vec<String> =
@@ -506,6 +607,26 @@ fn expression_to_key(expr: &OutputExpression<'_>) -> String {
         // For other types, use a unique identifier to prevent false matches
         _ => format!("expr:{:p}", expr),
     }
+}
+
+/// A literal pooled by [`ConstantPool::get_const_literal`].
+#[derive(Debug, Clone, Copy)]
+pub struct PooledLiteral<'a> {
+    /// The shared constant's name, or `None` while the literal is a long
+    /// string used once, inline.
+    pub name: Option<Ident<'a>>,
+    /// Whether an earlier class of the file pooled the literal.
+    pub inherited: bool,
+}
+
+/// A long string that an earlier class of the file used inline once and a
+/// later class shared, from [`ConstantPool::take_inherited_fixups`].
+#[derive(Debug)]
+pub struct InheritedFixup<'a> {
+    /// The shared constant's name.
+    pub name: Ident<'a>,
+    /// The literal, inline in the earlier class.
+    pub value: OutputExpression<'a>,
 }
 
 /// A pooled value reference.
@@ -649,6 +770,90 @@ mod tests {
         assert_eq!(idx1, idx2);
         assert_ne!(idx1, idx3);
         assert_eq!(pool.len(), 2);
+    }
+
+    fn string<'a>(allocator: &'a Allocator, value: &str) -> OutputExpression<'a> {
+        OutputExpression::Literal(Box::new_in(
+            crate::output::ast::LiteralExpr {
+                value: LiteralValue::String(Ident::from(allocator.alloc_str(value))),
+                source_span: None,
+            },
+            &allocator,
+        ))
+    }
+
+    fn read_var_name<'a>(expr: &OutputExpression<'a>) -> Option<&'a str> {
+        match expr {
+            OutputExpression::ReadVar(read) => Some(read.name.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_long_string_is_shared_from_its_second_use() {
+        let allocator = Allocator::default();
+        let mut pool = ConstantPool::new(&allocator);
+        let long = "x".repeat(POOL_INCLUSION_LENGTH_THRESHOLD_FOR_STRINGS);
+
+        let first = pool.get_const_literal(string(&allocator, &long), false);
+        assert!(matches!(first, OutputExpression::Literal(_)));
+        assert!(pool.shared_literal(&first).is_none());
+        assert!(pool.is_empty());
+
+        let second = pool.get_const_literal(string(&allocator, &long), false);
+        assert_eq!(read_var_name(&second), Some("_c0"));
+        assert_eq!(pool.shared_literal(&first).as_ref().and_then(read_var_name), Some("_c0"));
+        let third = pool.get_const_literal(string(&allocator, &long), false);
+        assert_eq!(read_var_name(&third), Some("_c0"));
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn test_short_string_stays_inline() {
+        let allocator = Allocator::default();
+        let mut pool = ConstantPool::new(&allocator);
+        // 49 UTF-16 code units, though more bytes in UTF-8.
+        let short = "é".repeat(POOL_INCLUSION_LENGTH_THRESHOLD_FOR_STRINGS - 1);
+
+        for _ in 0..2 {
+            let expr = pool.get_const_literal(string(&allocator, &short), true);
+            assert!(matches!(expr, OutputExpression::Literal(_)));
+        }
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn test_long_string_first_used_by_an_earlier_pool_is_a_fixup() {
+        let allocator = Allocator::default();
+        let long = "x".repeat(POOL_INCLUSION_LENGTH_THRESHOLD_FOR_STRINGS);
+        let mut first_pool = ConstantPool::new(&allocator);
+        first_pool.get_const_literal(string(&allocator, &long), false);
+
+        let mut pool = ConstantPool::with_starting_index(&allocator, 3);
+        pool.inherit_shared(first_pool.take_shared());
+        let second = pool.get_const_literal(string(&allocator, &long), false);
+        assert_eq!(read_var_name(&second), Some("_c3"));
+        // Declared before the earlier class, not with this pool's constants.
+        assert!(pool.is_empty());
+        let fixups = pool.take_inherited_fixups();
+        assert_eq!(fixups.len(), 1);
+        assert_eq!(fixups[0].name.as_str(), "_c3");
+        assert!(fixups[0].value.is_equivalent(&string(&allocator, &long)));
+    }
+
+    #[test]
+    fn test_unique_names_count_across_pools_apart_from_constants() {
+        let allocator = Allocator::default();
+        let mut first_pool = ConstantPool::new(&allocator);
+        first_pool.pool_string("a");
+        first_pool.pool_string("b");
+        assert_eq!(first_pool.unique_name("_forTrack", true).as_str(), "_forTrack0");
+
+        let mut pool = ConstantPool::with_starting_index(&allocator, first_pool.next_name_index());
+        pool.inherit_shared(first_pool.take_shared());
+        assert_eq!(pool.unique_name("_forTrack", true).as_str(), "_forTrack1");
+        assert_eq!(pool.unique_name("arrowFn", true).as_str(), "arrowFn0");
+        assert_eq!(pool.next_name_index(), 2);
     }
 
     #[test]

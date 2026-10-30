@@ -2870,23 +2870,19 @@ fn test_multiple_same_name_references_in_for() {
     insta::assert_snapshot!("multiple_same_name_references_in_for", js);
 }
 
-/// Test that attrs const is emitted for selectors with attributes.
+/// Test that no attrs const is emitted for selectors with attributes.
 ///
-/// When a selector like `span[bitBadge]` is used, Angular extracts the attribute
-/// selector into a constant array that is referenced in the component definition.
-///
-/// Expected output:
+/// Angular v22.0.0-next.4 stopped emitting the unused `attrs` field
+/// (angular/angular@d99ab0e040), so `span[bitBadge]` takes no constant and
+/// the ng-content selectors get `_c0`, as in ngtsc 22.2:
 /// ```javascript
-/// const _c0 = ["bitBadge", ""];  // attrs const
+/// const _c0 = ["*"];
 /// BadgeComponent.ɵcmp = ɵɵdefineComponent({
-///   attrs: _c0,
+///   selectors: [["span", "bitBadge", ""]],
+///   ngContentSelectors: _c0,
 ///   ...
 /// })
 /// ```
-///
-/// This was a bug where the attrs const was added to the pool during
-/// `generate_component_definitions` but never emitted because `compile_template`
-/// had already drained the pool to `declarations`.
 #[test]
 fn test_selector_attrs_const_emission() {
     let allocator = Allocator::default();
@@ -2906,24 +2902,89 @@ export class BadgeComponent {}
     assert_eq!(result.component_count, 1);
     assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
 
-    // The declarations_js should contain the attrs const
-    // The const should look like: const _cN = ["bitBadge",""]
-    // Note: no space after comma in the emitter output
-    assert!(
-        result.code.contains(r#"["bitBadge",""]"#),
-        "Should emit attrs const with selector attribute. Got:\n{}",
-        result.code
-    );
-
-    // The ɵcmp definition should reference the attrs const
-    // Note: no space after colon in the emitter output
-    assert!(
-        result.code.contains("attrs:_c"),
-        "Should reference attrs const in component definition. Got:\n{}",
-        result.code
-    );
+    let code: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(!code.contains("attrs:"), "Should not emit attrs. Got:\n{}", result.code);
+    assert!(!code.contains(r#"["bitBadge",""]"#), "Should not pool attrs. Got:\n{}", result.code);
+    assert!(code.contains(r#"const_c0=["*"];"#), "{}", result.code);
+    assert!(code.contains("ngContentSelectors:_c0,"), "{}", result.code);
 
     insta::assert_snapshot!("selector_attrs_const_emission", result.code);
+}
+
+/// Angular before v22.0.0-next.4 emits `attrs` with the first selector's
+/// attributes. `compileComponentFromMetadata` pools it after the query
+/// predicates (`baseDirectiveFields`) and before the template, and shares it
+/// with a later class of the file (`forceShared`). ngtsc 21.2.25 gives:
+/// ```javascript
+/// const _c0 = ["y"];
+/// const _c1 = ["x"];
+/// const _c2 = ["a", ""];
+/// const _c3 = ["*"];
+/// ```
+#[test]
+fn test_selector_attrs_before_v22() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, ContentChild, ViewChild } from '@angular/core';
+
+@Component({ selector: '[a]', template: '<ng-content></ng-content>', standalone: true })
+export class A { @ViewChild('x') q: any; @ContentChild('y') c: any; }
+
+@Component({ selector: 'b[a], c', template: '', standalone: true })
+export class B {}
+";
+    let options = ComponentTransformOptions {
+        angular_version: Some(AngularVersion::new(21, 2, 0)),
+        ..ComponentTransformOptions::default()
+    };
+
+    let result = transform_angular_file(&allocator, "a.ts", source, Some(&options), None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let code: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        code.contains(r#"const_c0=["y"];const_c1=["x"];const_c2=["a",""];const_c3=["*"];"#),
+        "{}",
+        result.code
+    );
+    assert!(code.contains("ɵɵcontentQuery(dirIndex,_c0,5)"), "{}", result.code);
+    assert!(code.contains("ɵɵviewQuery(_c1,5)"), "{}", result.code);
+    assert!(code.contains("},attrs:_c2,ngContentSelectors:_c3,"), "{}", result.code);
+    assert!(code.contains(r#"selectors:[["b","a",""],["c"]],attrs:_c2,"#), "{}", result.code);
+}
+
+/// v21's `compileComponentFromMetadata` pools `attrs` after `baseDirectiveFields`,
+/// so after the host bindings' constants and before the template's.
+#[test]
+fn test_selector_attrs_before_v22_follow_host_constants() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: 'x[role=a]',
+    host: { '[class]': '{on: on, off: !on}' },
+    template: '<i [class]="{a: on, b: !on}"></i>',
+})
+export class X { on = true; }
+"#;
+    let options = ComponentTransformOptions {
+        angular_version: Some(AngularVersion::new(21, 2, 0)),
+        ..ComponentTransformOptions::default()
+    };
+
+    let result = transform_angular_file(&allocator, "x.ts", source, Some(&options), None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let code: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        code.contains(
+            r#"const_c0=(a0,a1)=>({on:a0,off:a1});const_c1=["role","a"];const_c2=(a0,a1)=>({a:a0,b:a1});"#
+        ),
+        "{}",
+        result.code
+    );
+    assert!(code.contains("},attrs:_c1,decls:1,"), "{}", result.code);
 }
 
 // ============================================================================
@@ -2960,7 +3021,7 @@ export class FirstComponent {
 @Component({
     selector: 'app-second',
     template: `
-        @for (user of users; track user.id) {
+        @for (user of users; track user.email) {
             <span>{{ user.email }}</span>
         }
     `,
@@ -2996,14 +3057,11 @@ export class SecondComponent {
         );
     }
 
-    // Verify we have at least 2 unique track variables (one from each component)
-    assert!(
-        track_names.len() >= 2,
-        "Expected at least 2 unique track variables, got {}. Variables: {:?}\nFull output:\n{}",
-        track_names.len(),
-        track_names,
-        code
-    );
+    // One track function from each component, numbered by the `_forTrack`
+    // count across the file like ngtsc's single pool.
+    let expected: std::collections::HashSet<String> =
+        ["_forTrack0", "_forTrack1"].into_iter().map(String::from).collect();
+    assert_eq!(track_names, expected, "Full output:\n{code}");
 
     // Also check for function declarations with numbered suffixes
     // Both components generate template functions with unique names
@@ -3587,13 +3645,8 @@ export class MatMiniFabButton {}
         );
     }
 
-    // Both components should have attrs referencing _c constants (from selector)
-    let attrs_pattern = "attrs:_c";
-    let attrs_count = code.matches(attrs_pattern).count();
-    assert!(
-        attrs_count >= 2,
-        "Expected at least 2 attrs references (one per component), found {attrs_count}. Output:\n{code}"
-    );
+    // Angular v22 emits no `attrs` for the attribute selectors.
+    assert!(!code.contains("attrs:"), "Should not emit attrs. Output:\n{code}");
 }
 
 /// Test that multiple components sharing the same template in the same file
@@ -3789,12 +3842,8 @@ export class MatMiniFabButton {
         "Duplicate const declarations found: {duplicates:?}. Full output:\n{code}"
     );
 
-    // Each component should have its own constants for attrs and ngContentSelectors
-    let attrs_count = code.matches("attrs:_c").count();
-    assert!(
-        attrs_count >= 2,
-        "Expected at least 2 attrs references (one per component), found {attrs_count}"
-    );
+    // Angular v22 emits no `attrs` for the attribute selectors.
+    assert!(!code.contains("attrs:"), "Should not emit attrs. Output:\n{code}");
 }
 
 /// Test three components in the same file to ensure constant pool index is correctly
@@ -16080,6 +16129,39 @@ export class CounterService {}
     );
 
     insta::assert_snapshot!("aot_service_decorator_inline_arrow_factory", result.code);
+}
+
+#[test]
+fn test_raw_arrow_factory_is_parenthesized_when_called() {
+    // A block-body arrow the converter keeps as raw source (it declares a
+    // `const`) is called inside the factory wrapper. ngtsc emits
+    // `(() => {...})()`; a bare `() => {...}()` is a SyntaxError.
+    let code = compile_to_valid_js(
+        r"
+import { Injectable, InjectionToken, Service } from '@angular/core';
+export const DEP = new InjectionToken<number>('DEP');
+@Service({ factory: () => { const q = 1; return { v: q }; } })
+export class S1 {}
+@Service({ factory: async () => ({ v: 2 }) })
+export class S2 {}
+@Injectable({ providedIn: 'root', useFactory: () => { const q = 3; return { v: q }; } })
+export class I1 {}
+@Injectable({ providedIn: 'root', useFactory: (d) => { const q = d + 4; return { v: q }; }, deps: [DEP] })
+export class I2 {}
+@Injectable({ providedIn: 'root', useFactory: function () { const q = 5; return { v: q }; } })
+export class I3 {}
+",
+    );
+    for expected in [
+        "return (() => { const q = 1; return { v: q }; })();",
+        "return (async () => ({ v: 2 }))();",
+        "factory:() =>(() => { const q = 3; return { v: q }; })()",
+        "((d) => { const q = d + 4; return { v: q }; })(i0.ɵɵinject(DEP))",
+        // ngtsc leaves a called function expression bare.
+        "factory:() =>function () { const q = 5; return { v: q }; }()",
+    ] {
+        assert!(code.contains(expected), "Missing `{expected}` in:\n{code}");
+    }
 }
 
 #[test]

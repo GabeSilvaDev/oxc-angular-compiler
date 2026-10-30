@@ -219,6 +219,22 @@ impl AngularVersion {
         self.is_at_least(22, 0, 0)
     }
 
+    /// Check if this version emits the `attrs` field on `ɵcmp` (before
+    /// v22.0.0-next.4).
+    ///
+    /// Until then `compileComponentFromMetadata` pooled the attributes of the
+    /// component's first selector (`[bitBadge]` gives `["bitBadge", ""]`) and set
+    /// `attrs` to that constant. No runtime ever read it, and
+    /// `angular/angular@d99ab0e040` ("fix(compiler): stop generating unused
+    /// field") removed it in v22.0.0-next.4; it was never backported. The
+    /// constant still takes a `_cN` index on older versions.
+    pub fn emits_selector_attrs(&self) -> bool {
+        if self.major == 22 && self.minor == 0 && self.patch == 0 {
+            return matches!(self.prerelease, Some(prerelease) if prerelease < Prerelease::Next(4));
+        }
+        self.major < 22
+    }
+
     /// Check if this version compiles component templates in DOM-only mode
     /// (v20.1.0-next.3+).
     ///
@@ -530,8 +546,9 @@ pub struct ComponentMetadata<'a> {
     /// array literal, by position: `X`, or `forwardRef(() => X)` with
     /// `@angular/core`'s `forwardRef` (which [`Self::imports`] leaves out),
     /// as ngtsc resolves them through its `forwardRefResolver`; `None` for
-    /// anything else, such as `X as any`, which ngtsc keeps eager.
-    pub import_entry_classes: Vec<'a, Option<Ident<'a>>>,
+    /// anything else, such as `X as any`, which ngtsc keeps eager. Each class
+    /// comes with the span of its identifier in the array.
+    pub import_entry_classes: Vec<'a, Option<(Ident<'a>, Span)>>,
 
     /// Exported names for template references.
     ///
@@ -1193,6 +1210,27 @@ mod tests {
             AngularVersion::new(u32::MAX, 0, 0),
         ] {
             assert!(!version.uses_shadow_css_polyfills(), "{version:?}");
+        }
+    }
+
+    #[test]
+    fn selector_attrs_end_at_22_0_0_next_4() {
+        let parse = |s| AngularVersion::parse(s).unwrap();
+
+        for version in
+            [parse("19.2.20"), parse("20.3.34"), parse("21.2.25"), parse("22.0.0-next.3")]
+        {
+            assert!(version.emits_selector_attrs(), "{version:?}");
+        }
+
+        for version in [
+            parse("22.0.0-next.4"),
+            parse("22.0.0-rc.0"),
+            parse("22.0.0"),
+            parse("22.2.2"),
+            AngularVersion::new(u32::MAX, 0, 0),
+        ] {
+            assert!(!version.emits_selector_attrs(), "{version:?}");
         }
     }
 }

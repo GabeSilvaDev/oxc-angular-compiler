@@ -57,8 +57,8 @@ use crate::ng_module::{
     extract_ng_module_metadata_in, find_ng_module_decorator, generate_full_ng_module_definition,
 };
 use crate::output::ast::{
-    ArrowFunctionBody, ArrowFunctionExpr, DeclareFunctionStmt, FunctionExpr, OutputExpression,
-    OutputStatement, RawSourceExpr, ReadPropExpr, ReadVarExpr, StmtModifier,
+    ArrowFunctionBody, ArrowFunctionExpr, DeclareFunctionStmt, DeclareVarStmt, FunctionExpr,
+    OutputExpression, OutputStatement, RawSourceExpr, ReadPropExpr, ReadVarExpr, StmtModifier,
 };
 use crate::output::emitter::JsEmitter;
 use crate::parser::ParseTemplateOptions;
@@ -68,8 +68,12 @@ use crate::pipe::{
     extract_pipe_metadata_in, find_pipe_decorator, generate_full_pipe_definition_from_decorator,
 };
 use crate::pipeline::compilation::{DeferBlockDepsEmitMode, TemplateCompilationMode};
+use crate::pipeline::constant_pool::{
+    ConstantPool, InheritedFixup, PooledConstantKind, SharedPool, is_long_string_literal,
+};
 use crate::pipeline::emit::{
     HostBindingCompilationResult, compile_host_bindings, compile_template,
+    declare_pooled_constants_from,
 };
 use crate::pipeline::ingest::{
     HostBindingInput, IngestOptions, ingest_component, ingest_component_with_options,
@@ -3269,6 +3273,11 @@ pub fn transform_angular_file(
     // TypeScript Angular uses ONE file-level constant pool; we simulate this
     // by tracking the next index and passing it to each component.
     let mut shared_pool_index: u32 = 0;
+    // Likewise, the literals the file's components pooled so far, and the
+    // components whose ɵcmp has a long style inline that a later component
+    // may share: (class name, ɵcmp, its emitted text).
+    let mut shared_pool = SharedPool::default();
+    let mut inline_style_cmps: Vec<(String, OutputExpression<'_>, String)> = Vec::new();
 
     // The components compiled for HMR, whose inline template and styles the
     // HMR fingerprint leaves out.
@@ -3431,6 +3440,48 @@ pub fn transform_angular_file(
             import_elision_mut.preserve(name);
         }
     }
+
+    // The selector of the standalone component or directive an `imports`
+    // entry refers to, when cross-file analysis can read it or the class is
+    // declared in this file, and whether a named import brings it in, so
+    // `@defer` may lazy-load it (#313). Watched files are only reported with
+    // `resolve_imported_values`, so it is required here too.
+    #[cfg(feature = "cross_file_elision")]
+    let import_selector =
+        cross_file_analyzer.as_ref().filter(|_| options.resolve_imported_values).map(|analyzer| {
+            let import_map = &import_map;
+            let program = &parser_ret.program;
+            let string_consts = &string_consts;
+            let implicit_standalone = options.implicit_standalone();
+            move |local: &str| -> Option<(String, bool)> {
+                let Some(info) = import_map.get(&Ident::from(local)) else {
+                    let selector = super::cross_file_elision::local_standalone_class_selector(
+                        program,
+                        string_consts,
+                        local,
+                        implicit_standalone,
+                    )?;
+                    return Some((selector, false));
+                };
+                if !info.is_named_import || info.is_type_only {
+                    return None;
+                }
+                let export_name = info.imported_name.as_deref().unwrap_or(local);
+                let selector = analyzer.standalone_directive_selector(
+                    info.source_module.as_str(),
+                    export_name,
+                    std::path::Path::new(path),
+                    implicit_standalone,
+                )?;
+                Some((selector, true))
+            }
+        });
+    // ngc's `DeferredSymbolTracker` sees every component of the file before
+    // any compiles. The `imports` entries another component marks are found
+    // the first time a decision needs them, by class span.
+    #[cfg(feature = "cross_file_elision")]
+    let deferrable_marks: std::cell::RefCell<FxHashMap<Span, std::vec::Vec<Ident<'_>>>> =
+        std::cell::RefCell::default();
 
     // 2. Walk AST to find @Component decorated classes and extract metadata
     for stmt in &parser_ret.program.body {
@@ -3677,53 +3728,66 @@ pub fn transform_angular_file(
                     let content_query_names: Vec<String> =
                         content_queries.iter().map(|q| q.property_name.to_string()).collect();
 
-                    // The selector of the standalone component or directive an
-                    // `imports` entry refers to, when cross-file analysis can
-                    // read it or the class is declared in this file, and whether
-                    // `@defer` may lazy-load it (#313): its import is referenced
-                    // nowhere else in this file or in the compiled output, so the
-                    // static import can go. Watched files are only reported with
-                    // `resolve_imported_values`, so it is required here too.
+                    // ngc's `DeferredSymbolTracker.canDefer` (#313): `@defer`
+                    // may replace an import declaration with dynamic `import()`s
+                    // when no specifier in it is referenced in the compiled
+                    // output or anywhere in this file except the `imports`
+                    // entries the file's components mark as deferrable
+                    // candidates. An explicit `deferredImports` entry is such a
+                    // reference: OXC keeps its static import.
                     #[cfg(feature = "cross_file_elision")]
-                    let import_selector = cross_file_analyzer
-                        .as_ref()
-                        .filter(|_| options.resolve_imported_values)
-                        .map(|analyzer| {
-                            let import_map = &import_map;
-                            let import_elision = &import_elision_mut;
-                            let program = &parser_ret.program;
-                            let string_consts = &string_consts;
-                            move |local: &str| -> Option<(String, bool)> {
-                                let Some(info) = import_map.get(&Ident::from(local)) else {
-                                    let selector =
-                                        super::cross_file_elision::local_standalone_class_selector(
-                                            program,
-                                            string_consts,
-                                            local,
-                                            implicit_standalone,
-                                        )?;
-                                    return Some((selector, false));
-                                };
-                                if !info.is_named_import || info.is_type_only {
-                                    return None;
-                                }
-                                let export_name = info.imported_name.as_deref().unwrap_or(local);
-                                let selector = analyzer.standalone_directive_selector(
-                                    info.source_module.as_str(),
-                                    export_name,
-                                    std::path::Path::new(path),
-                                    implicit_standalone,
-                                )?;
-                                let deferrable = import_elision.value_reference_count(local)
-                                    == Some(1)
-                                    && !import_elision.is_kept_by_output(local);
-                                Some((selector, deferrable))
+                    let can_defer = |name: &str, marked: &[Ident<'_>]| -> bool {
+                        let import_elision = &import_elision_mut;
+                        import_elision.declaration_specifiers(name).iter().all(|specifier| {
+                            let Some(references) = import_elision.value_reference_count(specifier)
+                            else {
+                                return false;
+                            };
+                            if import_elision.is_kept_by_output(specifier) {
+                                return false;
                             }
-                        });
+                            let marks_of = |marked: &[Ident<'_>]| {
+                                marked.iter().filter(|m| m.as_str() == specifier.as_str()).count()
+                            };
+                            let mut marks = marks_of(marked);
+                            if marks < references
+                                && references != usize::MAX
+                                && let Some(import_selector) = &import_selector
+                            {
+                                let mut deferrable_marks = deferrable_marks.borrow_mut();
+                                for other in
+                                    parser_ret.program.body.iter().filter_map(statement_class)
+                                {
+                                    if other.span == class.span {
+                                        continue;
+                                    }
+                                    marks += marks_of(
+                                        deferrable_marks.entry(other.span).or_insert_with(|| {
+                                            component_deferrable_marks(
+                                                allocator,
+                                                other,
+                                                path,
+                                                source,
+                                                options,
+                                                &import_map,
+                                                &string_consts,
+                                                resolved_resources,
+                                                import_selector,
+                                            )
+                                        }),
+                                    );
+                                }
+                            }
+                            marks > 0 && marks >= references
+                        })
+                    };
                     #[cfg(feature = "cross_file_elision")]
-                    let import_selector = import_selector.as_ref().map(|f| f as ImportSelector<'_>);
+                    let (import_selector, can_defer) = (
+                        import_selector.as_ref().map(|f| f as ImportSelector<'_>),
+                        Some(&can_defer as CanDefer<'_>),
+                    );
                     #[cfg(not(feature = "cross_file_elision"))]
-                    let import_selector = None;
+                    let (import_selector, can_defer) = (None, None);
 
                     // 4. Compile the template and generate ɵcmp/ɵfac
                     // Pass the shared pool index to ensure unique constant names
@@ -3738,16 +3802,24 @@ pub fn transform_angular_file(
                         view_queries,
                         content_queries,
                         shared_pool_index,
+                        &mut shared_pool,
                         &mut file_namespace_registry,
                         &import_map,
                         resolved_resources,
                         import_selector,
-                        Some(&import_elision_mut),
+                        can_defer,
                         false,
                     ) {
-                        Ok(compilation_result) => {
+                        Ok(mut compilation_result) => {
                             // Update the shared pool index for the next component
                             shared_pool_index = compilation_result.next_pool_index;
+                            apply_inherited_fixups(
+                                allocator,
+                                std::mem::take(&mut compilation_result.inherited_fixups),
+                                &mut inline_style_cmps,
+                                &mut class_definitions,
+                                &mut compilation_result.declarations_js,
+                            );
 
                             // `@defer` loads these with a dynamic `import()` now.
                             for name in &compilation_result.implicitly_deferred_imports {
@@ -4030,6 +4102,13 @@ pub fn transform_angular_file(
                                 class_name.clone(),
                                 (property_assignments, decls_before_class, decls_after_class),
                             );
+                            if let Some(cmp_definition) = compilation_result.cmp_definition.take() {
+                                inline_style_cmps.push((
+                                    class_name.clone(),
+                                    cmp_definition,
+                                    compilation_result.cmp_js.clone(),
+                                ));
+                            }
                             class_positions.push((
                                 class_name,
                                 compute_effective_start(
@@ -4153,6 +4232,7 @@ pub fn transform_angular_file(
                         file_namespace_registry.angular_core_ns().as_str(),
                         &directive_metadata,
                         shared_pool_index,
+                        &mut shared_pool,
                         options.compilation_mode,
                         options.angular_version,
                     );
@@ -4981,7 +5061,7 @@ pub fn transform_angular_file(
 }
 
 /// Result of full component compilation including ɵcmp/ɵfac.
-struct FullCompilationResult {
+struct FullCompilationResult<'a> {
     /// Compiled template function as JavaScript, for HMR template updates.
     /// `None` when HMR is off (nothing reads it then), for an HMR update
     /// compile (see `hmr_update`) and in partial mode.
@@ -5037,6 +5117,15 @@ struct FullCompilationResult {
 
     /// The template fields of the ɵcmp, for an HMR update compile only.
     hmr_update: Option<HmrUpdateParts>,
+
+    /// The ɵcmp `cmp_js` was emitted from, kept when its styles hold a long
+    /// string inline that a later component of the file may share.
+    cmp_definition: Option<OutputExpression<'a>>,
+
+    /// The long styles an earlier component of the file has inline that this
+    /// one shared: the caller declares each before that component and points
+    /// its ɵcmp at the constant.
+    inherited_fixups: Vec<InheritedFixup<'a>>,
 }
 
 /// What an HMR update module needs from a component's full compile: the
@@ -5377,6 +5466,7 @@ pub fn compile_component_hmr_update(
         view_queries,
         content_queries,
         0,
+        &mut SharedPool::default(),
         &mut namespace_registry,
         &import_map,
         Some(resources),
@@ -5446,7 +5536,7 @@ fn compile_component_partial<'a>(
     content_queries: &[R3QueryMetadata<'a>],
     pool_starting_index: u32,
     namespace_registry: &mut NamespaceRegistry<'a>,
-) -> FullCompilationResult {
+) -> FullCompilationResult<'a> {
     let inputs = crate::partial::PartialComponentInputs {
         template,
         is_inline: metadata.template.is_some(),
@@ -5495,6 +5585,8 @@ fn compile_component_partial<'a>(
         template_style_urls: Vec::new(),
         missing_link_urls: Vec::new(),
         hmr_update: None,
+        cmp_definition: None,
+        inherited_fixups: Vec::new(),
     }
 }
 
@@ -5579,8 +5671,162 @@ fn html_parse_error_diagnostic(
 }
 
 /// The selector of the standalone component or directive an `imports`
-/// entry refers to, by local name, and whether `@defer` may lazy-load it.
+/// entry refers to, by local name, and whether a named import brings it in,
+/// which `@defer` may then replace with a dynamic `import()`.
 type ImportSelector<'f> = &'f dyn Fn(&str) -> Option<(String, bool)>;
+
+/// ngc's `DeferredSymbolTracker.canDefer` for the import declaration that
+/// binds a name, given the `imports` entries the component being compiled
+/// marks as deferrable candidates.
+type CanDefer<'f> = &'f dyn Fn(&str, &[Ident<'_>]) -> bool;
+
+/// What `@defer` may lazy-load among a component's `imports`, as ngc's
+/// `resolveDeferBlocks` finds it.
+struct DeferCandidates<'a> {
+    /// Each `imports` class with a known selector.
+    candidates: std::vec::Vec<(Ident<'a>, std::vec::Vec<crate::pipeline::selector::CssSelector>)>,
+    /// The candidates the template matches only inside `@defer` blocks.
+    block_only: std::vec::Vec<Ident<'a>>,
+    /// The `imports` entries naming a `block_only` candidate a named import
+    /// brings in, one per entry: the identifiers ngc's
+    /// `registerDeferrableCandidate` marks.
+    marked: std::vec::Vec<Ident<'a>>,
+}
+
+/// The [`DeferCandidates`] of a component, or `None` when its template has
+/// no `@defer` block or an `imports` entry can't be read.
+fn implicit_defer_candidates<'a>(
+    metadata: &ComponentMetadata<'a>,
+    nodes: &[crate::ast::r3::R3Node<'a>],
+    import_selector: ImportSelector<'_>,
+) -> Option<DeferCandidates<'a>> {
+    let Some(OutputExpression::LiteralArray(raw_imports)) = &metadata.raw_imports else {
+        return None;
+    };
+    if raw_imports.entries.len() != metadata.import_entry_classes.len()
+        || !raw_imports
+            .entries
+            .iter()
+            .zip(&metadata.import_entry_classes)
+            .all(|(entry, class)| class.is_some() || matches!(entry, OutputExpression::ReadVar(_)))
+        || !super::defer_resolver::template_has_defer_block(nodes)
+    {
+        return None;
+    }
+    let mut imported = std::vec::Vec::new();
+    let candidates: std::vec::Vec<_> = metadata
+        .import_entry_classes
+        .iter()
+        .flatten()
+        .map(|(name, _)| *name)
+        .filter_map(|name| {
+            let (selector, is_imported) = import_selector(name.as_str())?;
+            if is_imported {
+                imported.push(name);
+            }
+            Some((name, crate::pipeline::selector::CssSelector::parse(&selector)))
+        })
+        .collect();
+    let block_only = super::defer_resolver::implicitly_deferred_imports(nodes, &candidates);
+    let marked = metadata
+        .import_entry_classes
+        .iter()
+        .flatten()
+        .map(|(name, _)| *name)
+        .filter(|name| block_only.contains(name) && imported.contains(name))
+        .collect();
+    Some(DeferCandidates { candidates, block_only, marked })
+}
+
+/// The class a top-level statement declares, exported or not.
+#[cfg(feature = "cross_file_elision")]
+fn statement_class<'a>(stmt: &'a Statement<'a>) -> Option<&'a oxc_ast::ast::Class<'a>> {
+    match stmt {
+        Statement::ClassDeclaration(class) => Some(class),
+        Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+            ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class),
+            _ => None,
+        },
+        Statement::ExportDeclaration(export) => match &export.declaration {
+            Declaration::ClassDeclaration(class) => Some(class),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The `imports` entries another component of the file marks as deferrable
+/// candidates ([`DeferCandidates::marked`]); empty for any other class. Its
+/// template is parsed, as `compile_component_full` does, only when it may
+/// hold a `@defer` block. One that fails to parse fails to compile too.
+#[cfg(feature = "cross_file_elision")]
+#[expect(clippy::too_many_arguments)]
+fn component_deferrable_marks<'a>(
+    allocator: &'a Allocator,
+    class: &'a oxc_ast::ast::Class<'a>,
+    path: &str,
+    source: &'a str,
+    options: &TransformOptions,
+    import_map: &ImportMap<'a>,
+    string_consts: &crate::directive::StringConsts<'a>,
+    resolved_resources: Option<&ResolvedResources>,
+    import_selector: ImportSelector<'_>,
+) -> std::vec::Vec<Ident<'a>> {
+    if find_jit_forced_decorator(class, string_consts).is_some() {
+        return std::vec::Vec::new();
+    }
+    let Some(metadata) = extract_component_metadata(
+        allocator,
+        class,
+        options.implicit_standalone(),
+        import_map,
+        Some(source),
+        string_consts,
+    ) else {
+        return std::vec::Vec::new();
+    };
+    let (Some(template), _) = resolve_template(&metadata, resolved_resources) else {
+        return std::vec::Vec::new();
+    };
+    if metadata.import_entry_classes.is_empty() || !template.contains("@defer") {
+        return std::vec::Vec::new();
+    }
+    let template = allocator.alloc_str(&template);
+
+    let parse_options = ParseTemplateOptions {
+        preserve_whitespaces: metadata
+            .preserve_whitespaces
+            .or(options.preserve_whitespaces)
+            .unwrap_or(false),
+        enable_block_syntax: true,
+        enable_let_syntax: true,
+        tokenize_expansion_forms: true,
+        ..Default::default()
+    };
+    let html_result = HtmlParser::with_options(allocator, template, path, &parse_options).parse();
+    if !html_result.errors.is_empty() {
+        return std::vec::Vec::new();
+    }
+    let untrimmed: &'a [crate::ast::html::HtmlNode<'a>] = allocator.alloc(html_result.nodes);
+    let nodes = if parse_options.preserve_whitespaces {
+        untrimmed
+    } else {
+        allocator.alloc(remove_whitespaces(allocator, untrimmed, true)) as &_
+    };
+    let r3_transform_options = R3TransformOptions {
+        collect_comment_nodes: parse_options.collect_comment_nodes,
+        angular_version: options.angular_version,
+        enable_i18n_legacy_message_id_format: options.enable_i18n_legacy_message_id_format,
+    };
+    let r3_result = HtmlToR3Transform::new(allocator, template, r3_transform_options)
+        .with_untrimmed_nodes(untrimmed)
+        .transform(nodes);
+    if !r3_result.errors.is_empty() {
+        return std::vec::Vec::new();
+    }
+    implicit_defer_candidates(&metadata, &r3_result.nodes, import_selector)
+        .map_or_else(std::vec::Vec::new, |candidates| candidates.marked)
+}
 
 fn compile_component_full<'a>(
     allocator: &'a Allocator,
@@ -5592,13 +5838,14 @@ fn compile_component_full<'a>(
     view_queries: OxcVec<'a, R3QueryMetadata<'a>>,
     content_queries: OxcVec<'a, R3QueryMetadata<'a>>,
     pool_starting_index: u32,
+    shared_pool: &mut SharedPool<'a>,
     namespace_registry: &mut NamespaceRegistry<'a>,
     import_map: &ImportMap<'a>,
     resolved_resources: Option<&ResolvedResources>,
     import_selector: Option<ImportSelector<'_>>,
-    import_elision: Option<&ImportElisionAnalyzer<'_>>,
+    can_defer: Option<CanDefer<'_>>,
     hmr_update: bool,
-) -> Result<FullCompilationResult, Vec<OxcDiagnostic>> {
+) -> Result<FullCompilationResult<'a>, Vec<OxcDiagnostic>> {
     use oxc_allocator::FromIn;
 
     let mut diagnostics = Vec::new();
@@ -5773,50 +6020,22 @@ fn compile_component_full<'a>(
     // dependency function can be built (see below).
     let mut defer_block_dependencies = None;
     if let Some(import_selector) = import_selector
-        && let Some(import_elision) = import_elision
+        && let Some(can_defer) = can_defer
         && !options.hmr
-        && let Some(OutputExpression::LiteralArray(raw_imports)) = &metadata.raw_imports
-        && raw_imports.entries.len() == metadata.import_entry_classes.len()
-        && raw_imports
-            .entries
-            .iter()
-            .zip(&metadata.import_entry_classes)
-            .all(|(entry, class)| class.is_some() || matches!(entry, OutputExpression::ReadVar(_)))
-        && super::defer_resolver::template_has_defer_block(&r3_result.nodes)
+        && let Some(DeferCandidates { candidates, block_only, marked }) =
+            implicit_defer_candidates(metadata, &r3_result.nodes, import_selector)
     {
-        let mut deferrable = Vec::new();
-        let candidates: Vec<_> = metadata
-            .import_entry_classes
-            .iter()
-            .flatten()
-            .copied()
-            .filter_map(|name| {
-                let (selector, can_defer) = import_selector(name.as_str())?;
-                if can_defer {
-                    deferrable.push(name);
-                }
-                Some((name, crate::pipeline::selector::CssSelector::parse(&selector)))
-            })
-            .collect();
-        let block_only =
-            super::defer_resolver::implicitly_deferred_imports(&r3_result.nodes, &candidates);
-        let mut deferred = block_only.clone();
-        deferred.retain(|name| deferrable.contains(name));
-        // ngc's `DeferredSymbolTracker.canDefer`: an import declaration goes
-        // only when every non-`type` specifier in it is deferred, or the
-        // static import would stay and nothing would be split off. An
-        // explicit `deferredImports` entry doesn't count: OXC keeps its
-        // static import.
-        let mut deferred: std::vec::Vec<_> = deferred
-            .iter()
-            .copied()
-            .filter(|name| {
-                import_elision
-                    .declaration_specifiers(name)
-                    .iter()
-                    .all(|specifier| deferred.contains(specifier))
-            })
-            .collect();
+        // ngc's `DeferredSymbolTracker.canDefer`, over the whole file: the
+        // `imports` entries this component marks are handed over with the
+        // name, and the ones other components mark are counted there. A
+        // class two entries name is listed once (`seenDeps` in
+        // `resolveAllDeferredDependencies`).
+        let mut deferred = std::vec::Vec::new();
+        for &name in &block_only {
+            if !deferred.contains(&name) && marked.contains(&name) && can_defer(&name, &marked) {
+                deferred.push(name);
+            }
+        }
         // ngc's full compilation gives each `@defer` block its own dependency
         // function (`DeferBlockDepsEmitMode.PerBlock`) listing what the
         // block's main content uses: a dynamic `import()` for a lazy
@@ -5849,7 +6068,7 @@ fn compile_component_full<'a>(
             if let Some(OutputExpression::LiteralArray(raw_imports)) = &mut metadata.raw_imports {
                 let mut classes = metadata.import_entry_classes.iter();
                 raw_imports.entries.retain(|_| {
-                    !classes.next().copied().flatten().is_some_and(|name| is_removed(&name))
+                    !classes.next().copied().flatten().is_some_and(|(name, _)| is_removed(&name))
                 });
                 // Nothing left to resolve at runtime: like a standalone
                 // component without `imports`, it gets no `dependencies`.
@@ -5955,6 +6174,7 @@ fn compile_component_full<'a>(
                     allocator,
                     &dependencies,
                     &metadata.deferred_imports,
+                    &metadata.import_entry_classes,
                     import_map,
                 );
                 (span, deps_fn)
@@ -5975,16 +6195,15 @@ fn compile_component_full<'a>(
         ingest_options,
     );
     job.core_namespace = namespace_registry.angular_core_ns();
+    // Reuse the literals the file's earlier classes pooled, and avoid the names
+    // they claimed: ngtsc compiles the whole file with one constant pool. They are handed on only once this
+    // component compiled, as a failed one does not move `shared_pool_index`.
+    job.pool.inherit_shared(shared_pool.clone());
 
-    // BEFORE template compilation: Pool attrs const if first selector has attributes.
-    // This matches TypeScript Angular which adds attrs to the pool BEFORE template ingestion.
-    // By pooling attrs first, it gets _c0 (or the first available index).
-    // See: packages/compiler/src/render3/view/compiler.ts lines 192-212
-    let attrs_ref = pool_selector_attrs(allocator, &mut job, metadata);
-
-    // BEFORE template compilation: Pool query predicates so they
-    // appear in the constant table as `attrs -> query predicates ->
-    // pure functions`.
+    // BEFORE template compilation: Pool query predicates, then the host
+    // bindings' constants, then the selector attrs, as Angular's
+    // `compileComponentFromMetadata` runs `baseDirectiveFields` before it
+    // pools the attrs and ingests the template.
     //
     // Order matters: upstream ngtsc pools **content queries first, then
     // view queries** (compiler/src/render3/view/compiler.ts emits
@@ -6021,25 +6240,21 @@ fn compile_component_full<'a>(
         None
     };
 
-    let compiled = compile_template(&mut job);
-
-    if !job.emit_errors.is_empty() {
-        diagnostics.append(&mut job.emit_errors);
-        return Err(diagnostics);
-    }
-
-    // Stage 6: Compile host bindings (if any)
-    // Pass the template pool's current index to ensure host binding constants
-    // continue from where template compilation left off (avoiding duplicate names)
-    let template_pool_index = job.pool.next_name_index();
+    // Compile host bindings (if any) in `baseDirectiveFields`, after the
+    // queries. Their pool continues from the query predicates, and the
+    // template's pool from theirs, as both are one pool in Angular.
+    let query_constant_count = job.pool.len();
+    let mut component_pool = job.pool.take_shared();
     let host_binding_output = compile_component_host_bindings(
         &allocator,
         job.core_namespace.as_str(),
         metadata,
-        template_pool_index,
+        job.pool.next_name_index(),
+        &mut component_pool,
         options.angular_version,
         options.legacy_optional_chaining,
     );
+    job.pool.inherit_shared(component_pool);
 
     // Extract the result and update pool index if host bindings were compiled
     let (host_binding_result, host_binding_next_pool_index, host_binding_declarations) =
@@ -6056,11 +6271,34 @@ fn compile_component_full<'a>(
             }
             None => (None, None, OxcVec::new_in(&allocator)),
         };
+    if let Some(index) = host_binding_next_pool_index {
+        job.pool.continue_from(index);
+    }
+
+    // Pool the `attrs` const when the first selector has attributes, after
+    // the host bindings and before the template. Only Angular before
+    // v22.0.0-next.4 adds it, in `compileComponentFromMetadata` after
+    // `baseDirectiveFields`.
+    // See: packages/compiler/src/render3/view/compiler.ts (v21.2.x)
+    let attrs_ref = if options.angular_version.is_some_and(|v| v.emits_selector_attrs()) {
+        pool_selector_attrs(allocator, &mut job, metadata)
+    } else {
+        None
+    };
+
+    let compiled = compile_template(&mut job);
+
+    if !job.emit_errors.is_empty() {
+        diagnostics.append(&mut job.emit_errors);
+        return Err(diagnostics);
+    }
 
     // Stage 7: Generate ɵcmp/ɵfac definitions
     // The namespace registry is shared across all components in the file to ensure
     // consistent namespace assignments between factory generation and import statements.
     // Pass the pre-pooled attrs_ref so the attrs entry uses the correct constant index
+    // The styles pool their long strings after the template's constants.
+    let template_constant_count = job.pool.len();
     let definitions = generate_component_definitions(
         &allocator,
         metadata,
@@ -6077,17 +6315,23 @@ fn compile_component_full<'a>(
     // Emit JavaScript
     let emitter = JsEmitter::new();
 
-    // Emit declarations (child view functions, constants)
+    // Emit declarations in the order they were pooled: the query predicates
+    // (the template pool's first constants), the host bindings' constants,
+    // then the template's (constants, child view functions).
     let mut declarations_js = String::new();
-    for decl in compiled.declarations.iter() {
+    let (query_declarations, template_declarations) =
+        compiled.declarations.split_at(query_constant_count);
+    for decl in
+        query_declarations.iter().chain(&host_binding_declarations).chain(template_declarations)
+    {
         declarations_js.push_str(&emitter.emit_statement(decl));
         declarations_js.push('\n');
     }
 
     // An HMR update replaces the template fields of the live definition, so
     // it takes them from the definition just built: the same text the full
-    // transform emits. Only the template's declarations go along; the host
-    // binding's belong to fields the update keeps.
+    // transform emits. The host bindings' declarations go along too, as the
+    // template may share their constants.
     let hmr_update = hmr_update.then(|| HmrUpdateParts {
         template_js: cmp_definition_field(&definitions.cmp_definition, "template")
             .map(|template| emitter.emit_expression(template))
@@ -6102,14 +6346,15 @@ fn compile_component_full<'a>(
             "ngContentSelectors",
         )
         .map(|selectors| emitter.emit_expression(selectors)),
-        styles: cmp_definition_styles(&definitions.cmp_definition),
+        styles: cmp_definition_styles(&definitions.cmp_definition, &job.pool),
     });
 
-    // Emit host binding declarations (pooled constants like pure functions)
-    for decl in host_binding_declarations.iter() {
+    // Emit the long styles this component shared (the pool's last constants)
+    for decl in &declare_pooled_constants_from(&mut job.pool, template_constant_count) {
         declarations_js.push_str(&emitter.emit_statement(decl));
         declarations_js.push('\n');
     }
+    let inherited_fixups = job.pool.take_inherited_fixups();
 
     // For HMR, we emit the template separately using compile_template_to_js
     // The ɵcmp already contains the template function inline. Only the HMR
@@ -6127,9 +6372,14 @@ fn compile_component_full<'a>(
     } else {
         None
     };
+    *shared_pool = job.pool.take_shared();
 
     let cmp_js = emitter.emit_expression(&definitions.cmp_definition);
     let fac_js = emitter.emit_expression(&definitions.fac_definition);
+    // A later component may share a long style this one has inline; keep the
+    // ɵcmp to point it at the constant then.
+    let cmp_definition = cmp_definition_has_inline_long_style(&definitions.cmp_definition)
+        .then_some(definitions.cmp_definition);
 
     // Generate HMR initialization code if enabled
     let hmr_initializer_js = if options.hmr {
@@ -6195,11 +6445,7 @@ fn compile_component_full<'a>(
     };
 
     // Get the next pool index for the next component in this file
-    // If host bindings were compiled, use the host binding pool's next index
-    // (since it continues from the template pool)
-    // Otherwise, use the template pool's next index
-    let next_pool_index =
-        host_binding_next_pool_index.unwrap_or_else(|| job.pool.next_name_index());
+    let next_pool_index = job.pool.next_name_index();
 
     // Collect any diagnostics from the compilation job
     // (Done after using job to avoid borrow issues).
@@ -6225,7 +6471,23 @@ fn compile_component_full<'a>(
         template_style_urls,
         missing_link_urls,
         hmr_update,
+        cmp_definition,
+        inherited_fixups,
     })
+}
+
+/// The value of `key` in a `ɵɵdefineComponent({...})` call, to change it.
+fn cmp_definition_field_mut<'b, 'a>(
+    cmp_definition: &'b mut OutputExpression<'a>,
+    key: &str,
+) -> Option<&'b mut OutputExpression<'a>> {
+    let OutputExpression::InvokeFunction(call) = cmp_definition else { return None };
+    let Some(OutputExpression::LiteralMap(config)) = call.args.first_mut() else { return None };
+    config
+        .entries
+        .iter_mut()
+        .find(|entry| !entry.is_spread && entry.key.as_str() == key)
+        .map(|entry| &mut entry.value)
 }
 
 /// The value of `key` in a `ɵɵdefineComponent({...})` call.
@@ -6243,8 +6505,12 @@ fn cmp_definition_field<'b, 'a>(
 }
 
 /// The finished CSS strings in a `ɵɵdefineComponent({...})` call's `styles`
-/// (encapsulated and minified as configured, empty ones dropped).
-fn cmp_definition_styles(cmp_definition: &OutputExpression<'_>) -> Vec<String> {
+/// (encapsulated and minified as configured, empty ones dropped), reading a
+/// shared long style from the component's `pool`.
+fn cmp_definition_styles(
+    cmp_definition: &OutputExpression<'_>,
+    pool: &ConstantPool<'_>,
+) -> Vec<String> {
     use crate::output::ast::LiteralValue;
     let Some(OutputExpression::LiteralArray(styles)) =
         cmp_definition_field(cmp_definition, "styles")
@@ -6254,14 +6520,93 @@ fn cmp_definition_styles(cmp_definition: &OutputExpression<'_>) -> Vec<String> {
     styles
         .entries
         .iter()
-        .filter_map(|style| match style {
-            OutputExpression::Literal(literal) => match &literal.value {
-                LiteralValue::String(style) => Some(style.to_string()),
+        .filter_map(|style| {
+            let style = match style {
+                OutputExpression::ReadVar(read) => {
+                    match &pool.constants().iter().find(|c| c.name == read.name)?.kind {
+                        PooledConstantKind::Literal(literal) => literal.as_ref(),
+                        _ => return None,
+                    }
+                }
+                style => style,
+            };
+            match style {
+                OutputExpression::Literal(literal) => match &literal.value {
+                    LiteralValue::String(style) => Some(style.to_string()),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
+            }
         })
         .collect()
+}
+
+/// Whether a `ɵɵdefineComponent({...})` call's `styles` hold a string long
+/// enough for the constant pool to share inline (its first use in the file).
+fn cmp_definition_has_inline_long_style(cmp_definition: &OutputExpression<'_>) -> bool {
+    let Some(OutputExpression::LiteralArray(styles)) =
+        cmp_definition_field(cmp_definition, "styles")
+    else {
+        return false;
+    };
+    styles.entries.iter().any(is_long_string_literal)
+}
+
+/// Points the earlier component's inline first use of a long style that a
+/// later component shared at the shared constant, and declares it before that
+/// component, like the `FixupExpression` ngtsc's single file pool resolves.
+///
+/// `inline_style_cmps` holds the components whose ɵcmp has a long style inline,
+/// with the ɵcmp text in their `class_definitions` entry. Without one (that
+/// component failed to compile), the constant goes before the current class.
+fn apply_inherited_fixups<'a>(
+    allocator: &'a Allocator,
+    fixups: Vec<InheritedFixup<'a>>,
+    inline_style_cmps: &mut [(String, OutputExpression<'a>, String)],
+    class_definitions: &mut HashMap<String, (String, String, String)>,
+    current_declarations_js: &mut String,
+) {
+    let emitter = JsEmitter::new();
+    for fixup in fixups {
+        let declaration =
+            emitter.emit_statement(&OutputStatement::DeclareVar(oxc_allocator::Box::new_in(
+                DeclareVarStmt {
+                    name: fixup.name,
+                    value: Some(fixup.value.clone_in(allocator)),
+                    modifiers: StmtModifier::FINAL,
+                    leading_comment: None,
+                    source_span: None,
+                },
+                &allocator,
+            )));
+        let first_use = inline_style_cmps.iter_mut().find_map(|(class_name, cmp, cmp_js)| {
+            let Some(OutputExpression::LiteralArray(styles)) =
+                cmp_definition_field_mut(cmp, "styles")
+            else {
+                return None;
+            };
+            let style =
+                styles.entries.iter_mut().find(|style| style.is_equivalent(&fixup.value))?;
+            *style = OutputExpression::ReadVar(oxc_allocator::Box::new_in(
+                ReadVarExpr { name: fixup.name, source_span: None },
+                &allocator,
+            ));
+            Some((class_name, emitter.emit_expression(cmp), cmp_js))
+        });
+        let first_use = first_use.and_then(|(class_name, new_cmp_js, cmp_js)| {
+            Some((class_definitions.get_mut(class_name.as_str())?, new_cmp_js, cmp_js))
+        });
+        let Some(((property_assignments, decls_before_class, _), new_cmp_js, cmp_js)) = first_use
+        else {
+            current_declarations_js.push_str(&declaration);
+            current_declarations_js.push('\n');
+            continue;
+        };
+        *property_assignments = property_assignments.replacen(cmp_js.as_str(), &new_cmp_js, 1);
+        decls_before_class.push_str(&declaration);
+        decls_before_class.push('\n');
+        *cmp_js = new_cmp_js;
+    }
 }
 
 /// Resolve template content from inline or external source.
@@ -6585,13 +6930,14 @@ pub fn compile_template_to_js_with_options<'a>(
     // Stage 6: Compile host bindings if provided via options
     let host_pool_starting_index = job.pool.next_name_index();
     if let Some(ref host_input) = options.host {
-        if let Some(host_result) = compile_host_bindings_from_input(
+        if let Some((host_result, _)) = compile_host_bindings_from_input(
             &allocator,
             crate::r3::CORE_ALIAS,
             host_input,
             component_name,
             options.selector.as_deref(),
             host_pool_starting_index,
+            &mut job.pool.take_shared(),
             options.angular_version,
             options.legacy_optional_chaining,
         ) {
@@ -6896,9 +7242,9 @@ struct HostBindingCompilationOutput<'a> {
 /// into a compiled host binding result (function, hostAttrs, hostVars).
 ///
 /// The `pool_starting_index` parameter is used to ensure constant names don't conflict
-/// with those already used by template compilation. In Angular TypeScript, both template
-/// and host binding compilation share the same ConstantPool instance. In our implementation,
-/// we pass the template pool's next index to achieve the same effect.
+/// with those already used by the query predicates. In Angular TypeScript, the queries,
+/// host bindings and template share the same ConstantPool instance. In our implementation,
+/// we pass the component pool's next index and its `shared_pool` to achieve the same effect.
 ///
 /// Returns None if the component has no host bindings.
 fn compile_component_host_bindings<'a>(
@@ -6906,6 +7252,7 @@ fn compile_component_host_bindings<'a>(
     core_namespace: &'a str,
     metadata: &ComponentMetadata<'a>,
     pool_starting_index: u32,
+    shared_pool: &mut SharedPool<'a>,
     angular_version: Option<AngularVersion>,
     legacy_optional_chaining: Option<bool>,
 ) -> Option<HostBindingCompilationOutput<'a>> {
@@ -6930,7 +7277,7 @@ fn compile_component_host_bindings<'a>(
     let input = convert_host_metadata_to_input(allocator, host, component_name, component_selector);
 
     // Ingest and compile the host bindings with the pool starting index
-    // This ensures constant names continue from where template compilation left off
+    // This ensures constant names continue from where the queries left off
     let mut job = ingest_host_binding_with_version(
         &allocator,
         input,
@@ -6939,7 +7286,9 @@ fn compile_component_host_bindings<'a>(
         legacy_optional_chaining,
     );
     job.core_namespace = Ident::from(core_namespace);
+    job.pool.inherit_shared(std::mem::take(shared_pool));
     let result = compile_host_bindings(&mut job);
+    *shared_pool = job.pool.take_shared();
 
     // Get the next pool index after host binding compilation
     let next_pool_index = job.pool.next_name_index();
@@ -7200,11 +7549,11 @@ fn convert_host_metadata_input_to_host_metadata<'a>(
 /// Pool selector attrs constant BEFORE template compilation.
 ///
 /// This matches TypeScript Angular's behavior where the attrs constant is added to
-/// the constant pool BEFORE template ingestion and compilation. By pooling it first,
-/// attrs gets the first available constant index (_c0), ensuring the correct constant
-/// ordering in the output.
+/// the constant pool after the host bindings' constants and BEFORE template ingestion and
+/// compilation, ensuring the correct constant ordering in the output. Only Angular
+/// before v22.0.0-next.4 emits it (see [`crate::AngularVersion::emits_selector_attrs`]).
 ///
-/// See: packages/compiler/src/render3/view/compiler.ts lines 192-212
+/// See: packages/compiler/src/render3/view/compiler.ts (v21.2.x)
 fn pool_selector_attrs<'a>(
     allocator: &'a Allocator,
     job: &mut crate::pipeline::compilation::ComponentCompilationJob<'a>,
@@ -7250,7 +7599,9 @@ fn pool_selector_attrs<'a>(
 /// Compile host bindings from HostMetadataInput (owned strings).
 ///
 /// This is used by `compile_template_to_js_with_options` when host metadata is provided
-/// via TransformOptions for isolated template compilation.
+/// via TransformOptions for isolated template compilation, and by the linker.
+///
+/// Returns a tuple of (result, next_pool_index).
 fn compile_host_bindings_from_input<'a>(
     allocator: &'a Allocator,
     core_namespace: &'a str,
@@ -7258,9 +7609,10 @@ fn compile_host_bindings_from_input<'a>(
     component_name: &str,
     selector: Option<&str>,
     pool_starting_index: u32,
+    shared_pool: &mut SharedPool<'a>,
     angular_version: Option<crate::AngularVersion>,
     legacy_optional_chaining: Option<bool>,
-) -> Option<HostBindingCompilationResult<'a>> {
+) -> Option<(HostBindingCompilationResult<'a>, u32)> {
     use oxc_allocator::FromIn;
 
     // Check if there are any host bindings at all
@@ -7293,9 +7645,11 @@ fn compile_host_bindings_from_input<'a>(
         legacy_optional_chaining,
     );
     job.core_namespace = Ident::from(core_namespace);
+    job.pool.inherit_shared(std::mem::take(shared_pool));
     let result = compile_host_bindings(&mut job);
+    *shared_pool = job.pool.take_shared();
 
-    Some(result)
+    Some((result, job.pool.next_name_index()))
 }
 
 /// Result of compiling host bindings for the linker.
@@ -7306,6 +7660,9 @@ pub struct LinkerHostBindingOutput {
     pub host_vars: u32,
     /// Pool constant declarations (pure functions, etc.) as JS.
     pub declarations_js: String,
+    /// The next available pool index after host binding compilation.
+    /// Used to continue constant numbering in template compilation.
+    pub next_pool_index: u32,
 }
 
 /// Compile host bindings for the linker, returning the emitted JS function + hostVars count.
@@ -7313,23 +7670,27 @@ pub struct LinkerHostBindingOutput {
 /// This takes host property/listener data extracted from a partial declaration and compiles
 /// it through the full Angular expression parser and host binding pipeline, producing
 /// correctly compiled output (unlike raw string interpolation which would fail for complex
-/// Angular template expressions).
-pub fn compile_host_bindings_for_linker(
+/// Angular template expressions). `shared_pool` carries what the host bindings pool to the
+/// component's template (see [`compile_template_for_linker`]), which Angular compiles after
+/// them with the same pool.
+pub fn compile_host_bindings_for_linker<'a>(
+    allocator: &'a Allocator,
     host_input: &HostMetadataInput,
     component_name: &str,
     selector: Option<&str>,
     pool_starting_index: u32,
+    shared_pool: &mut SharedPool<'a>,
     core_namespace: &str,
     angular_version: Option<crate::AngularVersion>,
 ) -> Option<LinkerHostBindingOutput> {
-    let allocator = Allocator::default();
-    let result = compile_host_bindings_from_input(
-        &allocator,
+    let (result, next_pool_index) = compile_host_bindings_from_input(
+        allocator,
         allocator.alloc_str(core_namespace),
         host_input,
         component_name,
         selector,
         pool_starting_index,
+        shared_pool,
         angular_version,
         // Angular's linker uses native `?.` for declarations at version 22+ (and the
         // placeholder), which is not modeled here yet: keep legacy, and never let the
@@ -7349,11 +7710,11 @@ pub fn compile_host_bindings_for_linker(
     }
 
     let fn_js = result.host_binding_fn.map(|f| {
-        let expr = OutputExpression::Function(oxc_allocator::Box::new_in(f, &&allocator));
+        let expr = OutputExpression::Function(oxc_allocator::Box::new_in(f, &allocator));
         emitter.emit_expression(&expr)
     })?;
 
-    Some(LinkerHostBindingOutput { fn_js, host_vars, declarations_js })
+    Some(LinkerHostBindingOutput { fn_js, host_vars, declarations_js, next_pool_index })
 }
 
 /// Output from compiling a template for the linker.
@@ -7380,10 +7741,6 @@ pub struct LinkerTemplateOutput {
 
     /// The ngContentSelectors array as a JavaScript expression string, if any.
     pub ng_content_selectors_js: Option<String>,
-
-    /// The next available pool index after template compilation.
-    /// Used to continue constant numbering in host binding compilation.
-    pub next_pool_index: u32,
 }
 
 /// Compile a template for the linker, returning all data needed to build a `defineComponent` call.
@@ -7391,6 +7748,10 @@ pub struct LinkerTemplateOutput {
 /// This is similar to `compile_template_to_js_with_options` but returns a richer result
 /// that includes numeric metadata (decls, vars) and the consts/ngContentSelectors as strings,
 /// which the linker needs to assemble the `defineComponent({...})` replacement.
+///
+/// Angular's `compileComponentFromMetadata` compiles the host bindings first, so the
+/// template's pool continues from `pool_starting_index` and reuses what the host bindings
+/// pooled, from `shared_pool` (see [`compile_host_bindings_for_linker`]).
 pub fn compile_template_for_linker<'a>(
     allocator: &'a Allocator,
     template: &'a str,
@@ -7400,6 +7761,8 @@ pub fn compile_template_for_linker<'a>(
     core_namespace: &str,
     angular_version: Option<crate::AngularVersion>,
     defer_block_deps: &[Option<&str>],
+    pool_starting_index: u32,
+    shared_pool: SharedPool<'a>,
 ) -> Result<LinkerTemplateOutput, std::vec::Vec<OxcDiagnostic>> {
     use crate::pipeline::ingest::{IngestOptions, ingest_component_with_options};
     use oxc_allocator::FromIn;
@@ -7477,7 +7840,7 @@ pub fn compile_template_for_linker<'a>(
         template_source: Some(template),
         all_deferrable_deps_fn: None,
         defer_blocks,
-        pool_starting_index: 0,
+        pool_starting_index,
         angular_version,
         // Angular's linker uses native `?.` for declarations at version 22+ (and the
         // placeholder), which is not modeled here yet: keep legacy, and never let the
@@ -7493,6 +7856,7 @@ pub fn compile_template_for_linker<'a>(
         ingest_options,
     );
     job.core_namespace = Ident::from_in(core_namespace, &allocator);
+    job.pool.inherit_shared(shared_pool);
 
     let compiled = compile_template(&mut job);
 
@@ -7594,7 +7958,6 @@ pub fn compile_template_for_linker<'a>(
     }
 
     let declarations_js = emitter.emit_statements(&all_statements);
-    let next_pool_index = job.pool.next_name_index();
 
     Ok(LinkerTemplateOutput {
         declarations_js,
@@ -7603,7 +7966,6 @@ pub fn compile_template_for_linker<'a>(
         vars,
         consts_js,
         ng_content_selectors_js,
-        next_pool_index,
     })
 }
 

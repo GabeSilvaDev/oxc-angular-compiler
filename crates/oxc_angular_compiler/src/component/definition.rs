@@ -56,7 +56,7 @@ pub struct ComponentDefinitions<'a> {
 /// * `job` - The compilation job with template compilation results
 /// * `template_fn` - The compiled template function
 /// * `host_binding_result` - Optional host binding compilation result (function, hostAttrs, hostVars)
-/// * `attrs_ref` - Optional pre-pooled attrs constant reference (pooled before template compilation)
+/// * `attrs_ref` - Optional pre-pooled attrs constant reference (pooled before template compilation, pre-v22 only)
 /// * `view_query_fn` - Optional view query function (with pre-pooled predicates)
 ///
 /// # Returns
@@ -282,7 +282,8 @@ fn generate_cmp_definition<'a>(
 
     // 14. attrs: ["class", "..."] - only if first selector has attributes
     // This is optional and only included if the first selector specifies attributes.
-    // Ported from Angular compiler.ts lines 195-212.
+    // Ported from Angular compiler.ts (v21.2.x); v22.0.0-next.4 dropped the field
+    // (angular/angular@d99ab0e040), so attrs_ref is only set for older versions.
     // The attrs_ref is pre-pooled BEFORE template compilation to ensure correct constant ordering.
     // TypeScript Angular adds attrs to the pool BEFORE template ingestion/compilation.
     if let Some(attrs) = attrs_ref {
@@ -422,10 +423,22 @@ fn generate_cmp_definition<'a>(
             }
             let style_value = Ident::from_in(style.as_str(), &allocator);
 
-            style_entries.push(OutputExpression::Literal(Box::new_in(
-                LiteralExpr { value: LiteralValue::String(style_value), source_span: None },
-                &allocator,
-            )));
+            // A long style is shared once the file uses it twice (Angular's
+            // `constantPool.getConstLiteral(literal(style))`).
+            style_entries.push(job.pool.get_const_literal(
+                OutputExpression::Literal(Box::new_in(
+                    LiteralExpr { value: LiteralValue::String(style_value), source_span: None },
+                    &allocator,
+                )),
+                false,
+            ));
+        }
+        // A style used twice here was inline on its first use; point that use
+        // at the constant too, like Angular's `FixupExpression` does.
+        for entry in &mut style_entries {
+            if let Some(shared) = job.pool.shared_literal(entry) {
+                *entry = shared;
+            }
         }
 
         if !style_entries.is_empty() {
