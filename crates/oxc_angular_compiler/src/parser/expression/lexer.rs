@@ -454,7 +454,8 @@ impl<'a> Lexer<'a> {
     /// Advances the index by the current character's byte length and returns the character.
     fn advance(&mut self) -> char {
         let ch = self.peek();
-        if ch != chars::EOF {
+        // By the index, not the character: a NUL in the input reads as `EOF` too.
+        if !self.is_eof() {
             self.index += ch.len_utf8() as u32;
         }
         ch
@@ -465,9 +466,15 @@ impl<'a> Lexer<'a> {
         self.index >= self.length
     }
 
+    /// Whitespace as Angular's `scanToken` skips it: every character up to the space (NUL and the
+    /// other control characters too), and NBSP.
+    fn is_skipped_whitespace(ch: char) -> bool {
+        ch <= chars::SPACE || ch == chars::NBSP
+    }
+
     /// Skips whitespace characters.
     fn skip_whitespace(&mut self) {
-        while !self.is_eof() && chars::is_whitespace(self.peek()) {
+        while !self.is_eof() && Self::is_skipped_whitespace(self.peek()) {
             self.advance();
         }
     }
@@ -477,7 +484,7 @@ impl<'a> Lexer<'a> {
         let ch = self.advance();
 
         // Whitespace
-        if chars::is_whitespace(ch) {
+        if Self::is_skipped_whitespace(ch) {
             return;
         }
 

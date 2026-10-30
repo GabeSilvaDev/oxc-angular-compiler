@@ -1900,6 +1900,162 @@ mod positions {
 mod edge_cases {
     use super::*;
 
+    /// Tokenizes and returns humanized parts, checking that there are no errors.
+    fn humanize_parts_without_errors(input: &str, icu: bool) -> Vec<(HtmlTokenType, Vec<String>)> {
+        let result = HtmlLexer::new(input).with_expansion_forms(icu).tokenize();
+        assert!(result.errors.is_empty(), "{input:?}: {:?}", result.errors);
+        result.tokens.into_iter().map(|t| (t.token_type, t.parts)).collect()
+    }
+
+    #[test]
+    fn should_stop_at_a_nul_in_text_and_interpolation() {
+        // Angular's cursor peeks a NUL as `$EOF`, which ends text and interpolations.
+        assert_eq!(
+            humanize_parts_without_errors("<b>a</b>\0<i>{{ b }}</i>", false),
+            vec![
+                (HtmlTokenType::TagOpenStart, vec![String::new(), "b".to_string()]),
+                (HtmlTokenType::TagOpenEnd, vec![]),
+                (HtmlTokenType::Text, vec!["a".to_string()]),
+                (HtmlTokenType::TagClose, vec![String::new(), "b".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+        assert_eq!(
+            humanize_parts_without_errors("{{ a\0 }}", false),
+            vec![
+                (HtmlTokenType::Text, vec![String::new()]),
+                (HtmlTokenType::Interpolation, vec!["{{".to_string(), " a".to_string()]),
+                (HtmlTokenType::Text, vec![String::new()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_read_a_nul_in_comments_and_cdata() {
+        // These read to their closing marker, so a NUL is just text in them.
+        assert_eq!(
+            humanize_parts_without_errors("<!--a\0b-->c", false),
+            vec![
+                (HtmlTokenType::CommentStart, vec![]),
+                (HtmlTokenType::RawText, vec!["a\0b".to_string()]),
+                (HtmlTokenType::CommentEnd, vec![]),
+                (HtmlTokenType::Text, vec!["c".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+        assert_eq!(
+            humanize_parts_without_errors("<![CDATA[a\0b]]>c", false),
+            vec![
+                (HtmlTokenType::CdataStart, vec![]),
+                (HtmlTokenType::RawText, vec!["a\0b".to_string()]),
+                (HtmlTokenType::CdataEnd, vec![]),
+                (HtmlTokenType::Text, vec!["c".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_read_a_nul_in_raw_text() {
+        assert_eq!(
+            humanize_parts_without_errors("<textarea>a\0b</textarea>c", false),
+            vec![
+                (HtmlTokenType::TagOpenStart, vec![String::new(), "textarea".to_string()]),
+                (HtmlTokenType::TagOpenEnd, vec![]),
+                (HtmlTokenType::EscapableRawText, vec!["a\0b".to_string()]),
+                (HtmlTokenType::TagClose, vec![String::new(), "textarea".to_string()]),
+                (HtmlTokenType::Text, vec!["c".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_read_a_nul_in_a_quoted_attribute_value() {
+        assert_eq!(
+            humanize_parts_without_errors("<div a=\"x\0y\">z</div>", false),
+            vec![
+                (HtmlTokenType::TagOpenStart, vec![String::new(), "div".to_string()]),
+                (HtmlTokenType::AttrName, vec![String::new(), "a".to_string()]),
+                (HtmlTokenType::AttrQuote, vec!["\"".to_string()]),
+                (HtmlTokenType::AttrValueText, vec!["x\0y".to_string()]),
+                (HtmlTokenType::AttrQuote, vec!["\"".to_string()]),
+                (HtmlTokenType::TagOpenEnd, vec![]),
+                (HtmlTokenType::Text, vec!["z".to_string()]),
+                (HtmlTokenType::TagClose, vec![String::new(), "div".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_stop_a_block_parameter_at_a_nul_outside_quotes() {
+        assert_eq!(
+            humanize_parts_without_errors("@if (a\0) {x}", false),
+            vec![
+                (HtmlTokenType::IncompleteBlockOpen, vec!["if".to_string()]),
+                (HtmlTokenType::BlockParameter, vec!["a".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+        assert_eq!(
+            humanize_parts_without_errors("@if (\"a\0b\") {x}", false),
+            vec![
+                (HtmlTokenType::BlockOpenStart, vec!["if".to_string()]),
+                (HtmlTokenType::BlockParameter, vec!["\"a\0b\"".to_string()]),
+                (HtmlTokenType::BlockOpenEnd, vec![]),
+                (HtmlTokenType::Text, vec!["x".to_string()]),
+                (HtmlTokenType::BlockClose, vec![]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_read_a_nul_in_an_expansion_form_value() {
+        assert_eq!(
+            humanize_parts_without_errors("{a\0, select, x {b}}", true),
+            vec![
+                (HtmlTokenType::ExpansionFormStart, vec![]),
+                (HtmlTokenType::RawText, vec!["a\0".to_string()]),
+                (HtmlTokenType::RawText, vec!["select".to_string()]),
+                (HtmlTokenType::ExpansionCaseValue, vec!["x".to_string()]),
+                (HtmlTokenType::ExpansionCaseExpStart, vec![]),
+                (HtmlTokenType::Text, vec!["b".to_string()]),
+                (HtmlTokenType::ExpansionCaseExpEnd, vec![]),
+                (HtmlTokenType::ExpansionFormEnd, vec![]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_read_the_character_after_a_comment_start_in_an_interpolation() {
+        // Angular reads one more character after `//` before it checks for `}}` or a NUL again.
+        assert_eq!(
+            humanize_parts_without_errors("{{ a //}}b", false),
+            vec![
+                (HtmlTokenType::Text, vec![String::new()]),
+                (HtmlTokenType::Interpolation, vec!["{{".to_string(), " a //}}b".to_string()]),
+                (HtmlTokenType::Text, vec![String::new()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+        assert_eq!(
+            humanize_parts_without_errors("{{ a //\0 }}b", false),
+            vec![
+                (HtmlTokenType::Text, vec![String::new()]),
+                (
+                    HtmlTokenType::Interpolation,
+                    vec!["{{".to_string(), " a //\0 ".to_string(), "}}".to_string()]
+                ),
+                (HtmlTokenType::Text, vec!["b".to_string()]),
+                (HtmlTokenType::Eof, vec![]),
+            ]
+        );
+    }
+
     #[test]
     fn should_handle_empty_input() {
         let result = tokenize("");
