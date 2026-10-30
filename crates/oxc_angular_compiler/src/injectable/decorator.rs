@@ -66,8 +66,9 @@ pub struct UseClassMetadata<'a> {
     pub class_expr: OutputExpression<'a>,
     /// Whether this is wrapped in forwardRef().
     pub is_forward_ref: bool,
-    /// Dependencies for the class constructor.
-    pub deps: Vec<'a, DependencyMetadata<'a>>,
+    /// Dependencies for the class constructor, `None` without a `deps` key.
+    /// An empty `deps: []` still makes ngtsc build `new useClass()`.
+    pub deps: Option<Vec<'a, DependencyMetadata<'a>>>,
 }
 
 /// Metadata for useFactory provider.
@@ -75,8 +76,9 @@ pub struct UseClassMetadata<'a> {
 pub struct UseFactoryMetadata<'a> {
     /// The factory function expression.
     pub factory: OutputExpression<'a>,
-    /// Dependencies for the factory function.
-    pub deps: Vec<'a, DependencyMetadata<'a>>,
+    /// Dependencies for the factory function, `None` without a `deps` key.
+    /// An empty `deps: []` still makes ngtsc build the delegated factory.
+    pub deps: Option<Vec<'a, DependencyMetadata<'a>>>,
 }
 
 /// Metadata for useExisting provider.
@@ -139,22 +141,14 @@ impl<'a> InjectableMetadata<'a> {
                 use_existing.is_forward_ref,
             );
         } else if let Some(use_class) = &self.use_class {
-            let deps = if use_class.deps.is_empty() {
-                None
-            } else {
-                Some(convert_deps_to_r3(allocator, &use_class.deps))
-            };
+            let deps = use_class.deps.as_ref().map(|deps| convert_deps_to_r3(allocator, deps));
             builder = builder.use_class(
                 use_class.class_expr.clone_in(allocator),
                 use_class.is_forward_ref,
                 deps,
             );
         } else if let Some(use_factory) = &self.use_factory {
-            let deps = if use_factory.deps.is_empty() {
-                None
-            } else {
-                Some(convert_deps_to_r3(allocator, &use_factory.deps))
-            };
+            let deps = use_factory.deps.as_ref().map(|deps| convert_deps_to_r3(allocator, deps));
             builder = builder.use_factory(use_factory.factory.clone_in(allocator), deps);
         }
 
@@ -489,36 +483,35 @@ fn extract_forward_ref_or_expression<'a>(
     convert_oxc_expression(allocator, expr, source_text).map(|e| (e, false))
 }
 
+/// The `deps` array of a provider config, `None` without one.
 fn extract_deps_from_config<'a>(
     allocator: &'a Allocator,
     config_obj: &'a oxc_ast::ast::ObjectExpression<'a>,
     source_text: Option<&'a str>,
     consts: Option<&StringConsts<'_>>,
-) -> Vec<'a, DependencyMetadata<'a>> {
-    let mut deps = Vec::new_in(&allocator);
-
+) -> Option<Vec<'a, DependencyMetadata<'a>>> {
     for prop in &config_obj.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop
             && is_metadata_property(prop)
         {
             if let Some(key_name) = get_property_key_name(&prop.key) {
                 if key_name.as_str() == "deps" {
-                    if let Expression::ArrayExpression(arr) = &prop.value {
-                        for element in &arr.elements {
-                            if let Some(dep) =
-                                extract_dependency(allocator, element, source_text, consts)
-                            {
-                                deps.push(dep);
-                            }
+                    let Expression::ArrayExpression(arr) = &prop.value else { return None };
+                    let mut deps = Vec::new_in(&allocator);
+                    for element in &arr.elements {
+                        if let Some(dep) =
+                            extract_dependency(allocator, element, source_text, consts)
+                        {
+                            deps.push(dep);
                         }
                     }
-                    break;
+                    return Some(deps);
                 }
             }
         }
     }
 
-    deps
+    None
 }
 
 /// Angular's DI flags a `deps` array entry can hold, see [`extract_dependency`].

@@ -32,7 +32,7 @@ use super::decorator::{
 use super::definition::{const_value_to_expression, generate_component_definitions};
 use super::hoist::{collect_hoist_edits, program_has_angular_decorated_class};
 use super::import_elision::{ImportElisionAnalyzer, import_elision_edits};
-use super::metadata::{AngularVersion, ComponentMetadata, HostMetadata};
+use super::metadata::{AngularVersion, ComponentMetadata, HostMetadata, ImportRef};
 use super::namespace_registry::NamespaceRegistry;
 use super::signal_debug_name;
 use crate::ast::expression::{BindingType, ParsedEventType};
@@ -849,25 +849,6 @@ fn resolve_host_directive_namespaces<'a>(
     }
 }
 
-/// Compute the effective start position for a class statement in the original source.
-///
-/// This accounts for non-Angular decorators that remain on the class after Angular
-/// decorator removal. The effective start is the minimum of `stmt_start` and the
-/// earliest remaining (non-removed) decorator's start position.
-fn compute_effective_start(
-    class: &oxc_ast::ast::Class,
-    decorator_spans_to_remove: &[Span],
-    stmt_start: u32,
-) -> u32 {
-    class
-        .decorators
-        .iter()
-        .filter(|d| !decorator_spans_to_remove.contains(&d.span))
-        .map(|d| d.span.start)
-        .min()
-        .map_or(stmt_start, |dec_start| dec_start.min(stmt_start))
-}
-
 /// This is used to determine where to insert namespace imports so they appear
 /// AFTER existing imports but BEFORE other code (like class declarations).
 ///
@@ -1642,6 +1623,112 @@ fn collect_decorator_identifiers<'a>(
         }
     }
     identifiers.0
+}
+
+/// Whether the Angular metadata of a class nested in a function or block (its
+/// decorators, an initializer API's arguments, or the constructor's parameter
+/// types) reads a binding that function or block declares, other than a class
+/// the output names as is.
+/// The decorator evaluator only sees the file's top-level bindings: it would
+/// miss a local `const` that ngtsc folds, or fold the top-level binding a
+/// local one shadows.
+fn names_enclosing_binding(
+    class: &oxc_ast::ast::Class<'_>,
+    semantic: &oxc_semantic::Semantic<'_>,
+    string_consts: &crate::directive::StringConsts<'_>,
+) -> bool {
+    use oxc_ast_visit::Visit;
+    struct LocalReads<'s> {
+        scoping: &'s oxc_semantic::Scoping,
+        class_span: Span,
+        // Reading a constructor parameter type: the DI token.
+        types: bool,
+        found: bool,
+    }
+    impl<'a> Visit<'a> for LocalReads<'_> {
+        fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+            let scoping = self.scoping;
+            let Some(reference) = it.reference_id.get().map(|id| scoping.get_reference(id)) else {
+                return;
+            };
+            let Some(symbol) = reference.symbol_id().filter(|_| self.types || !reference.is_type())
+            else {
+                return;
+            };
+            // The class's own name and bindings inside the metadata
+            // (`useFactory: (dep) => ...`) are not the enclosing scope's.
+            let span = scoping.symbol_span(symbol);
+            if scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
+                || (self.class_span.start <= span.start && span.end <= self.class_span.end)
+            {
+                return;
+            }
+            if !scoping.symbol_flags(symbol).is_class()
+                || scoping.get_root_binding(it.name).is_some()
+            {
+                self.found = true;
+            }
+        }
+        // The token is the type's name, not its type arguments.
+        fn visit_ts_type_reference(&mut self, it: &oxc_ast::ast::TSTypeReference<'a>) {
+            self.visit_ts_type_name(&it.type_name);
+        }
+    }
+
+    let mut reads = LocalReads {
+        scoping: semantic.scoping(),
+        class_span: class.span,
+        types: false,
+        found: false,
+    };
+    for decorator in &class.decorators {
+        reads.visit_decorator(decorator);
+    }
+    if let Some(constructor) = crate::util::find_constructor(class) {
+        reads.types = true;
+        for param in &constructor.value.params.items {
+            if let Some(annotation) = &param.type_annotation {
+                reads.visit_ts_type_annotation(annotation);
+            }
+        }
+        reads.types = false;
+    }
+    for element in &class.body.body {
+        match element {
+            oxc_ast::ast::ClassElement::MethodDefinition(method) => {
+                for decorator in &method.decorators {
+                    reads.visit_decorator(decorator);
+                }
+                for param in &method.value.params.items {
+                    for decorator in &param.decorators {
+                        reads.visit_decorator(decorator);
+                    }
+                }
+            }
+            oxc_ast::ast::ClassElement::PropertyDefinition(property) => {
+                for decorator in &property.decorators {
+                    reads.visit_decorator(decorator);
+                }
+                if let Some(Expression::CallExpression(call)) =
+                    property.value.as_ref().map(unwrap_jit_initializer)
+                    && classify_initializer_api(&call.callee, string_consts).is_some()
+                {
+                    // The callee too: an enclosing `input` shadows the
+                    // imported one, and the field is no input then.
+                    reads.visit_expression(&call.callee);
+                    reads.visit_arguments(&call.arguments);
+                }
+            }
+            oxc_ast::ast::ClassElement::AccessorProperty(property) => {
+                for decorator in &property.decorators {
+                    reads.visit_decorator(decorator);
+                }
+            }
+            oxc_ast::ast::ClassElement::StaticBlock(_)
+            | oxc_ast::ast::ClassElement::TSIndexSignature(_) => {}
+        }
+    }
+    reads.found
 }
 
 /// Every identifier a file has, like TypeScript's `SourceFile.identifiers`.
@@ -3210,17 +3297,19 @@ pub fn transform_angular_file(
         options.emit_class_metadata && !options.advanced_optimizations,
     );
 
-    // Collect class definitions by class name.
-    // Each entry is (class_name, static_definitions_to_insert, external_declarations)
+    // Collect class definitions by the class's span (classes nested in
+    // different functions may share a name).
     // The external_declarations are things like _c0 constants and child view functions that
     // go outside the class.
-    // We track by name because positions shift after import filtering.
     // (property_assignments, decls_before_class, decls_after_class)
-    let mut class_definitions: HashMap<String, (String, String, String)> = HashMap::new();
+    let mut class_definitions: HashMap<Span, (String, String, String)> = HashMap::new();
     let mut decorator_spans_to_remove: Vec<Span> = Vec::new();
     // Collect class positions from original AST for edit-based output.
-    // (class_name, effective_start, class_body_end)
-    let mut class_positions: Vec<(String, u32, u32)> = Vec::new();
+    // (class span, class_body_end)
+    let mut class_positions: Vec<(Span, u32)> = Vec::new();
+    // The compiled classes of a `namespace` body: ngtsc adds no statement
+    // after them there.
+    let mut namespace_compiled: rustc_hash::FxHashSet<Span> = rustc_hash::FxHashSet::default();
 
     // Classes that opted out of AOT via `jit: true` in their decorator
     // metadata: downleveled like JIT-mode classes (no Ivy definitions) while
@@ -3275,9 +3364,9 @@ pub fn transform_angular_file(
     let mut shared_pool_index: u32 = 0;
     // Likewise, the literals the file's components pooled so far, and the
     // components whose ɵcmp has a long style inline that a later component
-    // may share: (class name, ɵcmp, its emitted text).
+    // may share: (class span, ɵcmp, its emitted text).
     let mut shared_pool = SharedPool::default();
-    let mut inline_style_cmps: Vec<(String, OutputExpression<'_>, String)> = Vec::new();
+    let mut inline_style_cmps: Vec<(Span, OutputExpression<'_>, String)> = Vec::new();
 
     // The components compiled for HMR, whose inline template and styles the
     // HMR fingerprint leaves out.
@@ -3453,29 +3542,39 @@ pub fn transform_angular_file(
             let program = &parser_ret.program;
             let string_consts = &string_consts;
             let implicit_standalone = options.implicit_standalone();
-            move |local: &str| -> Option<(String, bool)> {
-                let Some(info) = import_map.get(&Ident::from(local)) else {
-                    let selector = super::cross_file_elision::local_standalone_class_selector(
-                        program,
-                        string_consts,
-                        local,
-                        implicit_standalone,
-                    )?;
-                    return Some((selector, false));
+            move |import: &ImportRef<'_>| -> Option<ImportedClass> {
+                let local = import.namespace.unwrap_or(import.name);
+                let Some(info) = import_map.get(&local) else {
+                    return local_class(program, string_consts, import, implicit_standalone);
                 };
-                if !info.is_named_import || info.is_type_only {
+                // `ns.Cmp` reads the module's export; ngtsc never lazy-loads it.
+                let (export_name, is_imported) = match import.namespace {
+                    Some(_) if info.is_named_import => return None,
+                    Some(_) => (import.name.as_str(), false),
+                    None if !info.is_named_import => return None,
+                    None => (info.imported_name.as_deref().unwrap_or(&local), true),
+                };
+                if info.is_type_only {
                     return None;
                 }
-                let export_name = info.imported_name.as_deref().unwrap_or(local);
-                let selector = analyzer.standalone_directive_selector(
+                let (class_use, declaration) = analyzer.standalone_directive_selector(
                     info.source_module.as_str(),
                     export_name,
                     std::path::Path::new(path),
                     implicit_standalone,
                 )?;
-                Some((selector, true))
+                Some(ImportedClass { class_use, is_imported, declaration })
             }
         });
+    // Without cross-file analysis, only the classes declared in this file
+    // have a selector to read: they need no other file, and are never
+    // lazy-loaded.
+    let local_selector = |import: &ImportRef<'_>| -> Option<ImportedClass> {
+        if import_map.contains_key(&import.namespace.unwrap_or(import.name)) {
+            return None;
+        }
+        local_class(&parser_ret.program, &string_consts, import, options.implicit_standalone())
+    };
     // ngc's `DeferredSymbolTracker` sees every component of the file before
     // any compiles. The `imports` entries another component marks are found
     // the first time a decision needs them, by class span.
@@ -3483,24 +3582,40 @@ pub fn transform_angular_file(
     let deferrable_marks: std::cell::RefCell<FxHashMap<Span, std::vec::Vec<Ident<'_>>>> =
         std::cell::RefCell::default();
 
-    // 2. Walk AST to find @Component decorated classes and extract metadata
-    for stmt in &parser_ret.program.body {
-        let (class, stmt_start) = match stmt {
-            Statement::ClassDeclaration(class) => (Some(class.as_ref()), class.span.start),
-            Statement::ExportDefaultDeclaration(export) => match &export.declaration {
-                ExportDefaultDeclarationKind::ClassDeclaration(class) => {
-                    (Some(class.as_ref()), export.span.start)
-                }
-                _ => (None, 0),
-            },
-            Statement::ExportDeclaration(export) => match &export.declaration {
-                Declaration::ClassDeclaration(class) => (Some(class.as_ref()), export.span.start),
-                _ => (None, 0),
-            },
-            _ => (None, 0),
+    // 2. Walk AST to find @Component decorated classes and extract metadata.
+    // ngtsc also compiles a class declared in a function body or block: its
+    // definitions stay on the class, and the constants and child template
+    // functions its compile declares go to the file top level.
+    let declared_classes = crate::util::declared_classes(&parser_ret.program);
+    // HMR finds a component by `{path}@{name}`, so a name two classes of the
+    // file declare (in two functions) names neither: they compile without it.
+    let hmr_options = options.hmr.then(|| TransformOptions { hmr: false, ..options.clone() });
+    let ambiguous_names = ambiguous_class_names(&declared_classes);
+    for site in &declared_classes {
+        let class = site.class;
+        let stmt = site.top_level;
+        let stmt_start = if site.nested { class.span.start } else { stmt.span().start };
+        // A nested `jit: true` class keeps its decorators, as does one whose
+        // metadata names a binding of the enclosing function: the evaluator
+        // only sees the file's top-level bindings.
+        let keeps_decorators = site.nested
+            && (find_jit_forced_decorator(class, &string_consts).is_some()
+                || names_enclosing_binding(class, &semantic, &string_consts));
+        // A class in a function or block is not in the `.d.ts`; a `namespace`
+        // member is, under its dotted name: another class of the file may
+        // have its name.
+        let in_dts = !site.nested || site.namespace.is_some();
+        let dts_entry = |mut declaration: dts::DtsDeclaration| {
+            if let Some(namespace) = &site.namespace {
+                declaration.class_name = format!("{namespace}.{}", declaration.class_name);
+            }
+            declaration
         };
+        if !keeps_decorators {
+            if site.namespace.is_some() {
+                namespace_compiled.insert(class.span);
+            }
 
-        if let Some(class) = class {
             // Pre-flight: catch @Service co-located with another Angular
             // decorator before the primary-decorator branches dispatch.
             // Upstream service.ts:101-116 rejects this combination; without
@@ -3755,10 +3870,20 @@ pub fn transform_angular_file(
                                 && let Some(import_selector) = &import_selector
                             {
                                 let mut deferrable_marks = deferrable_marks.borrow_mut();
-                                for other in
-                                    parser_ret.program.body.iter().filter_map(statement_class)
-                                {
-                                    if other.span == class.span {
+                                // Every class the transform compiles, nested
+                                // ones too. A nested class keeping its
+                                // decorators keeps its `imports` entry.
+                                for other in &declared_classes {
+                                    let other_nested = other.nested;
+                                    let other = other.class;
+                                    if other.span == class.span
+                                        || (other_nested
+                                            && names_enclosing_binding(
+                                                other,
+                                                &semantic,
+                                                &string_consts,
+                                            ))
+                                    {
                                         continue;
                                     }
                                     marks += marks_of(
@@ -3783,11 +3908,28 @@ pub fn transform_angular_file(
                     };
                     #[cfg(feature = "cross_file_elision")]
                     let (import_selector, can_defer) = (
-                        import_selector.as_ref().map(|f| f as ImportSelector<'_>),
-                        Some(&can_defer as CanDefer<'_>),
+                        import_selector
+                            .as_ref()
+                            .map_or(&local_selector as ImportSelector<'_>, |f| f),
+                        &can_defer as CanDefer<'_>,
                     );
                     #[cfg(not(feature = "cross_file_elision"))]
-                    let (import_selector, can_defer) = (None, None);
+                    let can_defer = |_: &str, _: &[Ident<'_>]| false;
+                    #[cfg(not(feature = "cross_file_elision"))]
+                    let (import_selector, can_defer) =
+                        (&local_selector as ImportSelector<'_>, &can_defer as CanDefer<'_>);
+                    let (import_selector, can_defer) = (Some(import_selector), Some(can_defer));
+
+                    // A `namespace` member has nowhere to put its HMR code.
+                    let options = match &hmr_options {
+                        Some(no_hmr)
+                            if site.namespace.is_some()
+                                || ambiguous_names.contains(class_name.as_str()) =>
+                        {
+                            no_hmr
+                        }
+                        _ => options,
+                    };
 
                     // 4. Compile the template and generate ɵcmp/ɵfac
                     // Pass the shared pool index to ensure unique constant names
@@ -4099,25 +4241,17 @@ pub fn transform_angular_file(
                             }
 
                             class_definitions.insert(
-                                class_name.clone(),
+                                class.span,
                                 (property_assignments, decls_before_class, decls_after_class),
                             );
                             if let Some(cmp_definition) = compilation_result.cmp_definition.take() {
                                 inline_style_cmps.push((
-                                    class_name.clone(),
+                                    class.span,
                                     cmp_definition,
                                     compilation_result.cmp_js.clone(),
                                 ));
                             }
-                            class_positions.push((
-                                class_name,
-                                compute_effective_start(
-                                    class,
-                                    &decorator_spans_to_remove,
-                                    stmt_start,
-                                ),
-                                class.body.span.end,
-                            ));
+                            class_positions.push((class.span, class.body.span.end));
 
                             // Generate .d.ts type declaration for this component
                             let type_argument_count = class
@@ -4131,15 +4265,19 @@ pub fn transform_angular_file(
                                 &parser_ret.program.comments,
                                 dts_core_namespace.as_str(),
                             );
-                            result.dts_declarations.push(dts::generate_component_dts(
-                                dts_core_namespace.as_str(),
-                                &metadata,
-                                type_argument_count,
-                                &content_query_names,
-                                has_injectable,
-                                &compilation_result.ng_content_selectors,
-                                &accept_types,
-                            ));
+                            if in_dts {
+                                result.dts_declarations.push(dts_entry(
+                                    dts::generate_component_dts(
+                                        dts_core_namespace.as_str(),
+                                        &metadata,
+                                        type_argument_count,
+                                        &content_query_names,
+                                        has_injectable,
+                                        &compilation_result.ng_content_selectors,
+                                        &accept_types,
+                                    ),
+                                ));
+                            }
 
                             result.component_count += 1;
                         }
@@ -4291,12 +4429,14 @@ pub fn transform_angular_file(
                         &parser_ret.program.comments,
                         dts_core_namespace.as_str(),
                     );
-                    result.dts_declarations.push(dts::generate_directive_dts(
-                        dts_core_namespace.as_str(),
-                        &directive_metadata,
-                        has_injectable,
-                        &accept_types,
-                    ));
+                    if in_dts {
+                        result.dts_declarations.push(dts_entry(dts::generate_directive_dts(
+                            dts_core_namespace.as_str(),
+                            &directive_metadata,
+                            has_injectable,
+                            &accept_types,
+                        )));
+                    }
 
                     // Emit setClassMetadata for TestBed support (overrideDirective +
                     // signal members), mirroring the @Component path.
@@ -4311,11 +4451,7 @@ pub fn transform_angular_file(
                         &mut file_namespace_registry,
                     );
 
-                    class_positions.push((
-                        class_name.clone(),
-                        compute_effective_start(class, &decorator_spans_to_remove, stmt_start),
-                        class.body.span.end,
-                    ));
+                    class_positions.push((class.span, class.body.span.end));
                     // Constants pooled by the host bindings are declared before the class.
                     let mut decls_before_class = String::new();
                     for stmt in &definitions.statements {
@@ -4326,7 +4462,7 @@ pub fn transform_angular_file(
                     }
 
                     class_definitions.insert(
-                        class_name,
+                        class.span,
                         (property_assignments, decls_before_class, decls_after_class),
                     );
                 } else if let Some(mut pipe_metadata) = extract_pipe_metadata_in(
@@ -4416,12 +4552,14 @@ pub fn transform_angular_file(
                         // Generate .d.ts type declaration for this pipe
                         let type_argument_count =
                             class.type_parameters.as_ref().map_or(0, |tp| tp.params.len() as u32);
-                        result.dts_declarations.push(dts::generate_pipe_dts(
-                            dts_core_namespace.as_str(),
-                            &pipe_metadata,
-                            type_argument_count,
-                            has_injectable,
-                        ));
+                        if in_dts {
+                            result.dts_declarations.push(dts_entry(dts::generate_pipe_dts(
+                                dts_core_namespace.as_str(),
+                                &pipe_metadata,
+                                type_argument_count,
+                                has_injectable,
+                            )));
+                        }
 
                         // Emit setClassMetadata for TestBed support (overridePipe).
                         let decls_after_class = build_set_class_metadata_decls(
@@ -4435,13 +4573,9 @@ pub fn transform_angular_file(
                             &mut file_namespace_registry,
                         );
 
-                        class_positions.push((
-                            class_name.clone(),
-                            compute_effective_start(class, &decorator_spans_to_remove, stmt_start),
-                            class.body.span.end,
-                        ));
+                        class_positions.push((class.span, class.body.span.end));
                         class_definitions.insert(
-                            class_name,
+                            class.span,
                             (property_assignments, String::new(), decls_after_class),
                         );
                     }
@@ -4544,12 +4678,14 @@ pub fn transform_angular_file(
                         // Generate .d.ts type declaration for this NgModule
                         let type_argument_count =
                             class.type_parameters.as_ref().map_or(0, |tp| tp.params.len() as u32);
-                        result.dts_declarations.push(dts::generate_ng_module_dts(
-                            dts_core_namespace.as_str(),
-                            &ng_module_metadata,
-                            type_argument_count,
-                            has_injectable,
-                        ));
+                        if in_dts {
+                            result.dts_declarations.push(dts_entry(dts::generate_ng_module_dts(
+                                dts_core_namespace.as_str(),
+                                &ng_module_metadata,
+                                type_argument_count,
+                                has_injectable,
+                            )));
+                        }
 
                         // Emit setClassMetadata for TestBed support (overrideModule).
                         // ngtsc's `insertMetadataStatement` (ng_module/src/handler.ts)
@@ -4573,13 +4709,9 @@ pub fn transform_angular_file(
                         }
 
                         // NgModule: external_decls go AFTER the class (they reference the class name)
-                        class_positions.push((
-                            class_name.clone(),
-                            compute_effective_start(class, &decorator_spans_to_remove, stmt_start),
-                            class.body.span.end,
-                        ));
+                        class_positions.push((class.span, class.body.span.end));
                         class_definitions.insert(
-                            class_name,
+                            class.span,
                             (property_assignments, String::new(), external_decls),
                         );
                     }
@@ -4640,6 +4772,7 @@ pub fn transform_angular_file(
                             file_namespace_registry.angular_core_ns().as_str(),
                             &service_metadata,
                             type_argument_count,
+                            options.compilation_mode,
                         );
 
                         let emitter = JsEmitter::new();
@@ -4651,11 +4784,13 @@ pub fn transform_angular_file(
                             emitter.emit_expression(&definition.prov_definition)
                         );
 
-                        result.dts_declarations.push(dts::generate_service_dts(
-                            dts_core_namespace.as_str(),
-                            &service_metadata,
-                            type_argument_count,
-                        ));
+                        if in_dts {
+                            result.dts_declarations.push(dts_entry(dts::generate_service_dts(
+                                dts_core_namespace.as_str(),
+                                &service_metadata,
+                                type_argument_count,
+                            )));
+                        }
 
                         let decls_after_class = build_set_class_metadata_decls(
                             &allocator,
@@ -4668,13 +4803,9 @@ pub fn transform_angular_file(
                             &mut file_namespace_registry,
                         );
 
-                        class_positions.push((
-                            class_name.clone(),
-                            compute_effective_start(class, &decorator_spans_to_remove, stmt_start),
-                            class.body.span.end,
-                        ));
+                        class_positions.push((class.span, class.body.span.end));
                         class_definitions.insert(
-                            class_name,
+                            class.span,
                             (property_assignments, String::new(), decls_after_class),
                         );
                     }
@@ -4735,11 +4866,13 @@ pub fn transform_angular_file(
                         // Generate .d.ts type declaration for this injectable
                         let type_argument_count =
                             class.type_parameters.as_ref().map_or(0, |tp| tp.params.len() as u32);
-                        result.dts_declarations.push(dts::generate_injectable_dts(
-                            dts_core_namespace.as_str(),
-                            &injectable_metadata,
-                            type_argument_count,
-                        ));
+                        if in_dts {
+                            result.dts_declarations.push(dts_entry(dts::generate_injectable_dts(
+                                dts_core_namespace.as_str(),
+                                &injectable_metadata,
+                                type_argument_count,
+                            )));
+                        }
 
                         // Emit setClassMetadata for TestBed support.
                         let decls_after_class = build_set_class_metadata_decls(
@@ -4753,13 +4886,9 @@ pub fn transform_angular_file(
                             &mut file_namespace_registry,
                         );
 
-                        class_positions.push((
-                            class_name.clone(),
-                            compute_effective_start(class, &decorator_spans_to_remove, stmt_start),
-                            class.body.span.end,
-                        ));
+                        class_positions.push((class.span, class.body.span.end));
                         class_definitions.insert(
-                            class_name,
+                            class.span,
                             (property_assignments, String::new(), decls_after_class),
                         );
                     }
@@ -4770,24 +4899,14 @@ pub fn transform_angular_file(
 
     // The analyzer counts an Angular constructor parameter decorator, and the Angular decorator of a `declare`
     // property, as removed on every class with an Angular class decorator. One the walk above left in place (a
-    // component whose template is missing, a constructor other than the implementation) keeps what it references.
+    // component whose template is missing, a constructor other than the implementation, a nested class it skipped)
+    // keeps what it references.
     {
         let stripped: rustc_hash::FxHashSet<Span> =
             decorator_spans_to_remove.iter().copied().collect();
         let mut kept = DecoratorIdentifiers::default();
-        for stmt in &parser_ret.program.body {
-            let class = match stmt {
-                Statement::ClassDeclaration(class) => class.as_ref(),
-                Statement::ExportDefaultDeclaration(export) => match &export.declaration {
-                    ExportDefaultDeclarationKind::ClassDeclaration(class) => class.as_ref(),
-                    _ => continue,
-                },
-                Statement::ExportDeclaration(export) => match &export.declaration {
-                    Declaration::ClassDeclaration(class) => class.as_ref(),
-                    _ => continue,
-                },
-                _ => continue,
-            };
+        for declared in &declared_classes {
+            let class = declared.class;
             for element in &class.body.body {
                 let decorators: std::vec::Vec<_> = match element {
                     oxc_ast::ast::ClassElement::MethodDefinition(method)
@@ -4883,43 +5002,40 @@ pub fn transform_angular_file(
     if emit_ns_imports {
         additional_imports.push_str(&file_namespace_registry.generate_import_statements());
     }
-    let ns_edit = if !additional_imports.is_empty()
-        && (!class_definitions.is_empty() || !jit_classes.is_empty())
-    {
-        let ns_insert_pos = find_last_import_end(&parser_ret.program.body);
-        if let Some(insert_pos) = ns_insert_pos {
-            let bytes = source.as_bytes();
-            let mut actual_pos = insert_pos;
-            // Skip past trailing whitespace/newline after the last import semicolon
-            while actual_pos < bytes.len() {
-                let c = bytes[actual_pos];
-                if c == b'\n' {
-                    actual_pos += 1;
-                    break;
-                } else if c == b' ' || c == b'\t' || c == b'\r' {
-                    actual_pos += 1;
-                } else {
-                    break;
-                }
+    // Past the imports: where the added imports go, and the file-level
+    // declarations of every class.
+    let after_imports = find_last_import_end(&parser_ret.program.body).map_or(0, |insert_pos| {
+        let bytes = source.as_bytes();
+        let mut actual_pos = insert_pos;
+        // Skip past trailing whitespace/newline after the last import semicolon
+        while actual_pos < bytes.len() {
+            let c = bytes[actual_pos];
+            if c == b'\n' {
+                actual_pos += 1;
+                break;
+            } else if c == b' ' || c == b'\t' || c == b'\r' {
+                actual_pos += 1;
+            } else {
+                break;
             }
-            // Ensure the insert position doesn't fall inside any import elision
-            // edit span. Import elision edits extend past trailing newlines, which
-            // may cover the position we computed above.
-            // Note: elision edits are in ascending source order and non-overlapping
-            // (one per import declaration), so a single forward pass is sufficient —
-            // adjusting actual_pos forward can never land inside an earlier edit.
-            for edit in &elision_edits {
-                if (edit.start as usize) < actual_pos && (edit.end as usize) > actual_pos {
-                    actual_pos = edit.end as usize;
-                }
-            }
-            Some(Edit::insert(actual_pos as u32, additional_imports).with_priority(10))
-        } else {
-            Some(Edit::insert(0, additional_imports).with_priority(10))
         }
-    } else {
-        None
-    };
+        // Ensure the insert position doesn't fall inside any import elision
+        // edit span. Import elision edits extend past trailing newlines, which
+        // may cover the position we computed above.
+        // Note: elision edits are in ascending source order and non-overlapping
+        // (one per import declaration), so a single forward pass is sufficient —
+        // adjusting actual_pos forward can never land inside an earlier edit.
+        for edit in &elision_edits {
+            if (edit.start as usize) < actual_pos && (edit.end as usize) > actual_pos {
+                actual_pos = edit.end as usize;
+            }
+        }
+        // A source is shorter than `u32::MAX` bytes, like its spans.
+        u32::try_from(actual_pos).unwrap_or(u32::MAX)
+    });
+    let ns_edit = (!additional_imports.is_empty()
+        && (!class_definitions.is_empty() || !jit_classes.is_empty()))
+    .then(|| Edit::insert(after_imports, additional_imports).with_priority(10));
 
     // 5c. Merge all edits
     let mut edits: Vec<Edit> = elision_edits;
@@ -4947,10 +5063,13 @@ pub fn transform_angular_file(
         edits.push(edit);
     }
 
-    // 5d. Class definition insertion edits
-    for (class_name, effective_start, class_body_end) in &class_positions {
+    // 5d. Class definition insertion edits. Every class's constants and child
+    // view functions go after the imports, joined into one edit in the order
+    // the classes compiled, as ngtsc declares its constant pool's statements.
+    let mut decls_after_imports = String::new();
+    for (class_span, class_body_end) in &class_positions {
         if let Some((property_assignments, decls_before_class, decls_after_class)) =
-            class_definitions.get(class_name)
+            class_definitions.get(class_span)
         {
             // Static fields inside class body (before closing `}`)
             if !property_assignments.is_empty() {
@@ -4960,16 +5079,48 @@ pub fn transform_angular_file(
                 ));
             }
 
-            // Constants/child views before the class
+            // Constants/child views after the imports
             if !decls_before_class.is_empty() {
-                edits.push(Edit::insert(*effective_start, format!("{}\n", decls_before_class)));
+                decls_after_imports.push_str(decls_before_class);
+                decls_after_imports.push('\n');
             }
 
             // Debug info/class metadata/HMR after the class
-            if !decls_after_class.is_empty() {
+            if !decls_after_class.is_empty() && !namespace_compiled.contains(class_span) {
                 edits.push(Edit::insert(*class_body_end, format!("\n{}", decls_after_class)));
             }
         }
+    }
+    if !decls_after_imports.is_empty() {
+        // ngtsc moves the imports above the rest of the file. Imports load
+        // before the module body runs anyway, so a statement ahead of the
+        // last import only needs the declarations before it.
+        // A decorator a class keeps comes before `export`, outside the
+        // statement's span.
+        let first_statement = parser_ret
+            .program
+            .body
+            .iter()
+            .find(|stmt| !matches!(stmt, Statement::ImportDeclaration(_)))
+            .map(|stmt| {
+                let class = match stmt {
+                    Statement::ClassDeclaration(class) => Some(&**class),
+                    Statement::ExportDeclaration(export) => match &export.declaration {
+                        Declaration::ClassDeclaration(class) => Some(&**class),
+                        _ => None,
+                    },
+                    Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+                        ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(&**class),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                class
+                    .and_then(|class| class.decorators.first())
+                    .map_or(stmt.span().start, |first| first.span.start.min(stmt.span().start))
+            });
+        let start = first_statement.map_or(after_imports, |start| start.min(after_imports));
+        edits.push(Edit::insert(start, decls_after_imports));
     }
 
     // 5e. TDZ-safe hoisting of top-level bindings referenced by decorator
@@ -5226,22 +5377,13 @@ pub fn extract_component_resource_urls(
     let string_consts = with_imported_values(string_consts, analyzer.as_ref(), path, options);
 
     let mut urls = ComponentResourceUrls::default();
-    for stmt in &program.body {
-        let class = match stmt {
-            Statement::ClassDeclaration(class) => class.as_ref(),
-            Statement::ExportDefaultDeclaration(export) => match &export.declaration {
-                ExportDefaultDeclarationKind::ClassDeclaration(class) => class.as_ref(),
-                _ => continue,
-            },
-            Statement::ExportDeclaration(export) => match &export.declaration {
-                Declaration::ClassDeclaration(class) => class.as_ref(),
-                _ => continue,
-            },
-            _ => continue,
-        };
-        let Some((template_url, style_urls)) =
-            super::decorator::extract_component_resource_urls_of(allocator, class, &string_consts)
-        else {
+    // Nested classes too: the transform compiles those.
+    for declared in crate::util::declared_classes(program) {
+        let Some((template_url, style_urls)) = super::decorator::extract_component_resource_urls_of(
+            allocator,
+            declared.class,
+            &string_consts,
+        ) else {
             continue;
         };
         if let Some(template_url) = template_url {
@@ -5402,20 +5544,17 @@ pub fn compile_component_hmr_update(
     let source_matches = input.source_fingerprint.is_none_or(|expected| expected == fingerprint);
     update.fingerprint = Some(fingerprint);
 
-    let Some(class) = program.body.iter().find_map(|stmt| {
-        let class = match stmt {
-            Statement::ClassDeclaration(class) => class.as_ref(),
-            Statement::ExportDefaultDeclaration(export) => match &export.declaration {
-                ExportDefaultDeclarationKind::ClassDeclaration(class) => class.as_ref(),
-                _ => return None,
-            },
-            Statement::ExportDeclaration(export) => match &export.declaration {
-                Declaration::ClassDeclaration(class) => class.as_ref(),
-                _ => return None,
-            },
-            _ => return None,
-        };
-        class.id.as_ref().is_some_and(|id| id.name == class_name).then_some(class)
+    // A nested class too: the transform compiles those, with an HMR
+    // initializer like ngtsc's, unless another class has its name or it is a
+    // `namespace` member.
+    let declared_classes = crate::util::declared_classes(program);
+    if ambiguous_class_names(&declared_classes).contains(class_name) {
+        return update;
+    }
+    let Some(class) = declared_classes.into_iter().find_map(|declared| {
+        let class = declared.class;
+        (declared.namespace.is_none() && class.id.as_ref().is_some_and(|id| id.name == class_name))
+            .then_some(class)
     }) else {
         return update;
     };
@@ -5534,6 +5673,7 @@ fn compile_component_partial<'a>(
     metadata: &ComponentMetadata<'a>,
     view_queries: &[R3QueryMetadata<'a>],
     content_queries: &[R3QueryMetadata<'a>],
+    defer_block_dependencies: &[Option<OutputExpression<'a>>],
     pool_starting_index: u32,
     namespace_registry: &mut NamespaceRegistry<'a>,
 ) -> FullCompilationResult<'a> {
@@ -5542,6 +5682,7 @@ fn compile_component_partial<'a>(
         is_inline: metadata.template.is_some(),
         content_queries,
         view_queries,
+        defer_block_dependencies,
     };
     let cmp_expr = crate::partial::compile_declare_component_from_metadata(
         allocator,
@@ -5670,10 +5811,64 @@ fn html_parse_error_diagnostic(
     }
 }
 
-/// The selector of the standalone component or directive an `imports`
-/// entry refers to, by local name, and whether a named import brings it in,
-/// which `@defer` may then replace with a dynamic `import()`.
-type ImportSelector<'f> = &'f dyn Fn(&str) -> Option<(String, bool)>;
+/// The standalone component or directive a class an `imports` entry names
+/// refers to (see [`ImportedClass`]).
+type ImportSelector<'f> = &'f dyn Fn(&ImportRef<'_>) -> Option<ImportedClass>;
+
+/// What `@defer` reads of the standalone component or directive an `imports`
+/// entry refers to.
+struct ImportedClass {
+    class_use: super::defer_resolver::ClassUse,
+    /// Whether a named import brings it in, which `@defer` may then replace
+    /// with a dynamic `import()`.
+    is_imported: bool,
+    /// The file that declares the class (empty for this file) and its name
+    /// there: two references to one class are listed once.
+    declaration: (String, String),
+}
+
+/// The module and the name of the export an imported `imports` entry reads:
+/// `Cmp` of `import { Cmp }` and `ns.Cmp` of `import * as ns` read the same
+/// one from the same module.
+fn imported_export<'a>(
+    import_map: &ImportMap<'a>,
+    import: &ImportRef<'a>,
+) -> Option<(Ident<'a>, Ident<'a>)> {
+    let info = import_map.get(&import.namespace.unwrap_or(import.name))?;
+    if info.is_type_only {
+        return None;
+    }
+    match import.namespace {
+        Some(_) if !info.is_named_import => Some((info.source_module, import.name)),
+        None if info.is_named_import => {
+            Some((info.source_module, info.imported_name.unwrap_or(import.name)))
+        }
+        _ => None,
+    }
+}
+
+/// The [`ImportedClass`] a class of the file being compiled is.
+fn local_class<'p>(
+    program: &'p oxc_ast::ast::Program<'p>,
+    consts: &crate::directive::StringConsts<'p>,
+    import: &ImportRef<'_>,
+    implicit_standalone: bool,
+) -> Option<ImportedClass> {
+    if import.namespace.is_some() {
+        return None;
+    }
+    let class_use = super::defer_resolver::local_standalone_class_selector(
+        program,
+        consts,
+        &import.name,
+        implicit_standalone,
+    )?;
+    Some(ImportedClass {
+        class_use,
+        is_imported: false,
+        declaration: (String::new(), import.name.to_string()),
+    })
+}
 
 /// ngc's `DeferredSymbolTracker.canDefer` for the import declaration that
 /// binds a name, given the `imports` entries the component being compiled
@@ -5684,7 +5879,7 @@ type CanDefer<'f> = &'f dyn Fn(&str, &[Ident<'_>]) -> bool;
 /// `resolveDeferBlocks` finds it.
 struct DeferCandidates<'a> {
     /// Each `imports` class with a known selector.
-    candidates: std::vec::Vec<(Ident<'a>, std::vec::Vec<crate::pipeline::selector::CssSelector>)>,
+    candidates: std::vec::Vec<super::defer_resolver::Candidate<'a>>,
     /// The candidates the template matches only inside `@defer` blocks.
     block_only: std::vec::Vec<Ident<'a>>,
     /// The `imports` entries naming a `block_only` candidate a named import
@@ -5694,39 +5889,52 @@ struct DeferCandidates<'a> {
 }
 
 /// The [`DeferCandidates`] of a component, or `None` when its template has
-/// no `@defer` block or an `imports` entry can't be read.
+/// no `@defer` block or its `imports` names no class. Only an entry of an
+/// `imports` array literal can be marked: one that doesn't name a class (a
+/// spread, a nested array, `ns.Cmp`) is never marked, as ngc's
+/// `registerDeferrableCandidate` skips anything but an identifier, and the
+/// classes it brings in stay eager, like the classes of a `const` array
+/// (`imports: IMPORTS`).
 fn implicit_defer_candidates<'a>(
     metadata: &ComponentMetadata<'a>,
     nodes: &[crate::ast::r3::R3Node<'a>],
     import_selector: ImportSelector<'_>,
 ) -> Option<DeferCandidates<'a>> {
-    let Some(OutputExpression::LiteralArray(raw_imports)) = &metadata.raw_imports else {
-        return None;
-    };
-    if raw_imports.entries.len() != metadata.import_entry_classes.len()
-        || !raw_imports
-            .entries
-            .iter()
-            .zip(&metadata.import_entry_classes)
-            .all(|(entry, class)| class.is_some() || matches!(entry, OutputExpression::ReadVar(_)))
-        || !super::defer_resolver::template_has_defer_block(nodes)
+    if let Some(OutputExpression::LiteralArray(raw_imports)) = &metadata.raw_imports
+        && raw_imports.entries.len() != metadata.import_entry_classes.len()
     {
         return None;
     }
+    if metadata.import_refs.is_empty() || !super::defer_resolver::template_has_defer_block(nodes) {
+        return None;
+    }
     let mut imported = std::vec::Vec::new();
-    let candidates: std::vec::Vec<_> = metadata
-        .import_entry_classes
-        .iter()
-        .flatten()
-        .map(|(name, _)| *name)
-        .filter_map(|name| {
-            let (selector, is_imported) = import_selector(name.as_str())?;
-            if is_imported {
-                imported.push(name);
+    // Each class is listed once, where `imports` first names it, as ngc's
+    // scope does; an identifier naming it may still lazy-load it.
+    let mut candidates: std::vec::Vec<super::defer_resolver::Candidate<'a>> = std::vec::Vec::new();
+    let mut declarations = std::vec::Vec::new();
+    for import in &metadata.import_refs {
+        let Some(class) = import_selector(import) else { continue };
+        if class.is_imported {
+            imported.push(import.key);
+        }
+        if let Some(index) =
+            declarations.iter().position(|declaration| *declaration == class.declaration)
+        {
+            if class.is_imported && !imported.contains(&candidates[index].0) {
+                candidates[index].0 = import.key;
             }
-            Some((name, crate::pipeline::selector::CssSelector::parse(&selector)))
-        })
-        .collect();
+        } else {
+            declarations.push(class.declaration);
+            candidates
+                .push((import.key, super::defer_resolver::CandidateUse::of(&class.class_use)));
+        }
+    }
+    // ngc's declarations list the pipes after the directives
+    // (`componentDependenciesToDeclarations`).
+    candidates.sort_by_key(|(_, class_use)| {
+        matches!(class_use, super::defer_resolver::CandidateUse::Pipe(_))
+    });
     let block_only = super::defer_resolver::implicitly_deferred_imports(nodes, &candidates);
     let marked = metadata
         .import_entry_classes
@@ -5738,21 +5946,24 @@ fn implicit_defer_candidates<'a>(
     Some(DeferCandidates { candidates, block_only, marked })
 }
 
-/// The class a top-level statement declares, exported or not.
-#[cfg(feature = "cross_file_elision")]
-fn statement_class<'a>(stmt: &'a Statement<'a>) -> Option<&'a oxc_ast::ast::Class<'a>> {
-    match stmt {
-        Statement::ClassDeclaration(class) => Some(class),
-        Statement::ExportDefaultDeclaration(export) => match &export.declaration {
-            ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(class),
-            _ => None,
-        },
-        Statement::ExportDeclaration(export) => match &export.declaration {
-            Declaration::ClassDeclaration(class) => Some(class),
-            _ => None,
-        },
-        _ => None,
+/// The class names two or more classes of the file declare (in different
+/// functions or blocks). A `namespace` member never gets HMR code, so it
+/// does not count.
+pub(super) fn ambiguous_class_names<'a>(
+    declared_classes: &[crate::util::DeclaredClass<'_, 'a>],
+) -> rustc_hash::FxHashSet<&'a str> {
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut ambiguous = rustc_hash::FxHashSet::default();
+    for name in declared_classes
+        .iter()
+        .filter(|declared| declared.namespace.is_none())
+        .filter_map(|declared| declared.class.id.as_ref())
+    {
+        if !seen.insert(name.name.as_str()) {
+            ambiguous.insert(name.name.as_str());
+        }
     }
+    ambiguous
 }
 
 /// The `imports` entries another component of the file marks as deferrable
@@ -5826,6 +6037,98 @@ fn component_deferrable_marks<'a>(
     }
     implicit_defer_candidates(&metadata, &r3_result.nodes, import_selector)
         .map_or_else(std::vec::Vec::new, |candidates| candidates.marked)
+}
+
+/// What each `@defer` block uses, with the block's span.
+type DeferBlockDependencies<'a> = std::vec::Vec<(Span, std::vec::Vec<Ident<'a>>)>;
+
+/// Moves the `imports` entries a component's template matches only inside
+/// `@defer` blocks out of its eager dependencies, as ngc does in both its full
+/// and partial compilations (#313). Returns what each block uses, keyed by the
+/// block's span, when the blocks get their own dependency functions, and the
+/// names now lazy-loaded, which join `metadata.deferred_imports`. Needs
+/// cross-file analysis for the selectors; skipped under HMR, like ngc.
+fn resolve_implicit_defer<'a>(
+    metadata: &mut ComponentMetadata<'a>,
+    nodes: &[crate::ast::r3::R3Node<'a>],
+    options: &TransformOptions,
+    import_selector: Option<ImportSelector<'_>>,
+    can_defer: Option<CanDefer<'_>>,
+) -> (Option<DeferBlockDependencies<'a>>, Vec<String>) {
+    let mut implicitly_deferred_imports = Vec::new();
+    // What each `@defer` block uses, keyed by the block's span, when its own
+    // dependency function can be built (see below).
+    let mut defer_block_dependencies = None;
+    if let Some(import_selector) = import_selector
+        && let Some(can_defer) = can_defer
+        && !options.hmr
+        && let Some(DeferCandidates { candidates, block_only, marked }) =
+            implicit_defer_candidates(metadata, nodes, import_selector)
+    {
+        // ngc's `DeferredSymbolTracker.canDefer`, over the whole file: the
+        // `imports` entries this component marks are handed over with the
+        // name, and the ones other components mark are counted there. A
+        // class two entries name is listed once (`seenDeps` in
+        // `resolveAllDeferredDependencies`).
+        let mut deferred = std::vec::Vec::new();
+        for &name in &block_only {
+            if !deferred.contains(&name) && marked.contains(&name) && can_defer(&name, &marked) {
+                deferred.push(name);
+            }
+        }
+        // ngc's full compilation gives each `@defer` block its own dependency
+        // function (`DeferBlockDepsEmitMode.PerBlock`) listing what the
+        // block's main content uses: a dynamic `import()` for a lazy
+        // dependency and a plain reference for an eager one
+        // (`resolveDeferBlocks` and `compileDeferBlocks` in its component
+        // `handler.ts`). An `imports` entry whose selector is unknown is left
+        // out; it stays eager, and `dependencies` already provides it to the
+        // block. An explicit `deferredImports` keeps the shared function: its
+        // selectors aren't read.
+        if metadata.deferred_imports.is_empty() && !options.jit {
+            defer_block_dependencies =
+                super::defer_resolver::defer_block_dependencies(nodes, &candidates);
+        }
+        if let Some(blocks) = &defer_block_dependencies {
+            // `resolveAllDeferredDependencies` lists the lazy dependencies of
+            // `setClassMetadataAsync` block by block.
+            deferred.sort_by_key(|name| {
+                blocks.iter().flat_map(|(_, dependencies)| dependencies).position(|d| d == name)
+            });
+        }
+        // `dependencies` lists only what the template uses eagerly
+        // (`handleDependencyCycles` in ngc's component `handler.ts`). With a
+        // dependency function per block, an entry used only inside `@defer`
+        // blocks leaves it even when it can't be lazy-loaded: the blocks'
+        // functions provide it. Otherwise only the deferred entries leave.
+        let removed = if defer_block_dependencies.is_some() { &block_only } else { &deferred };
+        if !removed.is_empty() {
+            let is_removed = |name: &str| removed.iter().any(|d| d.as_str() == name);
+            metadata.imports.retain(|name| !is_removed(name.as_str()));
+            metadata.import_refs.retain(|import| !is_removed(import.key.as_str()));
+            if let Some(OutputExpression::LiteralArray(raw_imports)) = &mut metadata.raw_imports {
+                let mut classes = metadata.import_entry_classes.iter();
+                raw_imports.entries.retain(|_| {
+                    !classes.next().copied().flatten().is_some_and(|(name, _)| is_removed(&name))
+                });
+                // Nothing left to resolve at runtime: like a standalone
+                // component without `imports`, it gets no `dependencies`.
+                if raw_imports.entries.is_empty()
+                    && defer_block_dependencies.is_some()
+                    && metadata.standalone
+                {
+                    metadata.raw_imports = None;
+                    metadata.declaration_list_emit_mode =
+                        super::metadata::DeclarationListEmitMode::Direct;
+                }
+            }
+        }
+        if !deferred.is_empty() {
+            implicitly_deferred_imports = deferred.iter().map(ToString::to_string).collect();
+            metadata.deferred_imports.extend(deferred);
+        }
+    }
+    (defer_block_dependencies, implicitly_deferred_imports)
 }
 
 fn compile_component_full<'a>(
@@ -5915,18 +6218,69 @@ fn compile_component_full<'a>(
     // Partial mode stops here. Its declaration carries the template as a
     // verbatim string for the linker to compile at consumer build time, but
     // ngtsc still parses it first: its template errors are reported and
-    // `compilePartial` emits nothing for the class (handler.ts).
+    // `compilePartial` emits nothing for the class (handler.ts). Its `@defer`
+    // blocks are resolved as in a full compilation, and the declaration
+    // carries their dependency functions (`deferBlockDependencies`).
     if matches!(options.compilation_mode, crate::CompilationMode::Partial) {
-        return Ok(compile_component_partial(
+        // Read before `resolve_implicit_defer` leaves out what `@defer` provides.
+        let import_refs: std::vec::Vec<_> = metadata.import_refs.iter().copied().collect();
+        let (defer_block_dependencies, implicitly_deferred_imports) =
+            resolve_implicit_defer(metadata, &r3_result.nodes, options, import_selector, can_defer);
+        // `dependencies` lists each class once, like ngc's scope, which
+        // `[Cmp, ns.Cmp]` would otherwise give twice, and leaves out a class
+        // `@defer` lazy-loads however else `imports` names it. Two names are
+        // one class when they read one export of one module, or when
+        // cross-file analysis finds one declaration.
+        if let Some(import_selector) = import_selector
+            && metadata.import_refs.iter().any(|import| import.namespace.is_some())
+        {
+            let class_of = |import: &ImportRef<'a>| {
+                (
+                    import_selector(import).map(|class| class.declaration),
+                    imported_export(import_map, import),
+                )
+            };
+            let mut seen: std::vec::Vec<_> = import_refs
+                .iter()
+                .filter(|import| !metadata.import_refs.iter().any(|kept| kept.key == import.key))
+                .map(class_of)
+                .collect();
+            metadata.import_refs.retain(|import| {
+                let (declaration, export) = class_of(import);
+                let is_seen = seen.iter().any(|(seen_declaration, seen_export)| {
+                    (declaration.is_some() && *seen_declaration == declaration)
+                        || (export.is_some() && *seen_export == export)
+                });
+                seen.push((declaration, export));
+                !is_seen
+            });
+        }
+        let defer_block_dependencies: std::vec::Vec<_> = defer_block_dependencies
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, dependencies)| {
+                super::defer_resolver::compile_defer_block_resolver(
+                    allocator,
+                    &dependencies,
+                    &metadata.deferred_imports,
+                    &import_refs,
+                    import_map,
+                )
+            })
+            .collect();
+        let mut result = compile_component_partial(
             allocator,
             namespace_registry.angular_core_ns().as_str(),
             template,
             metadata,
             &view_queries,
             &content_queries,
+            &defer_block_dependencies,
             pool_starting_index,
             namespace_registry,
-        ));
+        );
+        result.implicitly_deferred_imports = implicitly_deferred_imports;
+        return Ok(result);
     }
 
     // Capture ng-content selectors from the R3 AST for .d.ts generation
@@ -6013,80 +6367,10 @@ fn compile_component_full<'a>(
     }
 
     // `imports` entries matched only inside `@defer` are lazy-loaded, as in
-    // ngc's full compilation (#313). Needs cross-file analysis for the
-    // selectors; skipped under HMR, like ngc.
-    let mut implicitly_deferred_imports = Vec::new();
-    // What each `@defer` block uses, keyed by the block's span, when its own
-    // dependency function can be built (see below).
-    let mut defer_block_dependencies = None;
-    if let Some(import_selector) = import_selector
-        && let Some(can_defer) = can_defer
-        && !options.hmr
-        && let Some(DeferCandidates { candidates, block_only, marked }) =
-            implicit_defer_candidates(metadata, &r3_result.nodes, import_selector)
-    {
-        // ngc's `DeferredSymbolTracker.canDefer`, over the whole file: the
-        // `imports` entries this component marks are handed over with the
-        // name, and the ones other components mark are counted there. A
-        // class two entries name is listed once (`seenDeps` in
-        // `resolveAllDeferredDependencies`).
-        let mut deferred = std::vec::Vec::new();
-        for &name in &block_only {
-            if !deferred.contains(&name) && marked.contains(&name) && can_defer(&name, &marked) {
-                deferred.push(name);
-            }
-        }
-        // ngc's full compilation gives each `@defer` block its own dependency
-        // function (`DeferBlockDepsEmitMode.PerBlock`) listing what the
-        // block's main content uses: a dynamic `import()` for a lazy
-        // dependency and a plain reference for an eager one
-        // (`resolveDeferBlocks` and `compileDeferBlocks` in its component
-        // `handler.ts`). An `imports` entry whose selector is unknown is left
-        // out; it stays eager, and `dependencies` already provides it to the
-        // block. An explicit `deferredImports` keeps the shared function: its
-        // selectors aren't read.
-        if metadata.deferred_imports.is_empty() && !options.jit {
-            defer_block_dependencies =
-                super::defer_resolver::defer_block_dependencies(&r3_result.nodes, &candidates);
-        }
-        if let Some(blocks) = &defer_block_dependencies {
-            // `resolveAllDeferredDependencies` lists the lazy dependencies of
-            // `setClassMetadataAsync` block by block.
-            deferred.sort_by_key(|name| {
-                blocks.iter().flat_map(|(_, dependencies)| dependencies).position(|d| d == name)
-            });
-        }
-        // `dependencies` lists only what the template uses eagerly
-        // (`handleDependencyCycles` in ngc's component `handler.ts`). With a
-        // dependency function per block, an entry used only inside `@defer`
-        // blocks leaves it even when it can't be lazy-loaded: the blocks'
-        // functions provide it. Otherwise only the deferred entries leave.
-        let removed = if defer_block_dependencies.is_some() { &block_only } else { &deferred };
-        if !removed.is_empty() {
-            let is_removed = |name: &str| removed.iter().any(|d| d.as_str() == name);
-            metadata.imports.retain(|name| !is_removed(name.as_str()));
-            if let Some(OutputExpression::LiteralArray(raw_imports)) = &mut metadata.raw_imports {
-                let mut classes = metadata.import_entry_classes.iter();
-                raw_imports.entries.retain(|_| {
-                    !classes.next().copied().flatten().is_some_and(|(name, _)| is_removed(&name))
-                });
-                // Nothing left to resolve at runtime: like a standalone
-                // component without `imports`, it gets no `dependencies`.
-                if raw_imports.entries.is_empty()
-                    && defer_block_dependencies.is_some()
-                    && metadata.standalone
-                {
-                    metadata.raw_imports = None;
-                    metadata.declaration_list_emit_mode =
-                        super::metadata::DeclarationListEmitMode::Direct;
-                }
-            }
-        }
-        if !deferred.is_empty() {
-            implicitly_deferred_imports = deferred.iter().map(ToString::to_string).collect();
-            metadata.deferred_imports.extend(deferred);
-        }
-    }
+    // ngc's full compilation (#313).
+    let import_refs: std::vec::Vec<_> = metadata.import_refs.iter().copied().collect();
+    let (defer_block_dependencies, implicitly_deferred_imports) =
+        resolve_implicit_defer(metadata, &r3_result.nodes, options, import_selector, can_defer);
 
     // Build the deferrable-dependencies resolver from
     // `@Component.deferredImports`.
@@ -6174,7 +6458,7 @@ fn compile_component_full<'a>(
                     allocator,
                     &dependencies,
                     &metadata.deferred_imports,
-                    &metadata.import_entry_classes,
+                    &import_refs,
                     import_map,
                 );
                 (span, deps_fn)
@@ -6428,7 +6712,7 @@ fn compile_component_full<'a>(
 
         // The 1-indexed line of the `class` keyword (ngtsc uses `clazz.name.pos`,
         // which sits right after it), with TypeScript's line-break rules.
-        let class_line_number = line_number_at(source, metadata.class_span.start as usize);
+        let class_line_number = line_number_at(source, metadata.class_name_pos as usize);
 
         // Build the debug info with the actual class declaration line number
         let debug_info = R3ClassDebugInfo::new(component_type, metadata.class_name.clone())
@@ -6553,17 +6837,18 @@ fn cmp_definition_has_inline_long_style(cmp_definition: &OutputExpression<'_>) -
 }
 
 /// Points the earlier component's inline first use of a long style that a
-/// later component shared at the shared constant, and declares it before that
-/// component, like the `FixupExpression` ngtsc's single file pool resolves.
+/// later component shared at the shared constant, like the `FixupExpression`
+/// ngtsc's single file pool resolves. The constant is declared with the
+/// current component's declarations, where ngtsc pools it: all of them go
+/// after the imports, before the earlier component.
 ///
 /// `inline_style_cmps` holds the components whose ɵcmp has a long style inline,
-/// with the ɵcmp text in their `class_definitions` entry. Without one (that
-/// component failed to compile), the constant goes before the current class.
+/// with the ɵcmp text in their `class_definitions` entry.
 fn apply_inherited_fixups<'a>(
     allocator: &'a Allocator,
     fixups: Vec<InheritedFixup<'a>>,
-    inline_style_cmps: &mut [(String, OutputExpression<'a>, String)],
-    class_definitions: &mut HashMap<String, (String, String, String)>,
+    inline_style_cmps: &mut [(Span, OutputExpression<'a>, String)],
+    class_definitions: &mut HashMap<Span, (String, String, String)>,
     current_declarations_js: &mut String,
 ) {
     let emitter = JsEmitter::new();
@@ -6579,7 +6864,7 @@ fn apply_inherited_fixups<'a>(
                 },
                 &allocator,
             )));
-        let first_use = inline_style_cmps.iter_mut().find_map(|(class_name, cmp, cmp_js)| {
+        let first_use = inline_style_cmps.iter_mut().find_map(|(class_span, cmp, cmp_js)| {
             let Some(OutputExpression::LiteralArray(styles)) =
                 cmp_definition_field_mut(cmp, "styles")
             else {
@@ -6591,20 +6876,17 @@ fn apply_inherited_fixups<'a>(
                 ReadVarExpr { name: fixup.name, source_span: None },
                 &allocator,
             ));
-            Some((class_name, emitter.emit_expression(cmp), cmp_js))
+            Some((class_span, emitter.emit_expression(cmp), cmp_js))
         });
-        let first_use = first_use.and_then(|(class_name, new_cmp_js, cmp_js)| {
-            Some((class_definitions.get_mut(class_name.as_str())?, new_cmp_js, cmp_js))
+        let first_use = first_use.and_then(|(class_span, new_cmp_js, cmp_js)| {
+            Some((class_definitions.get_mut(class_span)?, new_cmp_js, cmp_js))
         });
-        let Some(((property_assignments, decls_before_class, _), new_cmp_js, cmp_js)) = first_use
-        else {
-            current_declarations_js.push_str(&declaration);
-            current_declarations_js.push('\n');
+        current_declarations_js.push_str(&declaration);
+        current_declarations_js.push('\n');
+        let Some(((property_assignments, ..), new_cmp_js, cmp_js)) = first_use else {
             continue;
         };
         *property_assignments = property_assignments.replacen(cmp_js.as_str(), &new_cmp_js, 1);
-        decls_before_class.push_str(&declaration);
-        decls_before_class.push('\n');
         *cmp_js = new_cmp_js;
     }
 }
@@ -6721,10 +7003,11 @@ pub fn compile_component_template<'a>(
     }
 
     // Stage 1.5: Remove whitespace if not preserving (default behavior)
+    let untrimmed: &'a [crate::ast::html::HtmlNode<'a>] = allocator.alloc(html_result.nodes);
     let nodes = if parse_options.preserve_whitespaces {
-        &html_result.nodes
+        untrimmed
     } else {
-        let processed = remove_whitespaces(allocator, &html_result.nodes, true);
+        let processed = remove_whitespaces(allocator, untrimmed, true);
         allocator.alloc(processed) as &_
     };
 
@@ -6734,7 +7017,8 @@ pub fn compile_component_template<'a>(
         angular_version: None,
         ..R3TransformOptions::default()
     };
-    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options);
+    let transformer = HtmlToR3Transform::new(allocator, template, r3_transform_options)
+        .with_untrimmed_nodes(untrimmed);
     let r3_result = transformer.transform(nodes);
 
     if !r3_result.errors.is_empty() {
@@ -6889,6 +7173,29 @@ pub fn compile_template_to_js_with_options<'a>(
         ingest_options,
     );
 
+    // Compile the host bindings before the template, as
+    // `compile_component_full` does (Angular's `compileComponentFromMetadata`
+    // runs `baseDirectiveFields` first, with one pool): their constants come
+    // first, and the template reuses equal ones.
+    let mut component_pool = job.pool.take_shared();
+    let host_output = options.host.as_ref().and_then(|host_input| {
+        compile_host_bindings_from_input(
+            allocator,
+            crate::r3::CORE_ALIAS,
+            host_input,
+            component_name,
+            options.selector.as_deref(),
+            job.pool.next_name_index(),
+            &mut component_pool,
+            options.angular_version,
+            options.legacy_optional_chaining,
+        )
+    });
+    job.pool.inherit_shared(component_pool);
+    if let Some((_, next_pool_index)) = &host_output {
+        job.pool.continue_from(*next_pool_index);
+    }
+
     let compiled = compile_template(&mut job);
 
     // Collect any diagnostics from the compilation job
@@ -6905,6 +7212,14 @@ pub fn compile_template_to_js_with_options<'a>(
     // 1. Declarations (child view functions, pooled constants)
     // 2. Main template function as a declaration
     let mut all_statements: OxcVec<'a, OutputStatement<'a>> = OxcVec::new_in(&allocator);
+
+    // The host bindings' pool declarations (pure functions, etc.) come first,
+    // as they were pooled first.
+    let mut host_fn = None;
+    if let Some((host_result, _)) = host_output {
+        all_statements.extend(host_result.declarations);
+        host_fn = host_result.host_binding_fn;
+    }
 
     // Add all declarations first (child view functions come before main template)
     for decl in compiled.declarations {
@@ -6927,43 +7242,21 @@ pub fn compile_template_to_js_with_options<'a>(
         all_statements.push(main_fn_stmt);
     }
 
-    // Stage 6: Compile host bindings if provided via options
-    let host_pool_starting_index = job.pool.next_name_index();
-    if let Some(ref host_input) = options.host {
-        if let Some((host_result, _)) = compile_host_bindings_from_input(
+    // Add the host bindings function as a declaration if present
+    if let Some(host_fn) = host_fn
+        && let Some(fn_name) = host_fn.name
+    {
+        let host_fn_stmt = OutputStatement::DeclareFunction(oxc_allocator::Box::new_in(
+            DeclareFunctionStmt {
+                name: fn_name,
+                params: host_fn.params,
+                statements: host_fn.statements,
+                modifiers: StmtModifier::NONE,
+                source_span: host_fn.source_span,
+            },
             &allocator,
-            crate::r3::CORE_ALIAS,
-            host_input,
-            component_name,
-            options.selector.as_deref(),
-            host_pool_starting_index,
-            &mut job.pool.take_shared(),
-            options.angular_version,
-            options.legacy_optional_chaining,
-        ) {
-            // Add host binding pool declarations (pure functions, etc.)
-            for decl in host_result.declarations {
-                all_statements.push(decl);
-            }
-
-            // Add the host bindings function as a declaration if present
-            if let Some(host_fn) = host_result.host_binding_fn {
-                if let Some(fn_name) = host_fn.name.clone() {
-                    let host_fn_stmt =
-                        OutputStatement::DeclareFunction(oxc_allocator::Box::new_in(
-                            DeclareFunctionStmt {
-                                name: fn_name,
-                                params: host_fn.params,
-                                statements: host_fn.statements,
-                                modifiers: StmtModifier::NONE,
-                                source_span: host_fn.source_span,
-                            },
-                            &allocator,
-                        ));
-                    all_statements.push(host_fn_stmt);
-                }
-            }
-        }
+        ));
+        all_statements.push(host_fn_stmt);
     }
 
     // Generate code with optional source map
@@ -7646,6 +7939,10 @@ fn compile_host_bindings_from_input<'a>(
     );
     job.core_namespace = Ident::from(core_namespace);
     job.pool.inherit_shared(std::mem::take(shared_pool));
+    // Unique in the pool, like the template functions: the linker shares it
+    // across the declarations of a scope (Angular's `addNamesToView`)
+    let fn_name = format!("{component_name}_{}", job.fn_suffix);
+    job.root.fn_name = Some(job.pool.unique_name(&fn_name, false));
     let result = compile_host_bindings(&mut job);
     *shared_pool = job.pool.take_shared();
 
@@ -7723,12 +8020,16 @@ pub fn compile_host_bindings_for_linker<'a>(
 /// from `ɵɵngDeclareComponent` partial declarations.
 #[derive(Debug)]
 pub struct LinkerTemplateOutput {
-    /// All declarations (child view functions, pooled constants, main template function)
-    /// as JavaScript code. These need to be emitted before the `defineComponent` call.
+    /// The declarations (child view functions, pooled constants) as JavaScript code.
+    /// These need to be emitted before the `defineComponent` call.
     pub declarations_js: String,
 
-    /// The name of the main template function (e.g., "ComponentName_Template").
-    pub template_fn_name: String,
+    /// The main template function as a JavaScript expression
+    /// (`function ComponentName_Template(rf, ctx) { ... }`).
+    pub template_fn_js: String,
+
+    /// The next available pool index after template compilation.
+    pub next_pool_index: u32,
 
     /// Number of element/text/container declarations in the root view.
     pub decls: u32,
@@ -7751,7 +8052,12 @@ pub struct LinkerTemplateOutput {
 ///
 /// Angular's `compileComponentFromMetadata` compiles the host bindings first, so the
 /// template's pool continues from `pool_starting_index` and reuses what the host bindings
-/// pooled, from `shared_pool` (see [`compile_host_bindings_for_linker`]).
+/// (and the earlier declarations of the scope) pooled, from `shared_pool` (see
+/// [`compile_host_bindings_for_linker`]), which gets what the template pools.
+///
+/// `has_directive_dependencies` is Angular's linker's `!isStandalone` or a directive,
+/// component or NgModule dependency. A `@defer` block with a dependency function counts too,
+/// and without any the template is compiled in DomOnly mode.
 pub fn compile_template_for_linker<'a>(
     allocator: &'a Allocator,
     template: &'a str,
@@ -7761,8 +8067,9 @@ pub fn compile_template_for_linker<'a>(
     core_namespace: &str,
     angular_version: Option<crate::AngularVersion>,
     defer_block_deps: &[Option<&str>],
+    has_directive_dependencies: bool,
     pool_starting_index: u32,
-    shared_pool: SharedPool<'a>,
+    shared_pool: &mut SharedPool<'a>,
 ) -> Result<LinkerTemplateOutput, std::vec::Vec<OxcDiagnostic>> {
     use crate::pipeline::ingest::{IngestOptions, ingest_component_with_options};
     use oxc_allocator::FromIn;
@@ -7827,13 +8134,23 @@ pub fn compile_template_for_linker<'a>(
             });
             (span, deps_fn)
         })
-        .collect();
+        .collect::<FxHashMap<_, _>>();
+    let mode = if has_directive_dependencies
+        || defer_blocks.values().any(Option::is_some)
+        || angular_version.is_some_and(|v| !v.supports_dom_only_templates())
+    {
+        TemplateCompilationMode::Full
+    } else {
+        TemplateCompilationMode::DomOnly
+    };
 
     // Stage 3-5: Ingest and compile
     let ingest_options = IngestOptions {
-        mode: TemplateCompilationMode::Full,
-        relative_context_file_path: None,
-        i18n_use_external_ids: true,
+        mode,
+        // Angular's linker names Closure messages after the file it links
+        // (`MSG__X_MAIN_JS_0` for `/x/main.js`), never after their ids.
+        relative_context_file_path: Some(Ident::from_in(file_path, allocator)),
+        i18n_use_external_ids: false,
         defer_block_deps_emit_mode: DeferBlockDepsEmitMode::PerBlock,
         relative_template_path: None,
         enable_debug_locations: false,
@@ -7856,9 +8173,12 @@ pub fn compile_template_for_linker<'a>(
         ingest_options,
     );
     job.core_namespace = Ident::from_in(core_namespace, &allocator);
-    job.pool.inherit_shared(shared_pool);
+    // The caller drops what a failed template pooled.
+    job.pool.inherit_shared(std::mem::take(shared_pool));
 
     let compiled = compile_template(&mut job);
+    *shared_pool = job.pool.take_shared();
+    let next_pool_index = job.pool.next_name_index();
 
     // Collect diagnostics
     diagnostics.extend(job.diagnostics.into_iter());
@@ -7928,40 +8248,16 @@ pub fn compile_template_for_linker<'a>(
     let ng_content_selectors_js =
         job.content_selectors.take().map(|expr| emitter.emit_expression(&expr));
 
-    // Get template function name
-    let template_fn_name = compiled
-        .template_fn
-        .name
-        .as_ref()
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| format!("{component_name}_Template"));
-
-    // Emit all declarations + main template function as JS code
-    let mut all_statements: OxcVec<'a, OutputStatement<'a>> = OxcVec::new_in(&allocator);
-
-    for decl in compiled.declarations {
-        all_statements.push(decl);
-    }
-
-    if let Some(fn_name) = compiled.template_fn.name.clone() {
-        let main_fn_stmt = OutputStatement::DeclareFunction(oxc_allocator::Box::new_in(
-            DeclareFunctionStmt {
-                name: fn_name,
-                params: compiled.template_fn.params,
-                statements: compiled.template_fn.statements,
-                modifiers: StmtModifier::NONE,
-                source_span: compiled.template_fn.source_span,
-            },
-            &allocator,
-        ));
-        all_statements.push(main_fn_stmt);
-    }
-
-    let declarations_js = emitter.emit_statements(&all_statements);
+    // The main template function goes inline in the definition, as in Angular's output
+    let template_fn_js = emitter.emit_expression(&OutputExpression::Function(
+        oxc_allocator::Box::new_in(compiled.template_fn, &allocator),
+    ));
+    let declarations_js = emitter.emit_statements(&compiled.declarations);
 
     Ok(LinkerTemplateOutput {
         declarations_js,
-        template_fn_name,
+        template_fn_js,
+        next_pool_index,
         decls,
         vars,
         consts_js,

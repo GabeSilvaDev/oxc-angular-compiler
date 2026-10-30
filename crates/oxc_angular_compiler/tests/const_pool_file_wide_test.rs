@@ -6,7 +6,8 @@
 
 use oxc_allocator::Allocator;
 use oxc_angular_compiler::{
-    CompilationMode, ComponentHmrUpdateInput, TransformOptions, compile_component_hmr_update, link,
+    CompilationMode, ComponentHmrUpdateInput, HostMetadataInput, TransformOptions,
+    compile_component_hmr_update, compile_template_to_js_with_options, link,
     transform_angular_file,
 };
 
@@ -164,6 +165,33 @@ export class Cmp { k = true; }
 }
 
 #[test]
+fn compile_template_pools_host_constants_first() {
+    // As a full compile of the component: the host bindings' `{q: x}` and
+    // `{k: x}` first, the template's `{q: x}` reusing `_c0`, then `{z: x}`.
+    let allocator = Allocator::default();
+    let options = TransformOptions {
+        host: Some(HostMetadataInput {
+            properties: vec![
+                ("[style]".to_string(), "{q: x}".to_string()),
+                ("[class]".to_string(), "{k: x}".to_string()),
+            ],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let template = r#"<i [title]="{q: x}" [id]="{z: x}"></i>"#;
+    let output = compile_template_to_js_with_options(&allocator, template, "A", "a.ts", &options)
+        .expect("compiles");
+    let code = output.code;
+    assert_eq!(constants(&code), ["_c0", "_c1", "_c2"], "{code}");
+    let squashed = squash(&code);
+    assert!(value(&squashed, "_c0").contains("q:a0"), "{code}");
+    assert!(value(&squashed, "_c1").contains("k:a0"), "{code}");
+    assert!(value(&squashed, "_c2").contains("z:a0"), "{code}");
+    assert!(squashed.contains(r#"ɵɵproperty("title",i0.ɵɵpureFunction1(2,_c0,ctx.x))"#), "{code}");
+}
+
+#[test]
 fn hmr_update_declares_the_host_constants_its_template_reads() {
     let source = r#"
 import { Component } from '@angular/core';
@@ -270,4 +298,119 @@ export class B { k = 1; }
         "{code}"
     );
     assert_eq!(squashed.matches(",_c0,ctx.k)").count(), 2, "{code}");
+}
+
+#[test]
+fn i18n_message_names_are_counted_across_the_file() {
+    // ngtsc names messages with `pool.uniqueName`: `B` goes on from `A`'s
+    // `i18n_1` and `..._1`, with external ids as without.
+    let source = r#"
+import { Component } from '@angular/core';
+
+@Component({ selector: 'a-a', template: '<p i18n="@@foo">Hello {{w}}</p><b i18n-title="@@bar" title="T"></b>' })
+export class A { w = 1; }
+
+@Component({ selector: 'b-b', template: '<p i18n="@@baz">Bye</p>' })
+export class B {}
+"#;
+    let names = |use_external_ids: bool| {
+        let allocator = Allocator::default();
+        let options =
+            TransformOptions { i18n_use_external_ids: use_external_ids, ..Default::default() };
+        let result = transform_angular_file(&allocator, "test.ts", source, Some(&options), None);
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        // `(i18n_0=MSG_...)`, the Closure branch's assignments.
+        squash(&result.code)
+            .split("(i18n_")
+            .skip(1)
+            .filter_map(|part| part.split(')').next())
+            .filter(|assignment| assignment.contains("=MSG_"))
+            .map(|assignment| format!("i18n_{assignment}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(true),
+        [
+            "i18n_0=MSG_EXTERNAL_bar$$TEST_TS_0",
+            "i18n_1=MSG_EXTERNAL_foo$$TEST_TS_1",
+            "i18n_2=MSG_EXTERNAL_baz$$TEST_TS_2",
+        ]
+    );
+    assert_eq!(
+        names(false),
+        ["i18n_0=MSG_TEST_TS_0", "i18n_1=MSG_TEST_TS_1", "i18n_2=MSG_TEST_TS_2"]
+    );
+}
+
+#[test]
+fn every_class_declares_its_pool_after_the_imports() {
+    // ngtsc declares the whole constant pool, child view functions included,
+    // after the imports and in pool order, not each class's part before it.
+    let code = transform(
+        r#"
+import { Component } from '@angular/core';
+const helper = 1;
+@Component({ selector: 'cmp-a', template: '<p [title]="[k, 1]"></p>@if (k) {<b></b>}' })
+export class A { k = helper; }
+export function f() { return helper; }
+@Component({ selector: 'cmp-b', template: '<p [title]="[k, 2]"></p>@if (k) {<i></i>}' })
+export class B { k = 1; }
+"#,
+    );
+    let at = |needle: &str| code.find(needle).expect(&code);
+    let order = [
+        "import * as i0",
+        "const _c0",
+        "function A_Conditional_1_Template",
+        "const _c1",
+        "function B_Conditional_1_Template",
+        "const helper",
+        "export class A",
+        "export function f",
+        "export class B",
+    ];
+    assert!(order.windows(2).all(|pair| at(pair[0]) < at(pair[1])), "{code}");
+}
+
+#[test]
+fn pool_goes_before_a_class_that_an_import_follows() {
+    // ngtsc moves the imports up and declares the pool before the class. The
+    // class's static fields read `_c1`, so it can't come after the class.
+    let code = transform(
+        r#"
+import { Component } from '@angular/core';
+@Component({ selector: 'cmp-a', template: '<ng-content select="x"></ng-content><ng-content></ng-content>' })
+export class A {}
+import { helper } from './other';
+export const h = helper;
+"#,
+    );
+    let at = |needle: &str| code.find(needle).expect(&code);
+    assert!(at("const _c1") < at("export class A"), "{code}");
+}
+
+#[test]
+fn pool_goes_before_the_decorators_a_class_keeps() {
+    // `@Other()` stays on `Plain`, ahead of `export`: the pool goes before
+    // it, not between it and its class.
+    for source in [
+        r#"
+import { Component } from '@angular/core';
+@Other() export class Plain {}
+import { Other } from './other';
+@Component({ selector: 'a-x', template: '@for (i of l; track i.id) {<i>{{i}}</i>}' })
+export class AX { l: any[] = []; }
+"#,
+        r#"
+import { Component } from '@angular/core';
+@Other() @Component({ selector: 'a-x', template: '@for (i of l; track i.id) {<i>{{i}}</i>}' })
+export class AX { l: any[] = []; }
+import { Other } from './other';
+"#,
+    ] {
+        let code = transform(source);
+        let at = |needle: &str| code.find(needle).expect(&code);
+        assert!(at("const _forTrack0") < at("@Other()"), "{code}");
+        assert!(!squash(&code).contains("@Other()const"), "{code}");
+    }
 }

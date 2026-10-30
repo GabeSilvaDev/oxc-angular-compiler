@@ -501,6 +501,10 @@ pub struct ComponentMetadata<'a> {
     /// The span of the class declaration.
     pub class_span: Span,
 
+    /// Where TypeScript puts the class name's `pos`: the end of the `class`
+    /// keyword. `setClassDebugInfo`'s `lineNumber` is its line.
+    pub class_name_pos: u32,
+
     /// The CSS selector for this component.
     pub selector: Option<Ident<'a>>,
 
@@ -549,6 +553,15 @@ pub struct ComponentMetadata<'a> {
     /// anything else, such as `X as any`, which ngtsc keeps eager. Each class
     /// comes with the span of its identifier in the array.
     pub import_entry_classes: Vec<'a, Option<(Ident<'a>, Span)>>,
+
+    /// The classes `imports` names, flattened the way ngtsc's partial
+    /// evaluator resolves it without type information: through nested arrays,
+    /// spreads and same-file `const` arrays (`imports: IMPORTS`), and with
+    /// `ns.Cmp` members. Partial compilation lists them in `dependencies`. Unlike [`Self::import_entry_classes`], these may come
+    /// from outside the array literal, so `@defer` lists them in its blocks'
+    /// dependency functions but lazy-loads only the classes that one of
+    /// those entries names.
+    pub import_refs: Vec<'a, ImportRef<'a>>,
 
     /// Exported names for template references.
     ///
@@ -707,6 +720,24 @@ pub struct ComponentMetadata<'a> {
     pub is_signal: bool,
 }
 
+/// A class an `@Component.imports` value names (see
+/// [`ComponentMetadata::import_refs`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ImportRef<'a> {
+    /// The name `@defer` knows the reference by: `name`, or `ns.name`.
+    pub key: Ident<'a>,
+    /// The `import * as ns` binding of an `ns.name` member.
+    pub namespace: Option<Ident<'a>>,
+    /// The identifier that names the class.
+    pub name: Ident<'a>,
+    /// The span of that identifier. ngtsc emits a reference to an imported
+    /// class as a `WrappedNodeExpr` of the identifier it was read from, so
+    /// two references are equivalent only when they come from the same node.
+    pub span: Span,
+    /// Whether it is written as `forwardRef(() => name)`.
+    pub is_forward_reference: bool,
+}
+
 /// Metadata for a host directive.
 ///
 /// Corresponds to TypeScript's `HostDirectiveDef` in the compiler.
@@ -854,6 +885,9 @@ pub struct TemplateDependency<'a> {
 
     /// Whether this is a forward reference.
     pub is_forward_reference: bool,
+
+    /// The `import * as ns` binding the type is read through (`ns.Cmp`).
+    pub type_namespace: Option<Ident<'a>>,
 }
 
 impl<'a> TemplateDependency<'a> {
@@ -875,6 +909,7 @@ impl<'a> TemplateDependency<'a> {
             is_component,
             pipe_name: None,
             is_forward_reference: false,
+            type_namespace: None,
         }
     }
 
@@ -895,12 +930,20 @@ impl<'a> TemplateDependency<'a> {
             is_component: false,
             pipe_name: Some(pipe_name),
             is_forward_reference: false,
+            type_namespace: None,
         }
     }
 
     /// Mark this dependency as a forward reference.
     pub fn with_forward_reference(mut self) -> Self {
         self.is_forward_reference = true;
+        self
+    }
+
+    /// Read the type through the `import * as ns` binding `namespace`.
+    #[must_use]
+    pub fn with_type_namespace(mut self, namespace: Ident<'a>) -> Self {
+        self.type_namespace = Some(namespace);
         self
     }
 
@@ -966,6 +1009,7 @@ impl<'a> ComponentMetadata<'a> {
         Self {
             class_name,
             class_span,
+            class_name_pos: class_span.start,
             selector: None,
             template: None,
             template_span: None,
@@ -979,6 +1023,7 @@ impl<'a> ComponentMetadata<'a> {
             host: None,
             imports: Vec::new_in(&allocator),
             import_entry_classes: Vec::new_in(&allocator),
+            import_refs: Vec::new_in(&allocator),
             export_as: Vec::new_in(&allocator),
             preserve_whitespaces: None,
             constructor_deps: None,
