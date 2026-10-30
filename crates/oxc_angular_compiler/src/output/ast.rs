@@ -1158,10 +1158,10 @@ impl<'a> OutputExpression<'a> {
                         _ => false,
                     }
             }
-            // Wrapped nodes compare by identity upstream; node_id is the port's
-            // stable identity for a wrapped external node.
+            // Wrapped nodes compare by identity upstream; the port's identity
+            // for a wrapped node of the file is its name and its span.
             (OutputExpression::WrappedNode(a), OutputExpression::WrappedNode(b)) => {
-                a.node_id == b.node_id
+                a.node_id == b.node_id && a.source_span == b.source_span
             }
             (OutputExpression::WrappedIrNode(a), OutputExpression::WrappedIrNode(b)) => {
                 std::ptr::eq(a.node.as_ref(), b.node.as_ref())
@@ -1585,6 +1585,36 @@ fn statement_is_equivalent(a: &OutputStatement<'_>, b: &OutputStatement<'_>) -> 
         }
         _ => false,
     }
+}
+
+/// Clone a user-supplied callee before it is called, or a receiver before a
+/// property is read off it, wrapping an optional chain in parentheses.
+///
+/// Ported from TypeScript's `parenthesizeLeftSideOfAccess`,
+/// which `ts.factory.createCallExpression` applies when ngtsc calls a user
+/// factory: `(Maybe?.make)()` throws when `Maybe` is nullish, while
+/// `Maybe?.make()` would short-circuit to `undefined`. Property access does
+/// the same: `(Maybe?.cls).ɵfac`.
+pub fn clone_callee<'a>(
+    expr: &OutputExpression<'a>,
+    allocator: &'a oxc_allocator::Allocator,
+) -> OutputExpression<'a> {
+    fn is_optional_chain(expr: &OutputExpression<'_>) -> bool {
+        match expr {
+            OutputExpression::ReadProp(e) => e.optional || is_optional_chain(&e.receiver),
+            OutputExpression::ReadKey(e) => e.optional || is_optional_chain(&e.receiver),
+            OutputExpression::InvokeFunction(e) => e.optional || is_optional_chain(&e.fn_expr),
+            _ => false,
+        }
+    }
+    let callee = expr.clone_in(allocator);
+    if !is_optional_chain(expr) {
+        return callee;
+    }
+    OutputExpression::Parenthesized(Box::new_in(
+        ParenthesizedExpr { expr: Box::new_in(callee, &allocator), source_span: None },
+        &allocator,
+    ))
 }
 
 /// Clone an output statement.

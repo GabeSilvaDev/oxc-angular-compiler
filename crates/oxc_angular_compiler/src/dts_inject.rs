@@ -40,7 +40,8 @@ use crate::r3::{CORE, CORE_ALIAS};
 
 /// One class's `.d.ts` static member declarations.
 pub struct DtsInjectDeclaration {
-    /// The class the members belong to.
+    /// The class the members belong to; dotted (`NS.App`) for a class of a
+    /// `namespace`.
     pub class_name: String,
     /// Newline-separated `static …;` member declarations.
     /// Namespace-qualified type names (`i0.ɵɵComponentDeclaration`,
@@ -154,10 +155,17 @@ fn collect_identifiers(program: &Program<'_>) -> FxHashSet<String> {
 /// The `ClassBody` of the class named `class_name`, searching through
 /// export wrappers and ambient module blocks (the latter covers
 /// `declare module` declarations a bundler may wrap library classes in).
+/// A dotted name (`NS.App`) is the class `App` of namespace `NS`. A class
+/// declared in `statements` comes before one of the same name in a block.
 fn find_class_body<'a, 'b>(
     statements: &'b [Statement<'a>],
     class_name: &str,
 ) -> Option<&'b ClassBody<'a>> {
+    if class_name.contains('.') {
+        let path: std::vec::Vec<&str> = class_name.split('.').collect();
+        return find_qualified_class_body(statements, &path);
+    }
+
     fn from_namespace<'a, 'b>(
         ns: &'b oxc_ast::ast::TSNamespaceDeclaration<'a>,
         class_name: &str,
@@ -175,15 +183,17 @@ fn find_class_body<'a, 'b>(
     fn from_declaration<'a, 'b>(
         decl: &'b Declaration<'a>,
         class_name: &str,
+        in_block: bool,
     ) -> Option<&'b ClassBody<'a>> {
         match decl {
             Declaration::ClassDeclaration(class) => {
-                if class.id.as_ref().map(|id| id.name.as_str()) == Some(class_name) {
+                if !in_block && class.id.as_ref().map(|id| id.name.as_str()) == Some(class_name) {
                     Some(&*class.body)
                 } else {
                     None
                 }
             }
+            _ if !in_block => None,
             // `declare module "pkg" { export class … }`
             Declaration::TSExternalModuleDeclaration(module) => {
                 module.body.as_deref().and_then(|block| find_class_body(&block.body, class_name))
@@ -196,29 +206,76 @@ fn find_class_body<'a, 'b>(
         }
     }
 
-    for stmt in statements {
-        let found = match stmt {
-            // `export declare class` — oxc splits export-with-declaration
-            // into `ExportDeclaration`, while `export { a }` is
-            // `ExportNamedDeclaration` (which never wraps a declaration).
-            Statement::ExportDeclaration(export) => {
-                from_declaration(&export.declaration, class_name)
-            }
-            Statement::ExportDefaultDeclaration(export) => match &export.declaration {
-                oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class)
-                    if class.id.as_ref().map(|id| id.name.as_str()) == Some(class_name) =>
-                {
-                    Some(&*class.body)
+    for in_block in [false, true] {
+        for stmt in statements {
+            let found = match stmt {
+                // `export declare class` — oxc splits export-with-declaration
+                // into `ExportDeclaration`, while `export { a }` is
+                // `ExportNamedDeclaration` (which never wraps a declaration).
+                Statement::ExportDeclaration(export) => {
+                    from_declaration(&export.declaration, class_name, in_block)
                 }
-                _ => None,
-            },
-            other => other.as_declaration().and_then(|decl| from_declaration(decl, class_name)),
-        };
-        if found.is_some() {
-            return found;
+                Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+                    oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class)
+                        if !in_block
+                            && class.id.as_ref().map(|id| id.name.as_str()) == Some(class_name) =>
+                    {
+                        Some(&*class.body)
+                    }
+                    _ => None,
+                },
+                other => other
+                    .as_declaration()
+                    .and_then(|decl| from_declaration(decl, class_name, in_block)),
+            };
+            if found.is_some() {
+                return found;
+            }
         }
     }
     None
+}
+
+/// The class at `path` (`["A", "B", "C"]` for `A.B.C`): every segment but the
+/// last names a namespace, in `statements` itself, and the last a class
+/// declared directly in the innermost one. Namespaces of one name merge, so
+/// each is tried in turn.
+fn find_qualified_class_body<'a, 'b>(
+    statements: &'b [Statement<'a>],
+    path: &[&str],
+) -> Option<&'b ClassBody<'a>> {
+    fn in_namespace<'a, 'b>(
+        ns: &'b oxc_ast::ast::TSNamespaceDeclaration<'a>,
+        path: &[&str],
+    ) -> Option<&'b ClassBody<'a>> {
+        let (first, rest) = path.split_first()?;
+        if ns.id.name.as_str() != *first || rest.is_empty() {
+            return None;
+        }
+        match &ns.body {
+            TSNamespaceDeclarationBody::TSModuleBlock(block) => {
+                find_qualified_class_body(&block.body, rest)
+            }
+            TSNamespaceDeclarationBody::TSNamespaceDeclaration(inner) => in_namespace(inner, rest),
+        }
+    }
+
+    statements.iter().find_map(|stmt| {
+        let decl = match stmt {
+            Statement::ExportDeclaration(export) => Some(&export.declaration),
+            other => other.as_declaration(),
+        }?;
+        match decl {
+            Declaration::ClassDeclaration(class)
+                if path.len() == 1
+                    && class.id.as_ref().map(|id| id.name.as_str()) == Some(path[0]) =>
+            {
+                Some(&*class.body)
+            }
+            Declaration::TSNamespaceDeclaration(ns) => in_namespace(ns, path),
+            _ => None,
+        }
+    })
 }
 
 /// The member's name as written, if it is a non-computed static or string

@@ -23,7 +23,7 @@ use crate::factory::{
 use crate::output::ast::{
     ArrowFunctionBody, ArrowFunctionExpr, FnParam, InvokeFunctionExpr, LiteralExpr,
     LiteralMapEntry, LiteralMapExpr, LiteralValue, OutputExpression, OutputStatement, ReadPropExpr,
-    ReadVarExpr,
+    ReadVarExpr, clone_callee,
 };
 use crate::r3::Identifiers;
 
@@ -99,7 +99,8 @@ fn build_factory_expression<'a>(
 
         InjectableProvider::UseClass { class_expr, deps, .. } => {
             match deps {
-                Some(deps) if !deps.is_empty() => {
+                // Even an empty `deps: []` builds `new useClass()`, like ngtsc.
+                Some(deps) => {
                     // useClass with deps: use delegated factory with conditional pattern
                     // This generates the proper __ngConditionalFactory__ pattern.
                     // See: injectable_compiler_2.ts:69-75
@@ -133,7 +134,8 @@ fn build_factory_expression<'a>(
 
         InjectableProvider::UseFactory { factory, deps } => {
             match deps {
-                Some(deps) if !deps.is_empty() => {
+                // Even an empty `deps: []` builds the delegated factory, like ngtsc.
+                Some(deps) => {
                     // useFactory with deps: use delegated factory with conditional pattern
                     // This generates the proper __ngConditionalFactory__ pattern.
                     // See: injectable_compiler_2.ts:88-95
@@ -286,14 +288,15 @@ fn create_inject_call<'a>(
     ))
 }
 
-/// Creates a factory delegation: `MyClass.ɵfac`
+/// Creates a factory delegation: `MyClass.ɵfac`, or `(Maybe?.cls).ɵfac` for an
+/// optional chain.
 fn create_factory_delegation<'a>(
     allocator: &'a Allocator,
     type_expr: &OutputExpression<'a>,
 ) -> OutputExpression<'a> {
     OutputExpression::ReadProp(Box::new_in(
         ReadPropExpr {
-            receiver: Box::new_in(type_expr.clone_in(allocator), &allocator),
+            receiver: Box::new_in(clone_callee(type_expr, allocator), &allocator),
             name: Ident::from("ɵfac"),
             optional: false,
             source_span: None,
@@ -350,7 +353,7 @@ fn create_use_factory_wrapper<'a>(
     // factory()
     let factory_call = OutputExpression::InvokeFunction(Box::new_in(
         InvokeFunctionExpr {
-            fn_expr: Box::new_in(factory.clone_in(allocator), &allocator),
+            fn_expr: Box::new_in(clone_callee(factory, allocator), &allocator),
             args: Vec::new_in(&allocator),
             pure: false,
             optional: false,

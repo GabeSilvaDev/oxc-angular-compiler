@@ -219,6 +219,22 @@ impl AngularVersion {
         self.is_at_least(22, 0, 0)
     }
 
+    /// Check if this version emits the `attrs` field on `ɵcmp` (before
+    /// v22.0.0-next.4).
+    ///
+    /// Until then `compileComponentFromMetadata` pooled the attributes of the
+    /// component's first selector (`[bitBadge]` gives `["bitBadge", ""]`) and set
+    /// `attrs` to that constant. No runtime ever read it, and
+    /// `angular/angular@d99ab0e040` ("fix(compiler): stop generating unused
+    /// field") removed it in v22.0.0-next.4; it was never backported. The
+    /// constant still takes a `_cN` index on older versions.
+    pub fn emits_selector_attrs(&self) -> bool {
+        if self.major == 22 && self.minor == 0 && self.patch == 0 {
+            return matches!(self.prerelease, Some(prerelease) if prerelease < Prerelease::Next(4));
+        }
+        self.major < 22
+    }
+
     /// Check if this version compiles component templates in DOM-only mode
     /// (v20.1.0-next.3+).
     ///
@@ -485,6 +501,10 @@ pub struct ComponentMetadata<'a> {
     /// The span of the class declaration.
     pub class_span: Span,
 
+    /// Where TypeScript puts the class name's `pos`: the end of the `class`
+    /// keyword. `setClassDebugInfo`'s `lineNumber` is its line.
+    pub class_name_pos: u32,
+
     /// The CSS selector for this component.
     pub selector: Option<Ident<'a>>,
 
@@ -530,8 +550,18 @@ pub struct ComponentMetadata<'a> {
     /// array literal, by position: `X`, or `forwardRef(() => X)` with
     /// `@angular/core`'s `forwardRef` (which [`Self::imports`] leaves out),
     /// as ngtsc resolves them through its `forwardRefResolver`; `None` for
-    /// anything else, such as `X as any`, which ngtsc keeps eager.
-    pub import_entry_classes: Vec<'a, Option<Ident<'a>>>,
+    /// anything else, such as `X as any`, which ngtsc keeps eager. Each class
+    /// comes with the span of its identifier in the array.
+    pub import_entry_classes: Vec<'a, Option<(Ident<'a>, Span)>>,
+
+    /// The classes `imports` names, flattened the way ngtsc's partial
+    /// evaluator resolves it without type information: through nested arrays,
+    /// spreads and same-file `const` arrays (`imports: IMPORTS`), and with
+    /// `ns.Cmp` members. Partial compilation lists them in `dependencies`. Unlike [`Self::import_entry_classes`], these may come
+    /// from outside the array literal, so `@defer` lists them in its blocks'
+    /// dependency functions but lazy-loads only the classes that one of
+    /// those entries names.
+    pub import_refs: Vec<'a, ImportRef<'a>>,
 
     /// Exported names for template references.
     ///
@@ -690,6 +720,24 @@ pub struct ComponentMetadata<'a> {
     pub is_signal: bool,
 }
 
+/// A class an `@Component.imports` value names (see
+/// [`ComponentMetadata::import_refs`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ImportRef<'a> {
+    /// The name `@defer` knows the reference by: `name`, or `ns.name`.
+    pub key: Ident<'a>,
+    /// The `import * as ns` binding of an `ns.name` member.
+    pub namespace: Option<Ident<'a>>,
+    /// The identifier that names the class.
+    pub name: Ident<'a>,
+    /// The span of that identifier. ngtsc emits a reference to an imported
+    /// class as a `WrappedNodeExpr` of the identifier it was read from, so
+    /// two references are equivalent only when they come from the same node.
+    pub span: Span,
+    /// Whether it is written as `forwardRef(() => name)`.
+    pub is_forward_reference: bool,
+}
+
 /// Metadata for a host directive.
 ///
 /// Corresponds to TypeScript's `HostDirectiveDef` in the compiler.
@@ -837,6 +885,9 @@ pub struct TemplateDependency<'a> {
 
     /// Whether this is a forward reference.
     pub is_forward_reference: bool,
+
+    /// The `import * as ns` binding the type is read through (`ns.Cmp`).
+    pub type_namespace: Option<Ident<'a>>,
 }
 
 impl<'a> TemplateDependency<'a> {
@@ -858,6 +909,7 @@ impl<'a> TemplateDependency<'a> {
             is_component,
             pipe_name: None,
             is_forward_reference: false,
+            type_namespace: None,
         }
     }
 
@@ -878,12 +930,20 @@ impl<'a> TemplateDependency<'a> {
             is_component: false,
             pipe_name: Some(pipe_name),
             is_forward_reference: false,
+            type_namespace: None,
         }
     }
 
     /// Mark this dependency as a forward reference.
     pub fn with_forward_reference(mut self) -> Self {
         self.is_forward_reference = true;
+        self
+    }
+
+    /// Read the type through the `import * as ns` binding `namespace`.
+    #[must_use]
+    pub fn with_type_namespace(mut self, namespace: Ident<'a>) -> Self {
+        self.type_namespace = Some(namespace);
         self
     }
 
@@ -949,6 +1009,7 @@ impl<'a> ComponentMetadata<'a> {
         Self {
             class_name,
             class_span,
+            class_name_pos: class_span.start,
             selector: None,
             template: None,
             template_span: None,
@@ -962,6 +1023,7 @@ impl<'a> ComponentMetadata<'a> {
             host: None,
             imports: Vec::new_in(&allocator),
             import_entry_classes: Vec::new_in(&allocator),
+            import_refs: Vec::new_in(&allocator),
             export_as: Vec::new_in(&allocator),
             preserve_whitespaces: None,
             constructor_deps: None,
@@ -1193,6 +1255,27 @@ mod tests {
             AngularVersion::new(u32::MAX, 0, 0),
         ] {
             assert!(!version.uses_shadow_css_polyfills(), "{version:?}");
+        }
+    }
+
+    #[test]
+    fn selector_attrs_end_at_22_0_0_next_4() {
+        let parse = |s| AngularVersion::parse(s).unwrap();
+
+        for version in
+            [parse("19.2.20"), parse("20.3.34"), parse("21.2.25"), parse("22.0.0-next.3")]
+        {
+            assert!(version.emits_selector_attrs(), "{version:?}");
+        }
+
+        for version in [
+            parse("22.0.0-next.4"),
+            parse("22.0.0-rc.0"),
+            parse("22.0.0"),
+            parse("22.2.2"),
+            AngularVersion::new(u32::MAX, 0, 0),
+        ] {
+            assert!(!version.emits_selector_attrs(), "{version:?}");
         }
     }
 }

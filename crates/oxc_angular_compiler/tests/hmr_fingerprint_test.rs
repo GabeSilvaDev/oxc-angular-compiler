@@ -11,7 +11,8 @@
 
 use oxc_allocator::Allocator;
 use oxc_angular_compiler::{
-    ComponentHmrFingerprint, TransformOptions, component_hmr_fingerprint, transform_angular_file,
+    ComponentHmrFingerprint, ComponentHmrUpdateInput, TransformOptions,
+    compile_component_hmr_update, component_hmr_fingerprint, transform_angular_file,
 };
 
 const IMPORT: &str = "import { Component } from '@angular/core';\n";
@@ -171,9 +172,75 @@ fn transform_keeps_a_jit_components_template() {
     );
 }
 
+/// A component declared in a function is compiled with HMR too, so an edit to
+/// its template is an HMR update. Two classes of one name compile without
+/// HMR, so an edit to either one's template reloads. The transform and
+/// `compile_component_hmr_update` give the same fingerprint.
+#[test]
+fn reads_a_nested_component() {
+    let source = format!(
+        "{IMPORT}export function make() {{
+  @Component({{ selector: 'a', template: '<a/>', styles: ['.a{{}}'] }})
+  class A {{ x = 1 }}
+  return A;
+}}
+function one() {{ @Component({{ template: '<b/>' }}) class B {{}} return B; }}
+function two() {{ @Component({{ template: '<c/>' }}) class B {{}} return B; }}
+"
+    );
+    let allocator = Allocator::default();
+    let options = TransformOptions { hmr: true, ..TransformOptions::default() };
+    let result = transform_angular_file(&allocator, "test.ts", &source, Some(&options), None);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(result.template_updates.keys().collect::<Vec<_>>(), ["test.ts@A"]);
+    let fingerprint = result.hmr_fingerprint.unwrap();
+    assert_eq!(fingerprint_raw(&source, &["A"]).fingerprint, fingerprint);
+    assert_eq!(fingerprint_raw(&source, &["A", "B"]).fingerprint, fingerprint);
+    let input = ComponentHmrUpdateInput {
+        class_name: "A",
+        source_fingerprint: None,
+        compiled_class_names: Some(&["A"]),
+    };
+    let update =
+        compile_component_hmr_update(&allocator, "test.ts", &source, &input, Some(&options), None);
+    assert_eq!(update.fingerprint.as_deref(), Some(fingerprint.as_str()));
+
+    let of = |edited: String| fingerprint_raw(&edited, &["A"]).fingerprint;
+    assert_eq!(of(source.replace("<a/>", "<a>x</a>")), fingerprint);
+    assert_eq!(of(source.replace(".a{}", ".a{color:red}")), fingerprint);
+    assert_ne!(of(source.replace("x = 1", "x = 2")), fingerprint);
+    assert_ne!(of(source.replace("<b/>", "<b>x</b>")), fingerprint);
+}
+
 // -----------------------------------------------------------------
 // Which decorators are read
 // -----------------------------------------------------------------
+
+/// A `namespace` member compiles without HMR, so an edit to its template
+/// reloads, while a top-level component of its name keeps HMR.
+#[test]
+fn leaves_a_namespace_member_out() {
+    let source = format!(
+        "{IMPORT}export namespace NS {{
+  @Component({{ selector: 'n', template: '<n/>' }})
+  export class App {{}}
+}}
+@Component({{ selector: 'app', template: '<a/>' }})
+export class App {{}}
+"
+    );
+    let allocator = Allocator::default();
+    let options = TransformOptions { hmr: true, ..TransformOptions::default() };
+    let result = transform_angular_file(&allocator, "test.ts", &source, Some(&options), None);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(result.template_updates.keys().collect::<Vec<_>>(), ["test.ts@App"]);
+    let fingerprint = result.hmr_fingerprint.unwrap();
+    assert_eq!(fingerprint_raw(&source, &["App"]).fingerprint, fingerprint);
+
+    let of = |edited: String| fingerprint_raw(&edited, &["App"]).fingerprint;
+    assert_eq!(of(source.replace("<a/>", "<a>x</a>")), fingerprint);
+    assert_ne!(of(source.replace("<n/>", "<n>x</n>")), fingerprint);
+}
 
 /// The decorator is Angular's by its `@angular/core` import, under any alias
 /// or through a namespace, like the transform finds it. Another module's

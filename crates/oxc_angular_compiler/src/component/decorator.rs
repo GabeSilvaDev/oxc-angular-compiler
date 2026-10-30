@@ -5,15 +5,15 @@
 
 use oxc_allocator::{Allocator, Vec};
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, Class, ClassElement, Decorator, Expression,
-    MethodDefinitionKind, ObjectExpression, ObjectPropertyKind, PropertyKey,
+    Argument, ArrayExpressionElement, BindingPattern, Class, ClassElement, Declaration, Decorator,
+    Expression, MethodDefinitionKind, ObjectExpression, ObjectPropertyKind, PropertyKey, Statement,
 };
 use oxc_span::Span;
 use oxc_str::Ident;
 
 use super::dependency::R3DependencyMetadata;
 use super::metadata::{
-    ChangeDetectionStrategy, ComponentMetadata, HostDirectiveMetadata, HostMetadata,
+    ChangeDetectionStrategy, ComponentMetadata, HostDirectiveMetadata, HostMetadata, ImportRef,
     TemplateDependency, ViewEncapsulation,
 };
 use super::transform::ImportMap;
@@ -66,6 +66,9 @@ pub fn extract_component_metadata<'a>(
     // Create metadata with defaults (standalone uses implicit_standalone when not explicitly set)
     let mut metadata =
         ComponentMetadata::new(allocator, class_name, class_span, implicit_standalone);
+    if let Some(source) = source_text {
+        metadata.class_name_pos = crate::class_debug_info::class_name_pos(source, class);
+    }
 
     // Whether `imports` and `deferredImports` are provably empty; a spread or
     // accessor this loop skips could add them.
@@ -182,6 +185,7 @@ pub fn extract_component_metadata<'a>(
                     metadata.imports = extract_identifier_array(allocator, &prop.value);
                     metadata.import_entry_classes =
                         extract_import_entry_classes(allocator, &prop.value, consts);
+                    metadata.import_refs = extract_import_refs(allocator, &prop.value, consts);
                     // 2. The raw expression to pass to ɵɵgetComponentDepsFactory in RuntimeResolved mode
                     metadata.raw_imports =
                         convert_oxc_expression(allocator, &prop.value, source_text);
@@ -492,18 +496,19 @@ fn extract_identifier_array<'a>(
 }
 
 /// The class each element of an array literal names, by position: `X`, or
-/// `forwardRef(() => X)` with `@angular/core`'s `forwardRef`.
+/// `forwardRef(() => X)` with `@angular/core`'s `forwardRef`, with the span of
+/// the identifier.
 fn extract_import_entry_classes<'a>(
     allocator: &'a Allocator,
     expr: &'a Expression<'a>,
     consts: &StringConsts<'_>,
-) -> Vec<'a, Option<Ident<'a>>> {
+) -> Vec<'a, Option<(Ident<'a>, Span)>> {
     let mut result = Vec::new_in(&allocator);
     if let Expression::ArrayExpression(arr) = expr {
         for element in &arr.elements {
             let class = element.as_expression().and_then(|element| {
                 match try_unwrap_forward_ref(element, Some(consts)).unwrap_or(element) {
-                    Expression::Identifier(id) => Some(id.name),
+                    Expression::Identifier(id) => Some((id.name, id.span)),
                     _ => None,
                 }
             });
@@ -511,6 +516,108 @@ fn extract_import_entry_classes<'a>(
         }
     }
     result
+}
+
+/// The classes an `imports` value names, as ngtsc's partial evaluator
+/// flattens it: the classes [`extract_import_entry_classes`] reads from an
+/// array literal, through nested arrays, spreads and same-file `const` arrays
+/// (`imports: IMPORTS`), and `ns.Cmp` members. The spans are those of the
+/// identifiers where they are written: in a `const`'s array, every component
+/// naming it shares them. Anything else is left out.
+fn extract_import_refs<'a>(
+    allocator: &'a Allocator,
+    expr: &'a Expression<'a>,
+    consts: &StringConsts<'a>,
+) -> Vec<'a, ImportRef<'a>> {
+    let mut refs = Vec::new_in(&allocator);
+    collect_import_refs(allocator, expr, consts, &mut refs, 0);
+    refs
+}
+
+fn collect_import_refs<'a>(
+    allocator: &'a Allocator,
+    expr: &'a Expression<'a>,
+    consts: &StringConsts<'a>,
+    refs: &mut Vec<'a, ImportRef<'a>>,
+    depth: usize,
+) {
+    // `const A = [...B]; const B = [...A];` never ends.
+    if depth > 16 {
+        return;
+    }
+    let unwrapped = try_unwrap_forward_ref(expr, Some(consts));
+    let is_forward_reference = unwrapped.is_some();
+    match unwrapped.unwrap_or(expr) {
+        Expression::ArrayExpression(arr) => {
+            for element in &arr.elements {
+                let element = match element {
+                    ArrayExpressionElement::SpreadElement(spread) => &spread.argument,
+                    element => match element.as_expression() {
+                        Some(element) => element,
+                        None => continue,
+                    },
+                };
+                collect_import_refs(allocator, element, consts, refs, depth + 1);
+            }
+        }
+        Expression::Identifier(id) => match top_level_const_init(consts, &id.name) {
+            Some(init @ Expression::ArrayExpression(_)) => {
+                collect_import_refs(allocator, init, consts, refs, depth + 1);
+            }
+            _ => refs.push(ImportRef {
+                key: id.name,
+                namespace: None,
+                name: id.name,
+                span: id.span,
+                is_forward_reference,
+            }),
+        },
+        Expression::StaticMemberExpression(member) => {
+            if let Expression::Identifier(namespace) = &member.object {
+                let key = format!("{}.{}", namespace.name, member.property.name);
+                refs.push(ImportRef {
+                    key: Ident::from(allocator.alloc_str(&key)),
+                    namespace: Some(namespace.name),
+                    name: member.property.name,
+                    span: member.property.span,
+                    is_forward_reference,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The initializer of the top-level variable (`const`, `let` or `var`,
+/// exported or not) that binds `name` in the file `consts` were collected
+/// from. Like ngtsc's partial evaluator, it reads through `as const` and
+/// through a variable that names another one (`const IMPORTS = BASE`).
+fn top_level_const_init<'a>(consts: &StringConsts<'a>, name: &str) -> Option<&'a Expression<'a>> {
+    let mut name = name;
+    // `const A = B; const B = A;` never ends.
+    for _ in 0..16 {
+        let init = consts.program()?.body.iter().find_map(|stmt| {
+            let decl = match stmt {
+                Statement::VariableDeclaration(decl) => decl,
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::VariableDeclaration(decl) => decl,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            decl.declarations.iter().find_map(|declarator| match &declarator.id {
+                BindingPattern::BindingIdentifier(id) if id.name == name => {
+                    declarator.init.as_ref()
+                }
+                _ => None,
+            })
+        })?;
+        match init.get_inner_expression() {
+            Expression::Identifier(id) => name = id.name.as_str(),
+            init => return Some(init),
+        }
+    }
+    None
 }
 
 /// Extract ViewEncapsulation from an expression.
@@ -784,6 +891,7 @@ fn extract_param_dependency<'a>(
     // Determine the token:
     // 1. If @Inject(TOKEN) is present, use TOKEN
     // 2. Otherwise, use the type annotation
+    let from_inject = inject_token.is_some();
     let (token, member_path) = inject_token
         .or_else(|| extract_param_token(allocator, param))
         .map_or((None, &[][..]), |(t, m)| (Some(t), m));
@@ -823,10 +931,10 @@ fn extract_param_dependency<'a>(
                     // Carry the exported name so namespaced refs (`i1.X`) use the export
                     // name, not the local alias, for aliased imports.
                     d.token_imported_name = import_info.imported_name.clone();
-                    // Always use namespace imports for DI tokens (has_named_import = false).
-                    // Import elision removes @Inject(TOKEN) argument imports since they're
-                    // only used in decorator positions that get compiled away.
-                    // Using bare TOKEN would fail at runtime because the import is gone.
+                    // Type-annotation tokens use namespace imports (`i1.X`). Like ngtsc,
+                    // an `@Inject(TOKEN)` token keeps the expression as written and a
+                    // default import keeps its local name; import elision keeps both.
+                    d.has_named_import = from_inject || import_info.is_default_import;
                     d
                 }
             } else {

@@ -704,6 +704,39 @@ export class Parent {}
     );
 }
 
+/// A component declared in the file needs no cross-file analysis for its
+/// selector: each `@defer` block that uses it gets its own dependency
+/// function, as in ngc's full compilation, and the second component reuses
+/// the first one's, which ngc's single pool finds equivalent.
+#[test]
+fn test_defer_block_using_a_same_file_component_gets_its_own_resolver() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Component } from '@angular/core';
+
+@Component({ selector: 'app-dep', template: 'dep' })
+export class Dep {}
+
+@Component({ selector: 'app-a', imports: [Dep], template: '<app-dep/> @defer { <app-dep/> }' })
+export class A {}
+
+@Component({ selector: 'app-b', imports: [Dep], template: '@defer { <app-dep/> }' })
+export class B {}
+";
+
+    let result = transform_angular_file(&allocator, "parent.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+
+    let code = &result.code;
+    let collapsed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(collapsed.contains("constA_Defer_2_DepsFn=()=>[Dep];"), "{code}");
+    assert!(collapsed.contains("ɵɵdefer(2,1,A_Defer_2_DepsFn);"), "{code}");
+    assert!(collapsed.contains("ɵɵdefer(1,0,A_Defer_2_DepsFn);"), "{code}");
+    assert!(collapsed.contains("ɵɵgetComponentDepsFactory(A,[Dep])"), "{code}");
+    // Used only inside `@defer`, the class leaves `dependencies`.
+    assert!(!collapsed.contains("ɵɵgetComponentDepsFactory(B"), "{code}");
+}
+
 /// Aliased imports must use the original exported name in `m.X`, not the
 /// local alias.
 #[test]
@@ -2870,23 +2903,19 @@ fn test_multiple_same_name_references_in_for() {
     insta::assert_snapshot!("multiple_same_name_references_in_for", js);
 }
 
-/// Test that attrs const is emitted for selectors with attributes.
+/// Test that no attrs const is emitted for selectors with attributes.
 ///
-/// When a selector like `span[bitBadge]` is used, Angular extracts the attribute
-/// selector into a constant array that is referenced in the component definition.
-///
-/// Expected output:
+/// Angular v22.0.0-next.4 stopped emitting the unused `attrs` field
+/// (angular/angular@d99ab0e040), so `span[bitBadge]` takes no constant and
+/// the ng-content selectors get `_c0`, as in ngtsc 22.2:
 /// ```javascript
-/// const _c0 = ["bitBadge", ""];  // attrs const
+/// const _c0 = ["*"];
 /// BadgeComponent.ɵcmp = ɵɵdefineComponent({
-///   attrs: _c0,
+///   selectors: [["span", "bitBadge", ""]],
+///   ngContentSelectors: _c0,
 ///   ...
 /// })
 /// ```
-///
-/// This was a bug where the attrs const was added to the pool during
-/// `generate_component_definitions` but never emitted because `compile_template`
-/// had already drained the pool to `declarations`.
 #[test]
 fn test_selector_attrs_const_emission() {
     let allocator = Allocator::default();
@@ -2906,24 +2935,89 @@ export class BadgeComponent {}
     assert_eq!(result.component_count, 1);
     assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
 
-    // The declarations_js should contain the attrs const
-    // The const should look like: const _cN = ["bitBadge",""]
-    // Note: no space after comma in the emitter output
-    assert!(
-        result.code.contains(r#"["bitBadge",""]"#),
-        "Should emit attrs const with selector attribute. Got:\n{}",
-        result.code
-    );
-
-    // The ɵcmp definition should reference the attrs const
-    // Note: no space after colon in the emitter output
-    assert!(
-        result.code.contains("attrs:_c"),
-        "Should reference attrs const in component definition. Got:\n{}",
-        result.code
-    );
+    let code: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(!code.contains("attrs:"), "Should not emit attrs. Got:\n{}", result.code);
+    assert!(!code.contains(r#"["bitBadge",""]"#), "Should not pool attrs. Got:\n{}", result.code);
+    assert!(code.contains(r#"const_c0=["*"];"#), "{}", result.code);
+    assert!(code.contains("ngContentSelectors:_c0,"), "{}", result.code);
 
     insta::assert_snapshot!("selector_attrs_const_emission", result.code);
+}
+
+/// Angular before v22.0.0-next.4 emits `attrs` with the first selector's
+/// attributes. `compileComponentFromMetadata` pools it after the query
+/// predicates (`baseDirectiveFields`) and before the template, and shares it
+/// with a later class of the file (`forceShared`). ngtsc 21.2.25 gives:
+/// ```javascript
+/// const _c0 = ["y"];
+/// const _c1 = ["x"];
+/// const _c2 = ["a", ""];
+/// const _c3 = ["*"];
+/// ```
+#[test]
+fn test_selector_attrs_before_v22() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, ContentChild, ViewChild } from '@angular/core';
+
+@Component({ selector: '[a]', template: '<ng-content></ng-content>', standalone: true })
+export class A { @ViewChild('x') q: any; @ContentChild('y') c: any; }
+
+@Component({ selector: 'b[a], c', template: '', standalone: true })
+export class B {}
+";
+    let options = ComponentTransformOptions {
+        angular_version: Some(AngularVersion::new(21, 2, 0)),
+        ..ComponentTransformOptions::default()
+    };
+
+    let result = transform_angular_file(&allocator, "a.ts", source, Some(&options), None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let code: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        code.contains(r#"const_c0=["y"];const_c1=["x"];const_c2=["a",""];const_c3=["*"];"#),
+        "{}",
+        result.code
+    );
+    assert!(code.contains("ɵɵcontentQuery(dirIndex,_c0,5)"), "{}", result.code);
+    assert!(code.contains("ɵɵviewQuery(_c1,5)"), "{}", result.code);
+    assert!(code.contains("},attrs:_c2,ngContentSelectors:_c3,"), "{}", result.code);
+    assert!(code.contains(r#"selectors:[["b","a",""],["c"]],attrs:_c2,"#), "{}", result.code);
+}
+
+/// v21's `compileComponentFromMetadata` pools `attrs` after `baseDirectiveFields`,
+/// so after the host bindings' constants and before the template's.
+#[test]
+fn test_selector_attrs_before_v22_follow_host_constants() {
+    let allocator = Allocator::default();
+    let source = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: 'x[role=a]',
+    host: { '[class]': '{on: on, off: !on}' },
+    template: '<i [class]="{a: on, b: !on}"></i>',
+})
+export class X { on = true; }
+"#;
+    let options = ComponentTransformOptions {
+        angular_version: Some(AngularVersion::new(21, 2, 0)),
+        ..ComponentTransformOptions::default()
+    };
+
+    let result = transform_angular_file(&allocator, "x.ts", source, Some(&options), None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let code: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        code.contains(
+            r#"const_c0=(a0,a1)=>({on:a0,off:a1});const_c1=["role","a"];const_c2=(a0,a1)=>({a:a0,b:a1});"#
+        ),
+        "{}",
+        result.code
+    );
+    assert!(code.contains("},attrs:_c1,decls:1,"), "{}", result.code);
 }
 
 // ============================================================================
@@ -2960,7 +3054,7 @@ export class FirstComponent {
 @Component({
     selector: 'app-second',
     template: `
-        @for (user of users; track user.id) {
+        @for (user of users; track user.email) {
             <span>{{ user.email }}</span>
         }
     `,
@@ -2996,14 +3090,11 @@ export class SecondComponent {
         );
     }
 
-    // Verify we have at least 2 unique track variables (one from each component)
-    assert!(
-        track_names.len() >= 2,
-        "Expected at least 2 unique track variables, got {}. Variables: {:?}\nFull output:\n{}",
-        track_names.len(),
-        track_names,
-        code
-    );
+    // One track function from each component, numbered by the `_forTrack`
+    // count across the file like ngtsc's single pool.
+    let expected: std::collections::HashSet<String> =
+        ["_forTrack0", "_forTrack1"].into_iter().map(String::from).collect();
+    assert_eq!(track_names, expected, "Full output:\n{code}");
 
     // Also check for function declarations with numbered suffixes
     // Both components generate template functions with unique names
@@ -3587,13 +3678,8 @@ export class MatMiniFabButton {}
         );
     }
 
-    // Both components should have attrs referencing _c constants (from selector)
-    let attrs_pattern = "attrs:_c";
-    let attrs_count = code.matches(attrs_pattern).count();
-    assert!(
-        attrs_count >= 2,
-        "Expected at least 2 attrs references (one per component), found {attrs_count}. Output:\n{code}"
-    );
+    // Angular v22 emits no `attrs` for the attribute selectors.
+    assert!(!code.contains("attrs:"), "Should not emit attrs. Output:\n{code}");
 }
 
 /// Test that multiple components sharing the same template in the same file
@@ -3789,12 +3875,8 @@ export class MatMiniFabButton {
         "Duplicate const declarations found: {duplicates:?}. Full output:\n{code}"
     );
 
-    // Each component should have its own constants for attrs and ngContentSelectors
-    let attrs_count = code.matches("attrs:_c").count();
-    assert!(
-        attrs_count >= 2,
-        "Expected at least 2 attrs references (one per component), found {attrs_count}"
-    );
+    // Angular v22 emits no `attrs` for the attribute selectors.
+    assert!(!code.contains("attrs:"), "Should not emit attrs. Output:\n{code}");
 }
 
 /// Test three components in the same file to ensure constant pool index is correctly
@@ -4076,7 +4158,8 @@ export class BitLabelComponent {
         "DOCUMENT should be kept in imports (named by setClassMetadata). Import line: {common_line}"
     );
 
-    // With class metadata emission disabled, the same imports are elided again.
+    // With class metadata emission disabled, the param decorators are elided again,
+    // but DOCUMENT stays: the factory names it as written (`ɵɵdirectiveInject(DOCUMENT)`).
     let no_metadata = ComponentTransformOptions {
         emit_class_metadata: false,
         ..ComponentTransformOptions::default()
@@ -4097,14 +4180,15 @@ export class BitLabelComponent {
             "{decorator} should be elided when no setClassMetadata is emitted. Import line: {import_line}"
         );
     }
-    if let Some(common_line) =
-        code.lines().find(|l| l.starts_with("import") && l.contains("@angular/common"))
-    {
-        assert!(
-            !common_line.contains("DOCUMENT"),
-            "DOCUMENT should be elided when no setClassMetadata is emitted. Import line: {common_line}"
-        );
-    }
+    let common_line = code
+        .lines()
+        .find(|l| l.starts_with("import") && l.contains("@angular/common"))
+        .unwrap_or_else(|| panic!("DOCUMENT import missing. Code: {code}"));
+    assert!(
+        common_line.contains("DOCUMENT"),
+        "DOCUMENT should be kept (named by the factory). Import line: {common_line}"
+    );
+    assert!(code.contains("ɵɵdirectiveInject(DOCUMENT)"), "Code: {code}");
 }
 
 /// Test that @HostBinding and @HostListener decorators are elided from imports.
@@ -5811,6 +5895,33 @@ fn test_i18n_meta_is_trimmed_once() {
     assert_contains(&js, r#"$localize `:m | d:Logo`"#);
     assert_contains(&js, "/** @desc  d  @meaning m  */const MSG_EXTERNAL__custom$$");
     assert_contains(&js, r#"$localize `:m | d @@ custom:Custom`"#);
+}
+
+/// With external ids, a message without a custom id is named after its computed id
+/// (`decimalDigest`, with the meaning), and so are ICU sub-messages. The id of an element
+/// message is computed before whitespace removal, and a sole ICU takes it. Angular 22.2.2
+/// gives these names, in this order (MSG_3 is the nested select, MSG_4 the plural's element):
+#[test]
+fn test_i18n_external_ids_use_computed_message_id() {
+    let js = compile_i18n_component(
+        "<div i18n>Hello {{name}}!</div><span i18n=\"m|d\">Hi <b>x</b></span>\
+         <img i18n-alt=\"am|ad\" alt=\"Logo\">\
+         <div i18n>\n  {count, plural, =1 {one} other {{gender, select, male {m} other {o}}}}\n</div>\
+         <div i18n>before {count, plural, =1 {one} other {many}} after</div>\
+         {gender, select, male {M} other {O}}",
+    );
+    for name in [
+        "MSG_EXTERNAL_96409403850032568$$REPRO_TS_0 =",
+        "MSG_EXTERNAL_4848371593517801531$$REPRO_TS_1 =",
+        "MSG_EXTERNAL_7210328206936269780$$REPRO_TS_2 =",
+        "MSG_EXTERNAL_2330724444582433569$$REPRO_TS_3 =",
+        "MSG_EXTERNAL_2793568635912092133$$REPRO_TS_4 =",
+        "MSG_EXTERNAL_2403750739669008444$$REPRO_TS_5 =",
+        "MSG_EXTERNAL_6754785010889443455$$REPRO_TS_6 =",
+        "MSG_EXTERNAL_4388111603494198272$$REPRO_TS_7 =",
+    ] {
+        assert_contains(&js, name);
+    }
 }
 
 /// Compiles `template` with `enableI18nLegacyMessageIdFormat` set to `legacy_ids`.
@@ -7645,6 +7756,60 @@ export class MixedQueryComponent {
         "Single decorator query should have no chain continuation. \
          Output:\n{code}"
     );
+}
+
+/// Angular's `getQueryPredicate` splits a string predicate on `,` and trims
+/// each part, keeping the empty ones: ngtsc 22.2.3 gives `["x", ""]` for
+/// `@ViewChild('x, ')`, for decorator and signal queries alike.
+#[test]
+fn test_query_predicate_keeps_empty_parts() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, ContentChild, ViewChild, ViewChildren, viewChild, contentChildren } from '@angular/core';
+
+@Component({ selector: 'app-a', template: '', standalone: true })
+export class A {
+    a = viewChild('x, ');
+    b = contentChildren('x,,y');
+    @ViewChildren(', y') c: any;
+    @ContentChild(', ') d: any;
+}
+";
+
+    let result = transform_angular_file(&allocator, "a.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    let code: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        code.contains(
+            r#"const_c0=["x","","y"];const_c1=["",""];const_c2=["x",""];const_c3=["","y"];"#
+        ),
+        "{}",
+        result.code
+    );
+}
+
+/// The predicate parts are trimmed with `String.prototype.trim`, which strips
+/// U+FEFF but not U+0085: ngtsc 22.2.3 gives `["x"]` for `@ViewChild('\uFEFFx')`
+/// and `["y\u0085"]` for `@ViewChild('y\u0085')`.
+#[test]
+fn test_query_predicate_trims_like_js() {
+    let allocator = Allocator::default();
+    let source = r"
+import { Component, ViewChild } from '@angular/core';
+
+@Component({ selector: 'app-a', template: '', standalone: true })
+export class A {
+    @ViewChild('\uFEFFx') q: any;
+    @ViewChild('y\u0085') r: any;
+}
+";
+
+    let result = transform_angular_file(&allocator, "a.ts", source, None, None);
+
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    assert!(result.code.contains("const _c0 = [\"x\"];"), "{}", result.code);
+    assert!(result.code.contains("const _c1 = [\"y\u{85}\"];"), "{}", result.code);
 }
 
 /// Compatibility guard. Two contracts at once:
@@ -16081,6 +16246,171 @@ export class CounterService {}
 }
 
 #[test]
+fn test_raw_arrow_factory_is_parenthesized_when_called() {
+    // A block-body arrow the converter keeps as raw source (it declares a
+    // `const`) is called inside the factory wrapper. ngtsc emits
+    // `(() => {...})()`; a bare `() => {...}()` is a SyntaxError.
+    let code = compile_to_valid_js(
+        r"
+import { Injectable, InjectionToken, Service } from '@angular/core';
+export const DEP = new InjectionToken<number>('DEP');
+@Service({ factory: () => { const q = 1; return { v: q }; } })
+export class S1 {}
+@Service({ factory: async () => ({ v: 2 }) })
+export class S2 {}
+@Injectable({ providedIn: 'root', useFactory: () => { const q = 3; return { v: q }; } })
+export class I1 {}
+@Injectable({ providedIn: 'root', useFactory: (d) => { const q = d + 4; return { v: q }; }, deps: [DEP] })
+export class I2 {}
+@Injectable({ providedIn: 'root', useFactory: function () { const q = 5; return { v: q }; } })
+export class I3 {}
+",
+    );
+    for expected in [
+        "return (() => { const q = 1; return { v: q }; })();",
+        "return (async () => ({ v: 2 }))();",
+        "factory:() =>(() => { const q = 3; return { v: q }; })()",
+        "((d) => { const q = d + 4; return { v: q }; })(i0.ɵɵinject(DEP))",
+        // ngtsc leaves a called function expression bare.
+        "factory:() =>function () { const q = 5; return { v: q }; }()",
+    ] {
+        assert!(code.contains(expected), "Missing `{expected}` in:\n{code}");
+    }
+}
+
+#[test]
+fn test_use_class_call_is_parenthesized_when_instantiated() {
+    // A `useClass` with deps is instantiated as `new useClass(...deps)`.
+    // ngtsc wraps a call or an optional chain in the callee:
+    // `new makeClass()(dep)` would construct `makeClass` itself, and
+    // `new Maybe?.cls(dep)` is a SyntaxError.
+    let code = compile_to_valid_js(
+        r"
+import { Injectable, InjectionToken } from '@angular/core';
+export const DEP = new InjectionToken<number>('DEP');
+export function makeClass() { return class { constructor(d) { this.d = d; } }; }
+export const Maybe = undefined;
+@Injectable({ providedIn: 'root', useClass: makeClass(), deps: [DEP] })
+export class E1 {}
+@Injectable({ providedIn: 'root', useClass: makeClass().inner, deps: [DEP] })
+export class E2 {}
+@Injectable({ providedIn: 'root', useClass: Maybe?.cls, deps: [DEP] })
+export class E3 {}
+@Injectable({ providedIn: 'root', useClass: Maybe.cls, deps: [DEP] })
+export class E4 {}
+",
+    );
+    for expected in [
+        "new (makeClass())(i0.ɵɵinject(DEP))",
+        "new (makeClass().inner)(i0.ɵɵinject(DEP))",
+        "new (Maybe?.cls)(i0.ɵɵinject(DEP))",
+        "new Maybe.cls(i0.ɵɵinject(DEP))",
+    ] {
+        assert!(code.contains(expected), "Missing `{expected}` in:\n{code}");
+    }
+}
+
+#[test]
+fn test_optional_chain_factory_is_parenthesized_when_called() {
+    // ngtsc wraps an optional-chain factory before calling it, so
+    // `(Maybe?.make)()` throws when `Maybe` is nullish. A bare
+    // `Maybe?.make()` would short-circuit to `undefined` instead.
+    let code = compile_to_valid_js(
+        r"
+import { Injectable, InjectionToken, Service } from '@angular/core';
+export const DEP = new InjectionToken<number>('DEP');
+export const Maybe = undefined;
+@Injectable({ providedIn: 'root', useFactory: Maybe?.make })
+export class F1 {}
+@Service({ factory: Maybe?.make })
+export class F2 {}
+@Injectable({ providedIn: 'root', useFactory: Maybe?.make, deps: [DEP] })
+export class F3 {}
+@Injectable({ providedIn: 'root', useFactory: Maybe?.a.b?.() })
+export class F4 {}
+@Injectable({ providedIn: 'root', useFactory: (Maybe?.a).b })
+export class F5 {}
+@Injectable({ providedIn: 'root', useFactory: Maybe.make })
+export class F6 {}
+",
+    );
+    for expected in [
+        "factory:() =>(Maybe?.make)(),",
+        "return (Maybe?.make)();",
+        "(Maybe?.make)(i0.ɵɵinject(DEP))",
+        "factory:() =>(Maybe?.a.b?.())(),",
+        "factory:() =>(Maybe?.a).b(),",
+        "factory:() =>Maybe.make(),",
+    ] {
+        assert!(code.contains(expected), "Missing `{expected}` in:\n{code}");
+    }
+}
+
+#[test]
+fn test_optional_chain_use_class_is_parenthesized_before_fac() {
+    // ngtsc reads `ɵfac` off `(Maybe?.cls)`, which throws when `Maybe` is
+    // nullish. A bare `Maybe?.cls.ɵfac(...)` would short-circuit instead.
+    let code = compile_to_valid_js(
+        r"
+import { Injectable } from '@angular/core';
+export const Maybe = undefined;
+@Injectable({ providedIn: 'root', useClass: Maybe?.cls })
+export class C1 {}
+@Injectable({ providedIn: 'root', useClass: Maybe.cls })
+export class C2 {}
+",
+    );
+    for expected in [
+        "factory:(__ngFactoryType__) =>(Maybe?.cls).ɵfac(__ngFactoryType__),",
+        "factory:(__ngFactoryType__) =>Maybe.cls.ɵfac(__ngFactoryType__),",
+    ] {
+        assert!(code.contains(expected), "Missing `{expected}` in:\n{code}");
+    }
+}
+
+#[test]
+fn test_use_class_with_empty_deps_is_instantiated() {
+    // `deps: []` is still deps: ngtsc builds `new useClass()` instead of
+    // delegating to `useClass.ɵfac`, which a plain class does not have.
+    let code = compile_to_valid_js(
+        r"
+import { Injectable } from '@angular/core';
+export const Holder = { cls: () => class {} };
+@Injectable({ providedIn: 'root', useClass: Holder.cls(), deps: [] })
+export class F1 {}
+@Injectable({ providedIn: 'root', useClass: Holder.cls, deps: [] })
+export class F2 {}
+",
+    );
+    for expected in [
+        "(__ngConditionalFactory__ = new (Holder.cls())());",
+        "(__ngConditionalFactory__ = new Holder.cls());",
+    ] {
+        assert!(code.contains(expected), "Missing `{expected}` in:\n{code}");
+    }
+    assert!(!code.contains("ɵfac(__ngFactoryType__)"), "Unexpected delegation in:\n{code}");
+}
+
+#[test]
+fn test_use_factory_with_empty_deps_builds_conditional_factory() {
+    // `deps: []` is still deps: ngtsc builds the delegated conditional
+    // factory, as for useClass, instead of `() => make()`.
+    let code = compile_to_valid_js(
+        r"
+import { Injectable } from '@angular/core';
+export function make() { return {}; }
+@Injectable({ providedIn: 'root', useFactory: make, deps: [] })
+export class F1 {}
+",
+    );
+    assert!(
+        code.contains("(__ngConditionalFactory__ = make());"),
+        "Missing conditional factory in:\n{code}"
+    );
+    assert!(!code.contains("() => make()"), "Unexpected arrow wrapper in:\n{code}");
+}
+
+#[test]
 fn test_aot_service_decorator_version_gated() {
     // Targeting Angular < 22 should surface a diagnostic and leave the
     // decorator unchanged (no ɵfac/ɵprov emitted).
@@ -16637,6 +16967,62 @@ fn test_component_class_metadata_precedes_debug_info() {
         "class is on line 5 by TypeScript's count. Got:\n{}",
         result.code
     );
+}
+
+#[test]
+fn test_component_debug_info_line_is_the_class_keyword() {
+    // ngtsc takes the line of `clazz.name.pos`, the end of the `class`
+    // keyword, not of a decorator above it. Lines checked against ngtsc.
+    let allocator = Allocator::default();
+    let source = "import { Component } from '@angular/core';
+
+@Component({ selector: 'a', template: '' })
+class A {}
+
+@Component({
+  selector: 'b',
+  template: '',
+})
+export class B {}
+
+@Component({ selector: 'c', template: '' }) export class C {}
+
+@Component({ selector: 'd', template: '' })
+export
+abstract class /* x
+ */
+  D {}
+
+export function f() {
+  @Component({ selector: 'e', template: '' })
+  class E {}
+  return E;
+}
+export { A };
+";
+    let result = transform_angular_file(&allocator, "a.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    // The emitter wraps long lines.
+    let code: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    for (name, line) in [("A", 4), ("B", 10), ("C", 12), ("D", 16), ("E", 22)] {
+        assert!(
+            code.contains(&format!(
+                "className:\"{name}\",filePath:\"a.component.ts\",lineNumber:{line}}}"
+            )),
+            "{name} is on line {line}. Got:\n{}",
+            result.code
+        );
+    }
+
+    let source = "import { Component } from '@angular/core';
+@Component({ selector: 'h', template: '' })
+export default class
+// c
+H {}
+";
+    let result = transform_angular_file(&allocator, "h.component.ts", source, None, None);
+    assert!(!result.has_errors(), "Should not have errors: {:?}", result.diagnostics);
+    assert!(result.code.contains("lineNumber:3"), "H is on line 3. Got:\n{}", result.code);
 }
 
 #[test]

@@ -19,8 +19,8 @@ use std::rc::{Rc, Weak};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BindingPattern, Class, Declaration, ExportDefaultDeclarationKind, Expression,
-    ObjectPropertyKind, Program, Statement, TSNamespaceDeclarationBody,
+    BindingPattern, Class, Declaration, ExportDefaultDeclarationKind, Expression, Program,
+    Statement, TSNamespaceDeclarationBody,
 };
 use oxc_parser::Parser;
 use oxc_resolver::{
@@ -29,7 +29,12 @@ use oxc_resolver::{
 use oxc_span::SourceType;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::defer_resolver::{ClassUse, decorated_class_selector};
 use crate::directive::{ImportValueResolver, StringConsts};
+
+/// `(file, exported_name, local_name, implicit_standalone)` -> how a
+/// template uses the class (see `Inner::selector_memo`).
+type SelectorMemo = FxHashMap<(String, String, String, bool), Option<ClassUse>>;
 
 /// Result of analyzing a file's exports
 #[derive(Debug, Clone)]
@@ -87,7 +92,7 @@ struct Inner {
     /// Memoized standalone class selectors: `(file, exported_name, local_name,
     /// implicit_standalone)` -> selector (see
     /// [`Self::standalone_directive_selector`]).
-    selector_memo: RefCell<FxHashMap<(String, String, String, bool), Option<String>>>,
+    selector_memo: RefCell<SelectorMemo>,
     /// Exports whose evaluation is in progress (circular `const` chains —
     /// `a.A = b.B; b.B = a.A` — resolve the cycle edge to opaque, like
     /// `analyzing` does for files).
@@ -170,17 +175,17 @@ impl ImportValueResolver for CrossFileResolver {
     }
 }
 
-/// The selector of the class `local` declares in `program` (`"default"` for
-/// `export default class`) and exports as `exported`, when it is a
-/// standalone `@Component` or `@Directive` whose `selector` and `standalone`
-/// are literals. `consts` are the program's.
+/// The [`ClassUse`] of the class `local` declares in `program` (`"default"`
+/// for `export default class`) and exports as `exported`, when it is a
+/// standalone `@Component`, `@Directive` or `@Pipe` whose `selector` (or
+/// `name`) and `standalone` are literals. `consts` are the program's.
 fn standalone_class_selector<'a>(
     program: &'a Program<'a>,
     consts: &StringConsts<'a>,
     exported: &str,
     local: &str,
     implicit_standalone: bool,
-) -> Option<String> {
+) -> Option<ClassUse> {
     // A plain `class Local` must be exported as `exported` by a local
     // `export { Local as exported }`: the export map also records namespace
     // members, which can share the name of a top-level class the file doesn't
@@ -210,32 +215,7 @@ fn standalone_class_selector<'a>(
         }
         _ => None,
     })?;
-
-    let decorator = ["Component", "Directive"].iter().find_map(|name| {
-        crate::directive::find_angular_class_decorator(&class.decorators, name, consts)
-    })?;
-    let Expression::CallExpression(call) = &decorator.expression else { return None };
-    let Some(Expression::ObjectExpression(object)) =
-        call.arguments.first().and_then(|arg| arg.as_expression())
-    else {
-        return None;
-    };
-
-    let mut selector = None;
-    let mut standalone = implicit_standalone;
-    for property in &object.properties {
-        let ObjectPropertyKind::ObjectProperty(property) = property else { return None };
-        // A computed key can override `selector` or `standalone`.
-        let key = property.key.static_name()?;
-        if key == "selector" {
-            let Expression::StringLiteral(value) = &property.value else { return None };
-            selector = Some(value.value.as_str()?.to_string());
-        } else if key == "standalone" {
-            let Expression::BooleanLiteral(value) = &property.value else { return None };
-            standalone = value.value;
-        }
-    }
-    selector.filter(|selector| standalone && !selector.trim().is_empty())
+    decorated_class_selector(class, consts, implicit_standalone)
 }
 
 impl CrossFileAnalyzer {
@@ -317,10 +297,13 @@ impl CrossFileAnalyzer {
         self.inner.resolve_export_value(import_source, import_name, from_file)
     }
 
-    /// The selector of the standalone `@Component` or `@Directive` class that
-    /// `import_name` is exported as from `import_source`, as `import_source`
-    /// is written in `from_file`, following named re-exports. Used to tell
-    /// whether a template matches the class, for `@defer` (#313).
+    /// The selector of the standalone `@Component` or `@Directive` class (or
+    /// the name of the standalone `@Pipe`) that `import_name` is exported as
+    /// from `import_source`, as `import_source` is written in `from_file`,
+    /// following named re-exports. Used to tell whether a template uses the
+    /// class, for `@defer` (#313). It comes
+    /// with the file that declares the class and the class's name there,
+    /// which tell two references to one class apart from two classes.
     ///
     /// `None` when the import can't be followed to a class declared in a
     /// source file (packages, `export *`, unresolvable paths), the class isn't
@@ -333,7 +316,7 @@ impl CrossFileAnalyzer {
         import_name: &str,
         from_file: &Path,
         implicit_standalone: bool,
-    ) -> Option<String> {
+    ) -> Option<(ClassUse, (String, String))> {
         self.inner.standalone_directive_selector(
             import_source,
             import_name,
@@ -502,7 +485,7 @@ impl Inner {
         import_name: &str,
         from_file: &Path,
         implicit_standalone: bool,
-    ) -> Option<String> {
+    ) -> Option<(ClassUse, (String, String))> {
         let mut file = self.resolve_module_spec(from_file.parent()?, import_source)?;
         let mut name = import_name.to_string();
         for _ in 0..MAX_EXPORT_CHAIN {
@@ -519,12 +502,10 @@ impl Inner {
             let info = self.cache.borrow().get(&file)?.get(&name).cloned()?;
             match info.re_export_source {
                 None => {
-                    return self.class_selector(
-                        &file,
-                        &name,
-                        info.value_local.as_deref()?,
-                        implicit_standalone,
-                    );
+                    let local = info.value_local?;
+                    let selector =
+                        self.class_selector(&file, &name, &local, implicit_standalone)?;
+                    return Some((selector, (file, local)));
                 }
                 Some((source, original)) => {
                     if original == "*" {
@@ -546,7 +527,7 @@ impl Inner {
         exported: &str,
         local: &str,
         implicit_standalone: bool,
-    ) -> Option<String> {
+    ) -> Option<ClassUse> {
         let key =
             (file_path.to_string(), exported.to_string(), local.to_string(), implicit_standalone);
         if let Some(cached) = self.selector_memo.borrow().get(&key) {
@@ -2052,18 +2033,21 @@ export { doSomething } from './utils';
         let main_file = dir.path().join("main.ts");
         let mut analyzer = CrossFileAnalyzer::new(dir.path(), None, true);
         let selector = |analyzer: &CrossFileAnalyzer| {
-            analyzer.standalone_directive_selector("./lazy", "LazyCmp", &main_file, true)
+            analyzer
+                .standalone_directive_selector("./lazy", "LazyCmp", &main_file, true)
+                .map(|(selector, _)| selector)
         };
 
-        assert_eq!(selector(&analyzer).as_deref(), Some("app-a"));
+        let app = |selector: &str| Some(ClassUse::Selector(selector.to_string()));
+        assert_eq!(selector(&analyzer), app("app-a"));
         assert_eq!(analyzer.take_value_dependencies().len(), 1);
 
         fs::write(&lazy, component.replace("app-a", "app-b")).unwrap();
-        assert_eq!(selector(&analyzer).as_deref(), Some("app-a"));
+        assert_eq!(selector(&analyzer), app("app-a"));
         assert_eq!(analyzer.take_value_dependencies().len(), 1);
 
         analyzer.clear_cache();
-        assert_eq!(selector(&analyzer).as_deref(), Some("app-b"));
+        assert_eq!(selector(&analyzer), app("app-b"));
     }
 
     #[test]

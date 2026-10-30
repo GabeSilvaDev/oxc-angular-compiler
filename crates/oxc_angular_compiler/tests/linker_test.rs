@@ -303,11 +303,11 @@ fn test_link_sanitizes_img_video_src_before_22_2_2() {
     for version in [AngularVersion::new(21, 2, 0), AngularVersion::new(22, 2, 1)] {
         let code = link_for_version(SRC_BINDINGS_COMPONENT, Some(version));
         assert_eq!(
-            code.matches(r#"ɵɵproperty("src",ctx.url,i0.ɵɵsanitizeUrl)"#).count(),
+            code.matches(r#"ɵɵdomProperty("src",ctx.url,i0.ɵɵsanitizeUrl)"#).count(),
             2,
             "{version:?}: img and video src must be sanitized:\n{code}"
         );
-        assert!(code.contains(r#"ɵɵproperty("href",ctx.url,i0.ɵɵsanitizeUrl)"#), "{code}");
+        assert!(code.contains(r#"ɵɵdomProperty("href",ctx.url,i0.ɵɵsanitizeUrl)"#), "{code}");
     }
 }
 
@@ -318,11 +318,11 @@ fn test_link_does_not_sanitize_img_video_src_from_22_2_2() {
     for version in [Some(AngularVersion::new(22, 2, 2)), None] {
         let code = link_for_version(SRC_BINDINGS_COMPONENT, version);
         assert_eq!(
-            code.matches(r#"ɵɵproperty("src",ctx.url)"#).count(),
+            code.matches(r#"ɵɵdomProperty("src",ctx.url)"#).count(),
             2,
             "{version:?}: img and video src must not be sanitized:\n{code}"
         );
-        assert!(code.contains(r#"ɵɵproperty("href",ctx.url,i0.ɵɵsanitizeUrl)"#), "{code}");
+        assert!(code.contains(r#"ɵɵdomProperty("href",ctx.url,i0.ɵɵsanitizeUrl)"#), "{code}");
     }
 
     let allocator = Allocator::default();
@@ -555,19 +555,20 @@ i0.ɵɵngDeclareClassMetadata({ minVersion: "12.0.0", version: "21.0.0", ngImpor
 }
 
 /// When the linker wraps a define call in an IIFE to declare template or host
-/// binding functions and pooled constants, the IIFE itself is annotated. Angular's
-/// linker hoists those declarations and leaves `/* @__PURE__ */ i0.ɵɵdefine*(...)`
-/// as the static field value, so an unannotated IIFE would keep unused classes alive.
+/// binding functions and pooled constants (where `ngImport` is bound in an arrow
+/// function, which cannot hold shared constants), the IIFE itself is annotated:
+/// an unannotated IIFE would keep unused classes alive.
 #[test]
 fn test_link_declaration_iife_is_pure() {
     let allocator = Allocator::default();
-    let code = r#"import * as i0 from "@angular/core";
+    let code = r#"((i0) => {
 class C {
   static ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "21.0.0", type: C, isStandalone: true, selector: "c", ngImport: i0, template: "<b>{{x}}</b><ng-template><i>{{y}}</i></ng-template>" });
 }
 class D {
   static ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "21.0.0", type: D, isStandalone: true, selector: "[d]", ngImport: i0, host: { properties: { "style": "{ width: w }" } } });
 }
+})(core);
 "#;
     let result = link(&allocator, code, "test.mjs");
     assert!(result.code.contains("static ɵcmp = /*@__PURE__*/ (() => {"), "{}", result.code);
@@ -707,4 +708,480 @@ C.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "17.0.0", version: "22.2.2", n
         assert!(linked.contains(expected), "missing `{expected}` in\n{}", result.code);
     }
     assert!(!linked.contains("C_Defer_4_DepsFn"), "{}", result.code);
+}
+
+#[test]
+fn test_link_query_predicate_splits_refs() {
+    // Angular's `getQueryPredicate` splits each string of the predicate on `,`
+    // and trims each part, keeping the empty ones, as ngtsc 22.2.3 partial
+    // output linked by Angular 22.2.3's linker shows.
+    let code = r#"import * as i0 from "@angular/core";
+export class C {}
+C.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "22.2.2", ngImport: i0, type: C, isStandalone: true, selector: "c", queries: [{ propertyName: "a", predicate: ["y, z"] }], viewQueries: [{ propertyName: "b", first: true, predicate: ["x, "], descendants: true }], template: "" });
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "test.mjs");
+    assert!(result.linked);
+    let linked: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(linked.contains(r#"const_c0=["y","z"];const_c1=["x",""];"#), "{}", result.code);
+    assert!(linked.contains("ɵɵcontentQuery(dirIndex,_c0,4)"), "{}", result.code);
+    assert!(linked.contains("ɵɵviewQuery(_c1,5)"), "{}", result.code);
+}
+
+#[test]
+fn test_link_component_pools_query_predicates() {
+    // Angular's linker pools string predicates like ngtsc, with the
+    // component's one pool: content queries, then view queries, then the host
+    // bindings' constants, then the template's, which reuses `["*"]`.
+    let code = r#"import * as i0 from "@angular/core";
+export class C {}
+C.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "17.2.0", version: "22.2.2", type: C, isStandalone: true, selector: "c", host: { properties: { "attr.a": "[1, 2]" } }, queries: [{ propertyName: "c", first: true, predicate: ["y"], descendants: true }], viewQueries: [{ propertyName: "s", first: true, predicate: ["z"], descendants: true, isSignal: true }, { propertyName: "q", first: true, predicate: ["*"], descendants: true }, { propertyName: "t", first: true, predicate: TemplateRef, descendants: true }, { propertyName: "r", first: true, predicate: ["z"], descendants: true }], ngImport: i0, template: '<ng-content></ng-content>', isInline: true });
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "test.mjs");
+    assert!(result.linked);
+    let linked: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    // Fragments of the TS linker's output.
+    for expected in [
+        r#"const_c0=["y"];const_c1=["z"];const_c2=["*"];const_c3=()=>[1,2];"#,
+        "i0.ɵɵcontentQuery(dirIndex,_c0,5);",
+        "i0.ɵɵviewQuerySignal(ctx.s,_c1,5);",
+        "i0.ɵɵviewQuery(_c2,5)(TemplateRef,5)(_c1,5);",
+        "i0.ɵɵattribute(\"a\",i0.ɵɵpureFunction0(1,_c3));",
+        "ngContentSelectors:_c2,",
+    ] {
+        assert!(linked.contains(expected), "missing `{expected}` in\n{}", result.code);
+    }
+}
+
+#[test]
+fn test_link_directive_pools_query_predicates() {
+    // As in a component, the predicates are pooled before the host bindings'
+    // constants.
+    let code = r#"import * as i0 from "@angular/core";
+export class D {}
+D.ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "22.2.2", type: D, isStandalone: true, selector: "[d]", host: { properties: { "attr.a": "[1, 2]" } }, queries: [{ propertyName: "c", first: true, predicate: ["y"], descendants: true }, { propertyName: "cs", predicate: ["y, z"] }], viewQueries: [{ propertyName: "q", first: true, predicate: ["y"], descendants: true }], ngImport: i0 });
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "test.mjs");
+    assert!(result.linked);
+    let linked: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    // Fragments of the TS linker's output.
+    for expected in [
+        r#"const_c0=["y"];const_c1=["y","z"];const_c2=()=>[1,2];"#,
+        "i0.ɵɵcontentQuery(dirIndex,_c0,5)(dirIndex,_c1,4);",
+        "i0.ɵɵviewQuery(_c0,5);",
+        "i0.ɵɵattribute(\"a\",i0.ɵɵpureFunction0(1,_c2));",
+    ] {
+        assert!(linked.contains(expected), "missing `{expected}` in\n{}", result.code);
+    }
+}
+
+#[test]
+fn test_link_query_predicate_pools_lone_surrogates() {
+    // A predicate with a lone surrogate is split and pooled like any other, as
+    // Angular 22.2.3's linker shows, so the later constants keep their names.
+    let code = r#"import * as i0 from "@angular/core";
+export class C {}
+C.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "22.2.2", type: C, isStandalone: true, selector: "c", host: { properties: { "attr.a": "[1, 2]" } }, viewQueries: [{ propertyName: "q", first: true, predicate: ["\uD800"], descendants: true }, { propertyName: "r", first: true, predicate: ["y"], descendants: true }, { propertyName: "s", first: true, predicate: ["\uD800, z"], descendants: true }], ngImport: i0, template: "", isInline: true });
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "test.mjs");
+    assert!(result.linked);
+    let linked: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    for expected in [
+        r#"const_c0=["\uD800"];const_c1=["y"];const_c2=["\uD800","z"];const_c3=()=>[1,2];"#,
+        "i0.ɵɵviewQuery(_c0,5)(_c1,5)(_c2,5);",
+        "i0.ɵɵattribute(\"a\",i0.ɵɵpureFunction0(1,_c3));",
+    ] {
+        assert!(linked.contains(expected), "missing `{expected}` in\n{}", result.code);
+    }
+}
+
+#[test]
+fn test_link_query_predicate_trims_like_js() {
+    // The parts are trimmed with `String.prototype.trim`, which strips U+FEFF
+    // but not U+0085, as Angular 22.2.3's linker shows.
+    let code = r#"import * as i0 from "@angular/core";
+export class C {}
+C.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "22.2.2", ngImport: i0, type: C, isStandalone: true, selector: "c", viewQueries: [{ propertyName: "q", first: true, predicate: ["\uFEFFx"], descendants: true }, { propertyName: "r", first: true, predicate: ["y\u0085"], descendants: true }], template: "" });
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "test.mjs");
+    assert!(result.linked);
+    assert!(result.code.contains(r#"["x"]"#), "{}", result.code);
+    assert!(result.code.contains("[\"y\u{85}\"]"), "{}", result.code);
+}
+
+/// A component (standalone by default at version 22) with the given extra metadata.
+fn dom_only_component(extra: &str) -> String {
+    format!(
+        r#"import * as i0 from "@angular/core";
+export class A {{}}
+A.ɵcmp = i0.ɵɵngDeclareComponent({{ minVersion: "14.0.0", version: "22.2.2", type: A, selector: "a", ngImport: i0, template: '<div [title]="t" (click)="go()"></div>@defer {{<i></i>}}', isInline: true{extra} }});
+"#
+    )
+}
+
+/// Angular's linker compiles a standalone template in DomOnly mode unless it has a
+/// directive, component or NgModule dependency, or a `@defer` block with dependencies,
+/// as Angular 22.2.3's linker shows. DomOnly needs Angular 20.1.
+#[test]
+fn test_link_dom_only_template() {
+    let dom_only = [
+        r#"ɵɵdomElementStart(0,"div",0);"#,
+        r#"ɵɵdomListener("click",functionA_Template_div_click_0_listener()"#,
+        r#"ɵɵdomProperty("title",ctx.t);"#,
+        r#"ɵɵdomElement(0,"i");"#,
+    ];
+    let full = [
+        r#"ɵɵelementStart(0,"div",0);"#,
+        r#"ɵɵlistener("click",functionA_Template_div_click_0_listener()"#,
+        r#"ɵɵproperty("title",ctx.t);"#,
+        r#"ɵɵelement(0,"i");"#,
+    ];
+    let cases = [
+        ("", None, &dom_only),
+        (r#", dependencies: [{ kind: "pipe", type: P, name: "p" }]"#, None, &dom_only),
+        (", deferBlockDependencies: [null]", None, &dom_only),
+        ("", Some(AngularVersion::new(20, 1, 0)), &dom_only),
+        (r#", dependencies: [{ kind: "directive", type: D, selector: "d" }]"#, None, &full),
+        (r#", dependencies: [{ kind: "component", type: D, selector: "d" }]"#, None, &full),
+        (r#", dependencies: [{ kind: "ngmodule", type: M }]"#, None, &full),
+        (r#", deferBlockDependencies: [() => [import("./x").then(m => m.X)]]"#, None, &full),
+        (", isStandalone: false", None, &full),
+        ("", Some(AngularVersion::new(20, 0, 0)), &full),
+    ];
+    for (extra, version, expected) in cases {
+        let code = link_for_version(&dom_only_component(extra), version);
+        let linked: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        for expected in expected {
+            assert!(
+                linked.contains(expected),
+                "{extra} {version:?}: missing `{expected}` in\n{code}"
+            );
+        }
+    }
+}
+
+/// Partial declarations of three classes with equal constants, as ngtsc 22.2.3 emits them.
+const SHARED_CONSTANTS_FILE: &str = r#"import * as i0 from "@angular/core";
+export class A {}
+A.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "22.2.2", type: A, isStandalone: true, selector: "a", viewQueries: [{ propertyName: "f", first: true, predicate: ["foo"], descendants: true }, { propertyName: "b", first: true, predicate: ["bar"], descendants: true }], ngImport: i0, template: '<p i18n>Hi {{n}}</p><i [attr.x]="[1,2]"></i>@for (x of xs; track x.id) {<b>{{x}}</b>}', isInline: true });
+export class B {}
+B.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "22.2.2", type: B, isStandalone: true, selector: "b", viewQueries: [{ propertyName: "f", first: true, predicate: ["foo"], descendants: true }, { propertyName: "q", first: true, predicate: ["qux"], descendants: true }], ngImport: i0, template: '<p i18n>Bye {{n}}</p><i [attr.x]="[1,2]"></i>@for (x of xs; track x.id) {<u>{{x}}</u>}', isInline: true });
+export class D {}
+D.ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "22.2.2", type: D, isStandalone: true, selector: "[d]", host: { properties: { "attr.y": "[1,2]" } }, ngImport: i0 });
+"#;
+
+/// Like Angular's linker, the declarations of a module share one constant pool: the names
+/// go on across the file, equal constants are declared once, and the constants and child
+/// template functions go after the imports, in the order Angular 22.2.3's linker emits them,
+/// with the main template function inline.
+#[test]
+fn test_link_shares_constants_across_a_module() {
+    let allocator = Allocator::default();
+    let result = link(&allocator, SHARED_CONSTANTS_FILE, "/x/cases/main.js");
+    assert!(result.linked);
+    let code = &result.code;
+    let linked: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut last = 0;
+    for expected in [
+        r#"import*asi0from"@angular/core";const_c0=["foo"];const_c1=["bar"];const_c2=()=>[1,2];const_forTrack0=($index,$item)=>$item.id;functionA_For_4_Template(rf,ctx){"#,
+        r#"const_c3=["qux"];functionB_For_4_Template(rf,ctx){"#,
+        "exportclassA{}A.ɵcmp=/*@__PURE__*/i0.ɵɵdefineComponent({type:A,",
+        "i0.ɵɵviewQuery(_c0,5)(_c1,5);",
+        "i18n_0=MSG__X_CASES_MAIN_JS_0",
+        "template:functionA_Template(rf,ctx){",
+        r#"i0.ɵɵrepeaterCreate(3,A_For_4_Template,2,1,"b",null,_forTrack0);"#,
+        r#"i0.ɵɵattribute("x",i0.ɵɵpureFunction0(2,_c2));"#,
+        "exportclassB{}B.ɵcmp=/*@__PURE__*/i0.ɵɵdefineComponent({type:B,",
+        "i0.ɵɵviewQuery(_c0,5)(_c3,5);",
+        "i18n_1=MSG__X_CASES_MAIN_JS_1",
+        r#"i0.ɵɵrepeaterCreate(3,B_For_4_Template,2,1,"u",null,_forTrack0);"#,
+        r#"i0.ɵɵattribute("x",i0.ɵɵpureFunction0(2,_c2));"#,
+        "exportclassD{}D.ɵdir=/*@__PURE__*/i0.ɵɵdefineDirective({type:D,",
+        r#"i0.ɵɵattribute("y",i0.ɵɵpureFunction0(1,_c2));"#,
+    ] {
+        let Some(at) = linked[last..].find(expected) else {
+            panic!("missing `{expected}` after byte {last} in\n{code}");
+        };
+        last += at + expected.len();
+    }
+    assert!(!code.contains("(() =>"), "no IIFE:\n{code}");
+}
+
+/// A long style is inline on its first use and shared from its second, across the
+/// declarations of a module: as in Angular 22.2.3's linker output, a first use in an
+/// earlier declaration stays inline, and the constants go after the imports.
+#[test]
+fn test_link_shares_long_styles_across_a_module() {
+    let a = ".a { color: red; background: blue; border: 1px solid green; padding: 4px; }";
+    let b = ".b { color: red; background: blue; border: 1px solid green; padding: 4px; }";
+    let component = |name: &str, styles: &[&str]| {
+        let styles: Vec<String> = styles.iter().map(|style| format!("{style:?}")).collect();
+        format!(
+            r#"export class {name} {{}}
+{name}.ɵcmp = i0.ɵɵngDeclareComponent({{ minVersion: "14.0.0", version: "22.2.2", type: {name}, isStandalone: true, selector: "{name}", ngImport: i0, template: "<p></p>", isInline: true, styles: [{}] }});
+"#,
+            styles.join(", ")
+        )
+    };
+    let code = format!(
+        "import * as i0 from \"@angular/core\";\n// comment\n{}{}{}",
+        component("A", &[a, b]),
+        component("B", &[b, b, a]),
+        component("C", &[a])
+    );
+    let allocator = Allocator::default();
+    let result = link(&allocator, &code, "test.mjs");
+    assert!(result.linked);
+    let scoped_a = r#"".a[_ngcontent-%COMP%] { color: red; background: blue; border: 1px solid green; padding: 4px; }""#;
+    let scoped_b = r#"".b[_ngcontent-%COMP%] { color: red; background: blue; border: 1px solid green; padding: 4px; }""#;
+    let expected = format!(
+        "import * as i0 from \"@angular/core\";\n// comment\nconst _c0 = {scoped_b};\nconst _c1 = {scoped_a};\nexport class A {{}}"
+    );
+    assert!(result.code.starts_with(&expected), "{}", result.code);
+    for expected in [
+        format!("styles: [{scoped_a}, {scoped_b}]"),
+        "styles: [_c0, _c0, _c1]".to_string(),
+        "styles: [_c1]".to_string(),
+    ] {
+        assert!(result.code.contains(&expected), "missing `{expected}` in\n{}", result.code);
+    }
+}
+
+/// Angular's linker shares the constants of the declarations whose `ngImport` is bound in
+/// a function declaration or expression, at the start of its body (after the directives
+/// and the comments after them), and keeps the others' local in an IIFE: an arrow
+/// function or a method cannot hold them. As Angular 22.2.3's linker shows for a UMD bundle.
+#[test]
+fn test_link_constant_scopes() {
+    let component = |name: &str| {
+        format!(
+            r#"class {name} {{}} {name}.ɵcmp = i0.ɵɵngDeclareComponent({{ minVersion: "14.0.0", version: "22.2.2", type: {name}, isStandalone: true, selector: "{name}", ngImport: i0, template: "<i [attr.y]=\"[1,2]\"></i>", isInline: true }});"#
+        )
+    };
+    let code = format!(
+        r#"(function (global, factory) {{ factory(exports, require("@angular/core")); }})(this, (function (exports, i0) {{ 'use strict';
+  /** c */
+  {}
+  {}
+  const f = function (i0) {{ {} }};
+  const g = (i0) => {{ {} }};
+  class E {{ m(i0) {{ {} }} }}
+}}));
+"#,
+        component("A"),
+        component("B"),
+        component("F"),
+        component("G"),
+        component("M")
+    );
+    let allocator = Allocator::default();
+    let result = link(&allocator, &code, "test.js");
+    assert!(result.linked);
+    let code = &result.code;
+    let linked: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut last = 0;
+    for expected in [
+        "(function(exports,i0){'usestrict';/**c*/const_c0=()=>[1,2];classA{}A.ɵcmp=/*@__PURE__*/i0.ɵɵdefineComponent(",
+        "i0.ɵɵpureFunction0(1,_c0)",
+        "classB{}B.ɵcmp=/*@__PURE__*/i0.ɵɵdefineComponent(",
+        "i0.ɵɵpureFunction0(1,_c0)",
+        "constf=function(i0){const_c0=()=>[1,2];classF{}F.ɵcmp=/*@__PURE__*/i0.ɵɵdefineComponent(",
+        "constg=(i0)=>{classG{}G.ɵcmp=/*@__PURE__*/(()=>{const_c0=()=>[1,2];",
+        "classE{m(i0){classM{}M.ɵcmp=/*@__PURE__*/(()=>{const_c0=()=>[1,2];",
+    ] {
+        let Some(at) = linked[last..].find(expected) else {
+            panic!("missing `{expected}` after byte {last} in\n{code}");
+        };
+        last += at + expected.len();
+    }
+}
+
+/// The host binding functions are named with the scope's pool, like the template
+/// functions: as Angular 22.2.3's linker shows, a second class `A` of the module gets
+/// `A_HostBindings1`.
+#[test]
+fn test_link_names_host_bindings_across_a_module() {
+    let code = r#"import * as i0 from "@angular/core";
+export function f1() { class A {} A.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "17.0.0", version: "22.2.2", type: A, isStandalone: true, selector: "cmp-a", ngImport: i0, template: '@if (x) {<p>one</p>}', isInline: true, host: { listeners: { click: "go()" } } }); return A; }
+export function f2() { class A {} A.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "17.0.0", version: "22.2.2", type: A, isStandalone: true, selector: "cmp-a2", ngImport: i0, template: '@if (x) {<p>two</p>}', isInline: true, host: { listeners: { click: "go()" } } }); return A; }
+export function f3() { class A {} A.ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "17.0.0", version: "22.2.2", type: A, isStandalone: true, selector: "[d]", ngImport: i0, host: { properties: { title: "t" } } }); return A; }
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "/x/main.js");
+    assert!(result.linked);
+    let code = &result.code;
+    let linked: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut last = 0;
+    for expected in [
+        "hostBindings:functionA_HostBindings(rf,ctx){",
+        "template:functionA_Template(rf,ctx){",
+        "hostBindings:functionA_HostBindings1(rf,ctx){",
+        "template:functionA_Template1(rf,ctx){",
+        "hostBindings:functionA_HostBindings2(rf,ctx){",
+    ] {
+        let Some(at) = linked[last..].find(expected) else {
+            panic!("missing `{expected}` after byte {last} in\n{code}");
+        };
+        last += at + expected.len();
+    }
+}
+
+/// A `@defer` dependency function that uses a class of the function declaring the
+/// component stays local with the declaration's other constants, as the base linker kept
+/// it: Angular 22.2.3's linker moves it after the imports, where the class is not defined.
+#[test]
+fn test_link_keeps_defer_deps_with_inner_bindings_local() {
+    let code = r#"import * as i0 from "@angular/core";
+export function make() {
+  class Child {}
+  class A {}
+  A.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "17.0.0", version: "22.2.2", type: A, isStandalone: true, selector: "cmp-a", ngImport: i0, template: '@defer { <child/> } @placeholder { <p>x</p> }', isInline: true, deferBlockDependencies: [() => [Child]] });
+  return A;
+}
+export class B {}
+B.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "17.0.0", version: "22.2.2", type: B, isStandalone: true, selector: "cmp-b", ngImport: i0, template: '@defer { <child/> }', isInline: true, deferBlockDependencies: [() => [import("./c").then(m => m.C)]] });
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "/x/main.js");
+    assert!(result.linked);
+    let code = &result.code;
+    let linked: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut last = 0;
+    for expected in [
+        r#"import*asi0from"@angular/core";constB_Defer_1_DepsFn=()=>[import("./c").then(m=>m.C)];"#,
+        "exportfunctionmake(){classChild{}classA{}A.ɵcmp=/*@__PURE__*/(()=>{constA_Defer_2_DepsFn=()=>[Child];",
+        "i0.ɵɵdefer(2,0,A_Defer_2_DepsFn,null,1);",
+        "exportclassB{}B.ɵcmp=/*@__PURE__*/i0.ɵɵdefineComponent(",
+        "i0.ɵɵdefer(1,0,B_Defer_1_DepsFn);",
+    ] {
+        let Some(at) = linked[last..].find(expected) else {
+            panic!("missing `{expected}` after byte {last} in\n{code}");
+        };
+        last += at + expected.len();
+    }
+}
+
+/// Angular's linker names Closure messages after the linked file's path, without external
+/// ids even for a custom id, as Angular 22.2.3's linker shows for `/x/lib/a.component.mjs`.
+#[test]
+fn test_link_i18n_closure_names_use_file_path() {
+    let code = r#"import * as i0 from "@angular/core";
+export class A {}
+A.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "22.2.2", type: A, selector: "a", ngImport: i0, template: '<p i18n>Hello</p><p i18n="@@custom">Bye</p>', isInline: true });
+"#;
+    let allocator = Allocator::default();
+    let result = link(&allocator, code, "/x/lib/a.component.mjs");
+    assert!(result.linked);
+    let linked: String = result.code.chars().filter(|c| !c.is_whitespace()).collect();
+    for expected in [
+        r#"constMSG__X_LIB_A_COMPONENT_MJS_0=goog.getMsg("Hello");"#,
+        "i18n_0=MSG__X_LIB_A_COMPONENT_MJS_0",
+        r#"constMSG__X_LIB_A_COMPONENT_MJS_1=goog.getMsg("Bye");"#,
+        "i18n_1=MSG__X_LIB_A_COMPONENT_MJS_1",
+    ] {
+        assert!(linked.contains(expected), "missing `{expected}` in\n{}", result.code);
+    }
+}
+
+/// `ɵɵngDeclareDirective` of ngtsc 22.2.3 for two signal and two decorator
+/// view queries, and one signal and two decorator content queries.
+const CHAINED_QUERIES_DIRECTIVE: &str = r#"import * as i0 from "@angular/core";
+export class D {}
+D.ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "17.2.0", version: "22.2.2", type: D, isStandalone: true, selector: "[d]", queries: [{ propertyName: "cs", predicate: ["a"], isSignal: true }, { propertyName: "b", predicate: ["b"] }, { propertyName: "c", predicate: ["c"] }], viewQueries: [{ propertyName: "s", first: true, predicate: ["s"], descendants: true, isSignal: true }, { propertyName: "r", first: true, predicate: ["r"], descendants: true, isSignal: true }, { propertyName: "q", first: true, predicate: ["q"], descendants: true }, { propertyName: "p", first: true, predicate: ["p"], descendants: true }], ngImport: i0 });
+"#;
+
+/// Consecutive query creation calls of one instruction are chained, as Angular
+/// 22.2.3's linker does, except for runtimes before v21.0.4, whose query
+/// instructions return nothing. Consecutive signal queries advance once.
+#[test]
+fn test_link_chains_query_creation() {
+    for version in [None, Some(AngularVersion::new(21, 0, 4))] {
+        let code = link_for_version(CHAINED_QUERIES_DIRECTIVE, version);
+        let linked: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        for expected in [
+            "{i0.ɵɵcontentQuerySignal(dirIndex,ctx.cs,_c0,4);i0.ɵɵcontentQuery(dirIndex,_c1,4)(dirIndex,_c2,4);}",
+            "{i0.ɵɵviewQuerySignal(ctx.s,_c3,5)(ctx.r,_c4,5);i0.ɵɵviewQuery(_c5,5)(_c6,5);}",
+            "{i0.ɵɵqueryAdvance();let_t;i0.ɵɵqueryRefresh(_t=i0.ɵɵloadQuery())&&(ctx.b=_t);",
+            "{i0.ɵɵqueryAdvance(2);let_t;i0.ɵɵqueryRefresh(_t=i0.ɵɵloadQuery())&&(ctx.q=_t.first);",
+        ] {
+            assert!(linked.contains(expected), "{version:?}: missing `{expected}` in\n{code}");
+        }
+    }
+
+    let code = link_for_version(CHAINED_QUERIES_DIRECTIVE, Some(AngularVersion::new(21, 0, 3)));
+    let linked: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(linked.contains("i0.ɵɵviewQuery(_c5,5);i0.ɵɵviewQuery(_c6,5);"), "{code}");
+    assert!(!linked.contains(",4)(") && !linked.contains(",5)("), "{code}");
+}
+
+/// `ɵɵngDeclareComponent` of ngtsc 21.2.25 for
+/// `@Component({ selector: 'span[bitBadge]', template: '<ng-content></ng-content>' })`.
+const BADGE_COMPONENT: &str = r#"import * as i0 from "@angular/core";
+export class BadgeComponent {}
+BadgeComponent.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "21.2.25", type: BadgeComponent, isStandalone: true, selector: "span[bitBadge]", ngImport: i0, template: '<ng-content></ng-content>', isInline: true });
+"#;
+
+/// Angular before v22.0.0-next.4 sets `attrs` to the first selector's
+/// attributes, pooled after the host bindings' constants and before the
+/// template's, as Angular 21.2.25's linker does.
+#[test]
+fn test_link_selector_attrs_before_v22() {
+    let code = link_for_version(BADGE_COMPONENT, Some(AngularVersion::new(21, 2, 25)));
+    let linked: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(linked.contains(r#"const_c0=["bitBadge",""];const_c1=["*"];"#), "{code}");
+    assert!(linked.contains("attrs:_c0,ngContentSelectors:_c1,"), "{code}");
+
+    for version in [Some(AngularVersion::new(22, 0, 0)), None] {
+        let code = link_for_version(BADGE_COMPONENT, version);
+        assert!(!code.contains("attrs:"), "{version:?}:\n{code}");
+        assert!(code.contains(r#"const _c0 = ["*"];"#), "{version:?}:\n{code}");
+    }
+
+    // After the query predicates and the host bindings' constants.
+    let code = r#"import * as i0 from "@angular/core";
+export class C {}
+C.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "21.2.25", type: C, isStandalone: true, selector: "span[bitBadge]", host: { properties: { "attr.a": "[1, 2]" } }, viewQueries: [{ propertyName: "q", first: true, predicate: ["x"], descendants: true }], ngImport: i0, template: '<ng-content></ng-content>', isInline: true });
+"#;
+    let code = link_for_version(code, Some(AngularVersion::new(21, 2, 25)));
+    let linked: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        linked.contains(
+            r#"const_c0=["x"];const_c1=()=>[1,2];const_c2=["bitBadge",""];const_c3=["*"];"#
+        ),
+        "{code}"
+    );
+    assert!(linked.contains("attrs:_c2,ngContentSelectors:_c3,"), "{code}");
+
+    // Shared with an equal predicate.
+    let code = r#"import * as i0 from "@angular/core";
+export class D {}
+D.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "21.2.25", type: D, isStandalone: true, selector: "[x]", viewQueries: [{ propertyName: "q", first: true, predicate: ["x, "], descendants: true }], ngImport: i0, template: '', isInline: true });
+"#;
+    let code = link_for_version(code, Some(AngularVersion::new(21, 2, 25)));
+    let linked: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(linked.matches("const_c").count(), 1, "{code}");
+    assert!(linked.contains(r#"const_c0=["x",""];"#), "{code}");
+    assert!(linked.contains("ɵɵviewQuery(_c0,5)"), "{code}");
+    assert!(linked.contains("},attrs:_c0,decls:0,"), "{code}");
+}
+
+/// Angular's linker compiles with `i18nUseExternalIds: false`, so a Closure message is named
+/// `MSG_<suffix><n>`, never after its message id (`MSG_EXTERNAL_<id>$$...`).
+#[test]
+fn test_link_i18n_closure_names_do_not_use_message_ids() {
+    let code = link_for_version(
+        r#"
+import * as i0 from "@angular/core";
+class Greet {
+}
+Greet.ɵcmp = i0.ɵɵngDeclareComponent({ minVersion: "14.0.0", version: "21.0.0", type: Greet, isStandalone: true, selector: "x-greet", ngImport: i0, template: '<p i18n>Hello</p>' });
+"#,
+        None,
+    );
+    assert!(!code.contains("MSG_EXTERNAL_"), "{code}");
+    assert!(code.contains("const MSG_"), "{code}");
 }

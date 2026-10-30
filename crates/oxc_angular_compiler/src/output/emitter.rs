@@ -843,9 +843,16 @@ impl JsEmitter {
                 if e.pure {
                     ctx.print("/*@__PURE__*/ ");
                 }
-                // Wrap arrow functions in parens for IIFE
-                let should_parenthesize =
-                    matches!(e.fn_expr.as_ref(), OutputExpression::ArrowFunction(_));
+                // Wrap arrow functions in parens for IIFE. A `RawSource` callee
+                // is user code ngtsc emits verbatim (WrappedNodeExpr); TS's
+                // printer parenthesizes it unless it is a left-hand-side
+                // expression, so `() => {...}` becomes `(() => {...})()`
+                // while `makeIt` and `function () {...}` stay bare.
+                let should_parenthesize = match e.fn_expr.as_ref() {
+                    OutputExpression::ArrowFunction(_) => true,
+                    OutputExpression::RawSource(raw) => !is_left_hand_side_source(&raw.source),
+                    _ => false,
+                };
                 if should_parenthesize {
                     ctx.print("(");
                 }
@@ -865,7 +872,16 @@ impl JsEmitter {
             }
             OutputExpression::Instantiate(e) => {
                 ctx.print_with_span("new ", source_span);
+                // A user `useClass` like `makeClass()` must not take the
+                // constructor arguments: ngtsc emits `new (makeClass())(dep)`.
+                let should_parenthesize = new_callee_needs_parens(&e.class_expr);
+                if should_parenthesize {
+                    ctx.print("(");
+                }
                 self.visit_expression(&e.class_expr, ctx);
+                if should_parenthesize {
+                    ctx.print(")");
+                }
                 ctx.print("(");
                 self.visit_all_expressions(&e.args, ctx, ",");
                 ctx.print(")");
@@ -897,17 +913,12 @@ impl JsEmitter {
             OutputExpression::LocalizedString(e) => {
                 self.visit_localized_string(e, ctx);
             }
-            OutputExpression::WrappedNode(_) => {
-                // Wrapped nodes should not appear in JavaScript output.
-                // This matches Angular's abstract_js_emitter.ts which throws:
-                // `throw new Error("Cannot emit a WrappedNodeExpr in Javascript.");`
-                // WrappedNodeExpr is used internally during compilation but should
-                // be resolved before emission - if we hit this, it's a compiler bug.
-                ctx.diagnostics.push(OxcDiagnostic::error(
-                    "Cannot emit a WrappedNodeExpr in JavaScript. WrappedNodeExpr should be resolved before emission."
-                ));
-                // Emit undefined as fallback
-                ctx.print("undefined");
+            OutputExpression::WrappedNode(e) => {
+                // A wrapped node of the class's file is emitted as written, as
+                // ngtsc's `ExpressionTranslatorVisitor.visitWrappedNodeExpr`
+                // does. Its span is in that file, not in the template the
+                // source map points to, so it isn't mapped.
+                ctx.print(&e.node_id);
             }
             OutputExpression::WrappedIrNode(_) => {
                 // Wrapped IR expressions should not appear in JavaScript output.
@@ -1185,6 +1196,73 @@ fn emits_leading_brace(expr: &OutputExpression<'_>) -> bool {
         OutputExpression::ReadKey(e) => emits_leading_brace(&e.receiver),
         OutputExpression::InvokeFunction(e) => emits_leading_brace(&e.fn_expr),
         OutputExpression::TaggedTemplateLiteral(e) => emits_leading_brace(&e.tag),
+        _ => false,
+    }
+}
+
+/// Whether raw JavaScript source parses as a left-hand-side expression, one
+/// that can be called without parentheses. Ported from TypeScript's
+/// `parenthesizeLeftSideOfAccess` (via `isLeftHandSideExpression`), which
+/// `ts.factory.createCallExpression` applies to the callee when ngtsc
+/// translates `meta.useFactory.callFn([])` over a WrappedNodeExpr. A `new`
+/// without an argument list is not one: `new X()` would call the class.
+/// Source that does not parse is treated as needing parentheses, which is
+/// always valid.
+pub(crate) fn is_left_hand_side_source(source: &str) -> bool {
+    use oxc_ast::ast::Expression;
+    use oxc_span::GetSpan;
+
+    let allocator = oxc_allocator::Allocator::default();
+    let Ok(expr) =
+        oxc_parser::Parser::new(&allocator, source, oxc_span::SourceType::mjs()).parse_expression()
+    else {
+        return false;
+    };
+    match &expr {
+        // `new X(a)` has an argument list after its callee; `new X` does not.
+        Expression::NewExpression(new_expr) => {
+            source[new_expr.callee.span().end as usize..].contains('(')
+        }
+        Expression::Identifier(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::TemplateLiteral(_)
+        | Expression::ArrayExpression(_)
+        | Expression::ObjectExpression(_)
+        | Expression::FunctionExpression(_)
+        | Expression::ClassExpression(_)
+        | Expression::ThisExpression(_)
+        | Expression::Super(_)
+        | Expression::ParenthesizedExpression(_)
+        | Expression::CallExpression(_)
+        | Expression::ChainExpression(_)
+        | Expression::TaggedTemplateExpression(_)
+        | Expression::ImportMeta(_)
+        | Expression::NewTarget(_)
+        | Expression::ImportExpression(_)
+        | Expression::ComputedMemberExpression(_)
+        | Expression::StaticMemberExpression(_)
+        | Expression::PrivateFieldExpression(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether the callee of a `new` needs parentheses. Ported from TypeScript's
+/// `parenthesizeExpressionOfNew`, which `ts.factory.createNewExpression`
+/// applies when ngtsc translates `new useClass(...deps)`: a call on the
+/// callee's left spine would take the arguments (`new f()(a)` constructs
+/// `f`), and an optional chain is not allowed there (`new a?.b()` is a
+/// SyntaxError).
+fn new_callee_needs_parens(expr: &OutputExpression<'_>) -> bool {
+    match expr {
+        OutputExpression::InvokeFunction(_) | OutputExpression::ArrowFunction(_) => true,
+        OutputExpression::ReadProp(e) => e.optional || new_callee_needs_parens(&e.receiver),
+        OutputExpression::ReadKey(e) => e.optional || new_callee_needs_parens(&e.receiver),
+        OutputExpression::RawSource(raw) => !is_left_hand_side_source(&raw.source),
         _ => false,
     }
 }
@@ -1548,6 +1626,51 @@ mod tests {
             &&alloc,
         ));
         assert_eq!(emitter.emit_expression(&expr), "myVar");
+    }
+
+    #[test]
+    fn test_emit_raw_source_callee_parens() {
+        // A raw user expression called with no args, as in `useFactory`.
+        // Arrows (and other non-left-hand-side expressions) need parens,
+        // like ngtsc's TS printer adds; names, member access, function
+        // expressions and already parenthesized source stay as written.
+        let emitter = JsEmitter::new();
+        let alloc = Allocator::default();
+        let call = |source: &str| {
+            let raw = OutputExpression::RawSource(Box::new_in(
+                crate::output::ast::RawSourceExpr {
+                    source: Ident::from(alloc.alloc_str(source)),
+                    source_span: None,
+                },
+                &&alloc,
+            ));
+            let expr = OutputExpression::InvokeFunction(Box::new_in(
+                crate::output::ast::InvokeFunctionExpr {
+                    fn_expr: Box::new_in(raw, &&alloc),
+                    args: oxc_allocator::Vec::new_in(&&alloc),
+                    pure: false,
+                    optional: false,
+                    source_span: None,
+                },
+                &&alloc,
+            ));
+            emitter.emit_expression(&expr)
+        };
+        assert_eq!(
+            call("() => { const q = 1; return q; }"),
+            "(() => { const q = 1; return q; })()"
+        );
+        assert_eq!(call("() => ({ v: 2 })"), "(() => ({ v: 2 }))()");
+        assert_eq!(call("async () => { return 4; }"), "(async () => { return 4; })()");
+        assert_eq!(call("x => x"), "(x => x)()");
+        assert_eq!(call("a ? b : c"), "(a ? b : c)()");
+        assert_eq!(call("new Foo"), "(new Foo)()");
+        assert_eq!(call("function () { return 3; }"), "function () { return 3; }()");
+        assert_eq!(call("(() => 5)"), "(() => 5)()");
+        assert_eq!(call("makeIt"), "makeIt()");
+        assert_eq!(call("Factories.make"), "Factories.make()");
+        assert_eq!(call("new Foo(1)"), "new Foo(1)()");
+        assert_eq!(call("class { v = 1; }"), "class { v = 1; }()");
     }
 
     #[test]
