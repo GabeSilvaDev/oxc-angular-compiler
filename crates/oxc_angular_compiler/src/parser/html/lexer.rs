@@ -706,11 +706,8 @@ impl<'a> HtmlLexer<'a> {
 
     /// Tokenizes the input.
     pub fn tokenize(mut self) -> HtmlTokenizeResult {
-        // Angular's cursor reads NUL as `$EOF` (0), so the input ends at the first one.
-        if let Some(nul) = self.input[self.index as usize..self.length as usize].find('\0') {
-            self.length = self.index + nul as u32;
-        }
-        while self.index < self.length {
+        // Like Angular's loop, stop at a NUL: its cursor peeks one as `$EOF`.
+        while self.index < self.length && self.peek() != chars::EOF {
             self.scan_token();
         }
 
@@ -1512,6 +1509,11 @@ impl<'a> HtmlLexer<'a> {
                     continue;
                 }
 
+                // A NUL ends the parameter, but not inside a quote, as in Angular.
+                if ch == chars::EOF && in_quote.is_none() {
+                    break;
+                }
+
                 // If in a quote, check for quote end
                 if let Some(quote_char) = in_quote {
                     if ch == quote_char {
@@ -1607,7 +1609,8 @@ impl<'a> HtmlLexer<'a> {
         let mut in_quote: Option<char> = None;
         let mut in_comment = false;
 
-        while self.index < self.length {
+        // A NUL ends the interpolation, even inside a quote, as in Angular.
+        while self.index < self.length && self.peek() != chars::EOF {
             let ch = self.peek();
 
             // Check for tag start - break out of interpolation
@@ -1655,6 +1658,11 @@ impl<'a> HtmlLexer<'a> {
             if !in_comment && self.starts_with("//") {
                 in_comment = true;
                 self.advance();
+                self.advance();
+                // Like Angular, also take the character after `//` before checking again.
+                if self.peek() == '\\' {
+                    self.advance();
+                }
                 self.advance();
                 continue;
             }
@@ -1949,7 +1957,8 @@ impl<'a> HtmlLexer<'a> {
                 }
             }
 
-            if self.peek() == chars::EOF {
+            // Raw text reads through a NUL, as Angular's `_consumeRawText` does.
+            if self.index >= self.length {
                 // End of input - emit what we have (if non-empty)
                 if consume_entities {
                     if text_start < self.index {
@@ -2153,7 +2162,7 @@ impl<'a> HtmlLexer<'a> {
                 // Not our closing tag - continue scanning
             }
 
-            if self.peek() == chars::EOF {
+            if self.index >= self.length {
                 // EOF reached - emit whatever content we have
                 let content = &self.input[content_start as usize..self.index as usize];
                 let normalized = normalize_line_endings(content);
@@ -2499,7 +2508,7 @@ impl<'a> HtmlLexer<'a> {
             let starts_with_bracket = self.peek() == '[';
             let mut open_brackets: i32 = 0;
 
-            while self.peek() != chars::EOF {
+            while self.index < self.length {
                 let ch = self.peek();
 
                 // Track bracket depth (can go negative for mismatched brackets)
@@ -2515,9 +2524,10 @@ impl<'a> HtmlLexer<'a> {
                     // - When brackets are balanced or mismatched (open_brackets <= 0):
                     //   stop at name-end characters (whitespace, =, >, <, /, ', ", EOF)
                     // - When brackets are unbalanced with more opens (open_brackets > 0):
-                    //   only stop on newline (interrupts matching)
+                    //   only stop on newline (interrupts matching), so a NUL is read
                     if open_brackets <= 0 {
-                        if chars::is_whitespace(ch)
+                        if ch == chars::EOF
+                            || chars::is_whitespace(ch)
                             || ch == '='
                             || ch == '>'
                             || ch == '<'
@@ -2535,7 +2545,8 @@ impl<'a> HtmlLexer<'a> {
                     }
                 } else {
                     // Normal attribute name - stop at standard name-end characters
-                    if chars::is_whitespace(ch)
+                    if ch == chars::EOF
+                        || chars::is_whitespace(ch)
                         || ch == '='
                         || ch == '>'
                         || ch == '<'
@@ -2743,7 +2754,8 @@ impl<'a> HtmlLexer<'a> {
 
         let mut text_start = self.index;
 
-        while self.peek() != quote && self.peek() != chars::EOF {
+        // Only the quote ends the value: like Angular, read a NUL as text (an interpolation still stops there).
+        while self.peek() != quote && self.index < self.length {
             if self.starts_with(self.interpolation_start) {
                 // Emit any accumulated text first (or empty text token if at start of interpolation)
                 let text = &self.input[text_start as usize..self.index as usize];
@@ -3128,9 +3140,10 @@ impl<'a> HtmlLexer<'a> {
     }
 
     /// Reads characters until the given terminator (does not consume the terminator).
+    /// Like Angular's `_readUntil`, a NUL is read as text.
     fn read_until(&mut self, terminator: char) -> String {
         let start = self.index;
-        while self.peek() != terminator && self.peek() != chars::EOF {
+        while self.peek() != terminator && self.index < self.length {
             self.advance();
         }
         self.input[start as usize..self.index as usize].to_string()
@@ -3337,8 +3350,8 @@ impl<'a> HtmlLexer<'a> {
 
             // Numeric entity doesn't end with semicolon - this is an error
             // Advance cursor to include the peeked character in the error message
-            // (unless we're at EOF)
-            if self.peek() == chars::EOF {
+            // (unless we're at the end; a NUL is read like Angular's cursor does)
+            if self.index >= self.length {
                 // EOF - report "Unexpected character EOF"
                 self.errors.push(HtmlTokenError {
                     msg: "Unexpected character \"EOF\"".to_string(),

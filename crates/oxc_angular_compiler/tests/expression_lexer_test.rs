@@ -356,6 +356,17 @@ mod token {
     }
 
     #[test]
+    fn should_skip_control_characters_like_whitespace() {
+        // Angular's `scanToken` skips every character up to the space, NUL among them.
+        for input in ["a\0b", "a\x01b"] {
+            let tokens = lex(input);
+            assert_eq!(tokens.len(), 2);
+            expect_identifier_token(&tokens[0], 0, 1, "a");
+            expect_identifier_token(&tokens[1], 2, 3, "b");
+        }
+    }
+
+    #[test]
     fn should_tokenize_quoted_string() {
         let tokens = lex(r#"['\'', "\""]"#);
         expect_string_token(&tokens[1], 1, 5, "'", StringTokenKind::Plain);
@@ -630,6 +641,17 @@ mod template_literals {
         let tokens = lex(r"`\u00A0`");
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].str_value, "\u{00A0}");
+    }
+
+    #[test]
+    fn should_skip_a_nul_inside_an_interpolation() {
+        let tokens = lex("`${a\0}`");
+        assert_eq!(tokens.len(), 5);
+        expect_string_token(&tokens[0], 0, 1, "", StringTokenKind::TemplateLiteralPart);
+        expect_operator_token(&tokens[1], 1, 3, "${");
+        expect_identifier_token(&tokens[2], 3, 4, "a");
+        expect_character_token(&tokens[3], 5, 6, "}");
+        expect_string_token(&tokens[4], 6, 7, "", StringTokenKind::TemplateLiteralEnd);
     }
 
     #[test]
@@ -1177,13 +1199,13 @@ mod errors {
     use super::*;
 
     #[test]
-    fn should_skip_a_nul_character_like_whitespace() {
-        // Angular's `scanToken` skips every character up to the space.
-        let tokens = lex("a\0b");
-        assert_eq!(tokens.len(), 2);
-        expect_identifier_token(&tokens[0], 0, 1, "a");
-        expect_identifier_token(&tokens[1], 2, 3, "b");
-        assert!(lex("'a\0b'").iter().any(super::TokenInfo::is_error));
+    fn should_report_a_nul_in_a_string_as_unterminated() {
+        // As in Angular: the string ends at the NUL, `b` is read on its own, and the last quote opens another string.
+        let tokens = lex("'a\0b'");
+        assert_eq!(tokens.len(), 3);
+        assert!(tokens[0].is_error());
+        expect_identifier_token(&tokens[1], 3, 4, "b");
+        assert!(tokens[2].is_error());
     }
 
     #[test]

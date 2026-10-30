@@ -466,9 +466,15 @@ impl<'a> Lexer<'a> {
         self.index >= self.length
     }
 
+    /// Whitespace as Angular's `scanToken` skips it: every character up to the space (NUL and the
+    /// other control characters too), and NBSP.
+    fn is_skipped_whitespace(ch: char) -> bool {
+        ch <= chars::SPACE || ch == chars::NBSP
+    }
+
     /// Skips whitespace characters.
     fn skip_whitespace(&mut self) {
-        while !self.is_eof() && chars::is_whitespace(self.peek()) {
+        while !self.is_eof() && Self::is_skipped_whitespace(self.peek()) {
             self.advance();
         }
     }
@@ -477,8 +483,8 @@ impl<'a> Lexer<'a> {
     fn scan_token(&mut self, start: u32) {
         let ch = self.advance();
 
-        // Whitespace. Angular's `scanToken` skips every character up to the space, NUL among them.
-        if ch <= chars::SPACE || chars::is_whitespace(ch) {
+        // Whitespace
+        if Self::is_skipped_whitespace(ch) {
             return;
         }
 
