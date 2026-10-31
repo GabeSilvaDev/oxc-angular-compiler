@@ -3138,3 +3138,54 @@ mod visitor_tests {
         assert!(result.iter().filter(|n| n.node_type() == Some("Attribute")).count() == 2);
     }
 }
+
+// ============================================================================
+// Void and self-closing elements in a foreign namespace
+// ============================================================================
+//
+// Angular names an element without a prefix in its parent's namespace (`_getElementFullName`), so
+// `<area>` inside `<svg>` is `:svg:area`, which is no void element. `foreignObject` stops the
+// inheritance. Each case matches ngc 22.2.
+
+mod foreign_void_elements {
+    use super::*;
+
+    #[test]
+    fn takes_an_end_tag_for_an_html_void_name_in_a_foreign_namespace() {
+        for html in [
+            "<svg><area></area></svg>",
+            "<svg><br></br></svg>",
+            "<svg><g><area></area></g></svg>",
+            "<math><br></br></math>",
+            "<svg>@if (x) {<area></area>}</svg>",
+            "<svg:area></svg:area>",
+            "<svg:g><area></area></svg:g>",
+        ] {
+            assert_eq!(parse_errors(html), Vec::<String>::new(), "{html}");
+        }
+    }
+
+    #[test]
+    fn keeps_the_children_of_an_html_void_name_in_a_foreign_namespace() {
+        let (nodes, errors) = parse_with_errors("<svg><area>t</area></svg>");
+        assert_eq!(errors, Vec::<String>::new());
+        assert!(nodes.contains(&element("area", 1)), "{nodes:?}");
+        assert!(nodes.contains(&text("t", 2)), "{nodes:?}");
+    }
+
+    #[test]
+    fn reads_html_void_elements_again_inside_foreign_object() {
+        assert_eq!(
+            parse_errors("<svg><foreignObject><area></area></foreignObject></svg>"),
+            vec!["Void elements do not have end tags \"area\"".to_string()]
+        );
+    }
+
+    #[test]
+    fn still_reports_an_end_tag_for_an_html_void_element() {
+        assert_eq!(
+            parse_errors("<area></area>"),
+            vec!["Void elements do not have end tags \"area\"".to_string()]
+        );
+    }
+}
