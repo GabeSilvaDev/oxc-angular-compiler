@@ -32,7 +32,9 @@ use super::decorator::{
 use super::definition::{const_value_to_expression, generate_component_definitions};
 use super::hoist::{collect_hoist_edits, program_has_angular_decorated_class};
 use super::import_elision::{ImportElisionAnalyzer, import_elision_edits};
-use super::metadata::{AngularVersion, ComponentMetadata, HostMetadata, ImportRef};
+use super::metadata::{
+    AngularVersion, ComponentMetadata, HostMetadata, ImportRef, TemplateDependency,
+};
 use super::namespace_registry::NamespaceRegistry;
 use super::signal_debug_name;
 use crate::ast::expression::{BindingType, ParsedEventType};
@@ -953,6 +955,7 @@ fn build_set_class_metadata_decls<'a>(
         crate::CompilationMode::Partial => crate::partial::compile_declare_class_metadata(
             allocator,
             core_namespace,
+            allocator.alloc_str(&crate::partial::declaration_version(options.angular_version)),
             &class_metadata,
         ),
     };
@@ -3307,6 +3310,10 @@ pub fn transform_angular_file(
     // Collect class positions from original AST for edit-based output.
     // (class span, class_body_end)
     let mut class_positions: Vec<(Span, u32)> = Vec::new();
+    // Statements that run once the whole file has, when every class it
+    // declares exists.
+    #[cfg_attr(not(feature = "cross_file_elision"), allow(unused_mut))]
+    let mut decls_at_end = String::new();
     // The compiled classes of a `namespace` body: ngtsc adds no statement
     // after them there.
     let mut namespace_compiled: rustc_hash::FxHashSet<Span> = rustc_hash::FxHashSet::default();
@@ -3566,6 +3573,31 @@ pub fn transform_angular_file(
                 Some(ImportedClass { class_use, is_imported, declaration })
             }
         });
+    // The directives and pipes an NgModule in a component's `imports`
+    // exports, for its partial declaration's `dependencies` (#655).
+    #[cfg(feature = "cross_file_elision")]
+    let ng_module_exports = cross_file_analyzer
+        .as_ref()
+        .filter(|_| {
+            options.resolve_imported_values
+                && matches!(options.compilation_mode, crate::CompilationMode::Partial)
+        })
+        .map(|analyzer| {
+            move |component: &str, imports: &[ImportRef<'_>]| {
+                let imports: std::vec::Vec<_> = imports
+                    .iter()
+                    .map(|import| {
+                        (import.namespace.as_ref().map(Ident::as_str), import.name.as_str())
+                    })
+                    .collect();
+                analyzer.standalone_import_scopes(
+                    std::path::Path::new(path),
+                    source,
+                    component,
+                    &imports,
+                )
+            }
+        });
     // Without cross-file analysis, only the classes declared in this file
     // have a selector to read: they need no other file, and are never
     // lazy-loaded.
@@ -3714,6 +3746,7 @@ pub fn transform_angular_file(
                         file_namespace_registry.angular_core_ns().as_str(),
                         &injectable_metadata,
                         options.compilation_mode,
+                        options.angular_version,
                     ) {
                         jit_emitted_i0_statics = true;
                         let emitter = JsEmitter::new();
@@ -3919,6 +3952,11 @@ pub fn transform_angular_file(
                     let (import_selector, can_defer) =
                         (&local_selector as ImportSelector<'_>, &can_defer as CanDefer<'_>);
                     let (import_selector, can_defer) = (Some(import_selector), Some(can_defer));
+                    #[cfg(feature = "cross_file_elision")]
+                    let ng_module_exports =
+                        ng_module_exports.as_ref().map(|f| f as NgModuleExports<'_>);
+                    #[cfg(not(feature = "cross_file_elision"))]
+                    let ng_module_exports: Option<NgModuleExports<'_>> = None;
 
                     // A `namespace` member has nowhere to put its HMR code.
                     let options = match &hmr_options {
@@ -3950,6 +3988,7 @@ pub fn transform_angular_file(
                         resolved_resources,
                         import_selector,
                         can_defer,
+                        ng_module_exports,
                         false,
                     ) {
                         Ok(mut compilation_result) => {
@@ -4059,6 +4098,7 @@ pub fn transform_angular_file(
                                     file_namespace_registry.angular_core_ns().as_str(),
                                     injectable_metadata,
                                     options.compilation_mode,
+                                    options.angular_version,
                                 ) {
                                     let emitter = JsEmitter::new();
                                     property_assignments.push_str(&format!(
@@ -4191,6 +4231,11 @@ pub fn transform_angular_file(
                                             crate::partial::compile_component_declare_class_metadata(
                                                 &allocator,
                                                 core_namespace,
+                                                allocator.alloc_str(
+                                                    &crate::partial::declaration_version(
+                                                        options.angular_version,
+                                                    ),
+                                                ),
                                                 &class_metadata,
                                                 deferred_deps.as_slice(),
                                             )
@@ -4409,6 +4454,7 @@ pub fn transform_angular_file(
                             file_namespace_registry.angular_core_ns().as_str(),
                             injectable_metadata,
                             options.compilation_mode,
+                            options.angular_version,
                         ) {
                             property_assignments.push_str(&format!(
                                 "\nstatic ɵprov = {};",
@@ -4508,6 +4554,7 @@ pub fn transform_angular_file(
                         file_namespace_registry.angular_core_ns().as_str(),
                         &pipe_metadata,
                         options.compilation_mode,
+                        options.angular_version,
                     ) {
                         // Use JsEmitter to emit both expressions
                         let emitter = JsEmitter::new();
@@ -4540,6 +4587,7 @@ pub fn transform_angular_file(
                                 file_namespace_registry.angular_core_ns().as_str(),
                                 injectable_metadata,
                                 options.compilation_mode,
+                                options.angular_version,
                             ) {
                                 property_assignments.push_str(&format!(
                                     "\nstatic ɵprov = {};",
@@ -4623,6 +4671,7 @@ pub fn transform_angular_file(
                         file_namespace_registry.angular_core_ns().as_str(),
                         &ng_module_metadata,
                         options.compilation_mode,
+                        options.angular_version,
                     ) {
                         let emitter = JsEmitter::new();
                         let class_name = ng_module_metadata.class_name.to_string();
@@ -4657,6 +4706,7 @@ pub fn transform_angular_file(
                                 file_namespace_registry.angular_core_ns().as_str(),
                                 injectable_metadata,
                                 options.compilation_mode,
+                                options.angular_version,
                             ) {
                                 property_assignments.push_str(&format!(
                                     "\nstatic ɵprov = {};",
@@ -4706,6 +4756,32 @@ pub fn transform_angular_file(
                                 external_decls.insert(0, '\n');
                             }
                             external_decls.insert_str(0, &metadata);
+                        }
+
+                        // A partial declaration of a component this module
+                        // declares has no `dependencies`, which ngtsc fills
+                        // with the module's scope from the whole program
+                        // (#655). This file names the components, so it sets
+                        // their scope at runtime, when cross-file analysis
+                        // reads all of it.
+                        #[cfg(feature = "cross_file_elision")]
+                        if matches!(options.compilation_mode, crate::CompilationMode::Partial)
+                            && options.resolve_imported_values
+                            && let Some(analyzer) = &cross_file_analyzer
+                            && let Some(scopes) = analyzer.ng_module_component_scopes(
+                                std::path::Path::new(path),
+                                source,
+                                &class_name,
+                            )
+                        {
+                            for scope in &scopes {
+                                decls_at_end.push('\n');
+                                decls_at_end.push_str(&set_component_scope_statement(
+                                    allocator,
+                                    scope,
+                                    &mut file_namespace_registry,
+                                ));
+                            }
                         }
 
                         // NgModule: external_decls go AFTER the class (they reference the class name)
@@ -4773,6 +4849,7 @@ pub fn transform_angular_file(
                             &service_metadata,
                             type_argument_count,
                             options.compilation_mode,
+                            options.angular_version,
                         );
 
                         let emitter = JsEmitter::new();
@@ -4852,6 +4929,7 @@ pub fn transform_angular_file(
                         file_namespace_registry.angular_core_ns().as_str(),
                         &injectable_metadata,
                         options.compilation_mode,
+                        options.angular_version,
                     ) {
                         let emitter = JsEmitter::new();
                         let class_name = injectable_metadata.class_name.to_string();
@@ -5091,6 +5169,9 @@ pub fn transform_angular_file(
             }
         }
     }
+    if !decls_at_end.is_empty() {
+        edits.push(Edit::insert(parser_ret.program.span.end, decls_at_end));
+    }
     if !decls_after_imports.is_empty() {
         // ngtsc moves the imports above the rest of the file. Imports load
         // before the module body runs anyway, so a statement ahead of the
@@ -5292,6 +5373,85 @@ struct HmrUpdateParts {
     ng_content_selectors_js: Option<String>,
     /// The ɵcmp's `styles`.
     styles: Vec<String>,
+}
+
+/// The `dependencies` entries of the directives and pipes of `entries`,
+/// with the modules they come from imported as namespaces. `None` when a
+/// pipe's name isn't known: the linker requires it.
+fn scope_dependencies<'a>(
+    allocator: &'a Allocator,
+    entries: &[super::metadata::ScopeEntry],
+    registry: &mut NamespaceRegistry<'a>,
+) -> Option<OxcVec<'a, TemplateDependency<'a>>> {
+    use super::metadata::{ImportedName, ScopeKind};
+    let mut dependencies = OxcVec::with_capacity_in(entries.len(), &allocator);
+    for entry in entries {
+        let ident = |s: &str| Ident::from(allocator.alloc_str(s));
+        let (namespace, name) = match &entry.name {
+            ImportedName::Local(name) => (None, ident(name)),
+            ImportedName::Module { specifier, name } => {
+                (Some(registry.get_or_assign(&ident(specifier))), ident(name))
+            }
+        };
+        let dependency = match &entry.kind {
+            // The linker only requires a selector to be a string.
+            ScopeKind::Directive { selector, is_component } => TemplateDependency::directive(
+                allocator,
+                name,
+                ident(selector.as_deref().unwrap_or("*")),
+                *is_component,
+            ),
+            ScopeKind::Pipe { name: pipe_name } => {
+                TemplateDependency::pipe(allocator, name, ident(pipe_name.as_deref()?))
+            }
+        };
+        let dependency = match namespace {
+            Some(namespace) => dependency.with_type_namespace(namespace),
+            None => dependency,
+        };
+        dependencies.push(if entry.is_forward_reference {
+            dependency.with_forward_reference()
+        } else {
+            dependency
+        });
+    }
+    Some(dependencies)
+}
+
+/// `i0.ɵɵsetComponentScope(Cmp, () => [directives], () => [pipes]);` for
+/// `scope`, with the modules its classes come from imported as namespaces.
+/// The lists are read when the component first renders: a module in an
+/// import cycle with this file may not have run yet.
+#[cfg(feature = "cross_file_elision")]
+fn set_component_scope_statement<'a>(
+    allocator: &'a Allocator,
+    scope: &super::metadata::ComponentScope,
+    registry: &mut NamespaceRegistry<'a>,
+) -> String {
+    use super::metadata::{ImportedName, ScopeKind};
+    let mut name_of = |name: &ImportedName| match name {
+        ImportedName::Local(name) => name.clone(),
+        ImportedName::Module { specifier, name } => {
+            let namespace = registry.get_or_assign(&Ident::from(allocator.alloc_str(specifier)));
+            format!("{namespace}.{name}")
+        }
+    };
+    let component = name_of(&scope.component);
+    let mut directives = Vec::new();
+    let mut pipes = Vec::new();
+    for entry in &scope.entries {
+        let list = match entry.kind {
+            ScopeKind::Directive { .. } => &mut directives,
+            ScopeKind::Pipe { .. } => &mut pipes,
+        };
+        list.push(name_of(&entry.name));
+    }
+    format!(
+        "{}.ɵɵsetComponentScope({component}, () => [{}], () => [{}]);",
+        registry.angular_core_ns(),
+        directives.join(", "),
+        pipes.join(", ")
+    )
 }
 
 /// The analyzer behind both cross-file features (`cross_file_elision`'s
@@ -5611,6 +5771,7 @@ pub fn compile_component_hmr_update(
         Some(resources),
         None,
         None,
+        None,
         true,
     ) {
         Ok(compiled) => compiled,
@@ -5674,6 +5835,8 @@ fn compile_component_partial<'a>(
     view_queries: &[R3QueryMetadata<'a>],
     content_queries: &[R3QueryMetadata<'a>],
     defer_block_dependencies: &[Option<OutputExpression<'a>>],
+    import_scopes: &[(Ident<'a>, OxcVec<'a, TemplateDependency<'a>>)],
+    angular_version: Option<AngularVersion>,
     pool_starting_index: u32,
     namespace_registry: &mut NamespaceRegistry<'a>,
 ) -> FullCompilationResult<'a> {
@@ -5683,16 +5846,20 @@ fn compile_component_partial<'a>(
         content_queries,
         view_queries,
         defer_block_dependencies,
+        import_scopes,
     };
+    let version = allocator.alloc_str(&crate::partial::declaration_version(angular_version));
     let cmp_expr = crate::partial::compile_declare_component_from_metadata(
         allocator,
         core_namespace,
+        version,
         metadata,
         &inputs,
     );
     let fac_expr = crate::partial::component::compile_declare_factory_for_component(
         allocator,
         core_namespace,
+        version,
         metadata,
         namespace_registry,
     );
@@ -5814,6 +5981,14 @@ fn html_parse_error_diagnostic(
 /// The standalone component or directive a class an `imports` entry names
 /// refers to (see [`ImportedClass`]).
 type ImportSelector<'f> = &'f dyn Fn(&ImportRef<'_>) -> Option<ImportedClass>;
+
+/// For each `imports` entry, the directives and pipes the NgModule it refers
+/// to adds, when cross-file analysis reads them.
+type NgModuleExports<'f> =
+    &'f dyn Fn(
+        &str,
+        &[ImportRef<'_>],
+    ) -> std::vec::Vec<Option<std::vec::Vec<super::metadata::ScopeEntry>>>;
 
 /// What `@defer` reads of the standalone component or directive an `imports`
 /// entry refers to.
@@ -6147,6 +6322,7 @@ fn compile_component_full<'a>(
     resolved_resources: Option<&ResolvedResources>,
     import_selector: Option<ImportSelector<'_>>,
     can_defer: Option<CanDefer<'_>>,
+    ng_module_exports: Option<NgModuleExports<'_>>,
     hmr_update: bool,
 ) -> Result<FullCompilationResult<'a>, Vec<OxcDiagnostic>> {
     use oxc_allocator::FromIn;
@@ -6268,6 +6444,17 @@ fn compile_component_full<'a>(
                 )
             })
             .collect();
+        let import_scopes: std::vec::Vec<_> = ng_module_exports
+            .map(|exports| exports(metadata.class_name.as_str(), &metadata.import_refs))
+            .unwrap_or_default()
+            .into_iter()
+            .zip(&metadata.import_refs)
+            .filter_map(|(entries, import)| {
+                let entries = entries?;
+                let dependencies = scope_dependencies(allocator, &entries, namespace_registry)?;
+                Some((import.key, dependencies))
+            })
+            .collect();
         let mut result = compile_component_partial(
             allocator,
             namespace_registry.angular_core_ns().as_str(),
@@ -6276,6 +6463,8 @@ fn compile_component_full<'a>(
             &view_queries,
             &content_queries,
             &defer_block_dependencies,
+            &import_scopes,
+            options.angular_version,
             pool_starting_index,
             namespace_registry,
         );

@@ -125,13 +125,41 @@ pub(crate) fn wrap_forward_ref<'a>(
     ))
 }
 
-/// The literal text used for the `version` field of every partial
-/// declaration. Upstream substitutes this at npm publish; we keep the same
-/// sentinel so the existing linker version-check logic recognizes it.
+/// The `version` field ngtsc's own development builds write.
 ///
-/// Matches upstream `packages/compiler/src/render3/partial/*.ts` — every
-/// emitter writes `"0.0.0-PLACEHOLDER"` directly.
+/// npm publishing replaces it with the release version, and a published
+/// linker reads it as `0.0.0`, which turns off the template syntax and
+/// defaults added since (block syntax, standalone, `OnPush`), so oxc writes a
+/// real version instead (see [`declaration_version`]).
 pub const PLACEHOLDER_VERSION: &str = "0.0.0-PLACEHOLDER";
+
+/// The newest Angular release oxc's output follows: what a compilation
+/// without a known `angular_version` targets.
+pub const LATEST_VERSION: &str = "22.2.3";
+
+/// The `version` field of a partial declaration, which the linker reads its
+/// defaults by: the Angular version compiled for, as ngtsc writes its own
+/// version, else [`LATEST_VERSION`].
+pub fn declaration_version(angular_version: Option<crate::AngularVersion>) -> String {
+    match angular_version {
+        // `AngularVersion::parse` reads the placeholder as the newest version.
+        Some(version) if version.major != u32::MAX => {
+            format!("{}.{}.{}", version.major, version.minor, version.patch)
+        }
+        _ => LATEST_VERSION.to_string(),
+    }
+}
+
+/// Whether the linker reads a declaration of `version` without
+/// `isStandalone` as standalone: from v19 on, as Angular's linker's
+/// `getDefaultStandaloneValue` does.
+pub(crate) fn standalone_is_default(version: &str) -> bool {
+    version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= 19)
+}
 
 /// Minimum linker version that understands a `ɵɵngDeclareFactory` shape.
 ///

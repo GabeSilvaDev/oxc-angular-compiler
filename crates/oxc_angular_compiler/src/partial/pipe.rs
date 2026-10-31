@@ -22,8 +22,8 @@
 use oxc_allocator::{Allocator, Box, Vec};
 use oxc_str::Ident;
 
+use super::MIN_VERSION_PIPE;
 use super::factory::compile_declare_factory_function;
-use super::{MIN_VERSION_PIPE, PLACEHOLDER_VERSION};
 use crate::factory::{
     FactoryTarget, R3ConstructorFactoryMetadata, R3DependencyMetadata, R3FactoryDeps,
     R3FactoryMetadata,
@@ -41,12 +41,13 @@ use crate::r3::Identifiers;
 pub fn compile_declare_pipe_from_metadata<'a>(
     allocator: &'a Allocator,
     core_namespace: &'a str,
+    version: &'a str,
     meta: &R3PipeMetadata<'a>,
 ) -> OutputExpression<'a> {
     let mut entries: Vec<'a, LiteralMapEntry<'a>> = Vec::new_in(&allocator);
 
     entries.push(string_entry(allocator, "minVersion", MIN_VERSION_PIPE));
-    entries.push(string_entry(allocator, "version", PLACEHOLDER_VERSION));
+    entries.push(string_entry(allocator, "version", version));
     entries.push(LiteralMapEntry::new(
         Ident::from("ngImport"),
         read_var(allocator, core_namespace),
@@ -58,10 +59,11 @@ pub fn compile_declare_pipe_from_metadata<'a>(
     // plain bool, so emit only when false — the linker defaults to true,
     // matching the v19+ runtime. (Skipping `isStandalone: true` produces a
     // smaller payload that the linker handles identically.)
-    if !meta.is_standalone {
+    // An older linker defaults to `false`, so it's told `true`.
+    if !meta.is_standalone || !super::standalone_is_default(version) {
         entries.push(LiteralMapEntry::new(
             Ident::from("isStandalone"),
-            bool_literal(allocator, false),
+            bool_literal(allocator, meta.is_standalone),
             false,
         ));
     }
@@ -118,6 +120,7 @@ pub fn compile_declare_pipe_from_metadata<'a>(
 pub fn compile_declare_factory_for_pipe<'a>(
     allocator: &'a Allocator,
     core_namespace: &'a str,
+    version: &'a str,
     meta: &R3PipeMetadata<'a>,
 ) -> OutputExpression<'a> {
     let factory_meta = R3FactoryMetadata::Constructor(R3ConstructorFactoryMetadata {
@@ -129,7 +132,7 @@ pub fn compile_declare_factory_for_pipe<'a>(
         target: FactoryTarget::Pipe,
     });
 
-    compile_declare_factory_function(allocator, core_namespace, &factory_meta)
+    compile_declare_factory_function(allocator, core_namespace, version, &factory_meta)
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -189,7 +192,7 @@ fn namespaced_prop<'a>(
     ))
 }
 
-fn string_literal<'a>(allocator: &'a Allocator, value: &'static str) -> OutputExpression<'a> {
+fn string_literal<'a>(allocator: &'a Allocator, value: &'a str) -> OutputExpression<'a> {
     OutputExpression::Literal(Box::new_in(
         LiteralExpr { value: LiteralValue::String(Ident::from(value)), source_span: None },
         &allocator,
@@ -199,7 +202,7 @@ fn string_literal<'a>(allocator: &'a Allocator, value: &'static str) -> OutputEx
 fn string_entry<'a>(
     allocator: &'a Allocator,
     key: &'static str,
-    value: &'static str,
+    value: &'a str,
 ) -> LiteralMapEntry<'a> {
     LiteralMapEntry::new(Ident::from(key), string_literal(allocator, value), false)
 }

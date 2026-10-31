@@ -40,7 +40,7 @@ use oxc_allocator::{Allocator, Box, Vec};
 use oxc_str::Ident;
 
 use super::factory::compile_declare_factory_function;
-use super::{PLACEHOLDER_VERSION, wrap_forward_ref};
+use super::wrap_forward_ref;
 use crate::directive::{
     QueryPredicate, R3DirectiveMetadata, R3HostDirectiveMetadata, R3HostMetadata, R3InputMetadata,
     R3QueryMetadata,
@@ -59,9 +59,10 @@ use crate::r3::Identifiers;
 pub fn compile_declare_directive_from_metadata<'a>(
     allocator: &'a Allocator,
     core_namespace: &'a str,
+    version: &'a str,
     meta: &R3DirectiveMetadata<'a>,
 ) -> OutputExpression<'a> {
-    let entries = create_directive_definition_map(allocator, core_namespace, meta);
+    let entries = create_directive_definition_map(allocator, core_namespace, version, meta);
     invoke_declare(allocator, core_namespace, Identifiers::DECLARE_DIRECTIVE, entries)
 }
 
@@ -74,21 +75,23 @@ pub fn compile_declare_directive_from_metadata<'a>(
 pub(crate) fn create_directive_definition_map<'a>(
     allocator: &'a Allocator,
     core_namespace: &'a str,
+    version: &'a str,
     meta: &R3DirectiveMetadata<'a>,
 ) -> Vec<'a, LiteralMapEntry<'a>> {
     let mut entries: Vec<'a, LiteralMapEntry<'a>> = Vec::new_in(&allocator);
 
     let min_version = compute_min_version(meta);
     entries.push(string_entry(allocator, "minVersion", min_version));
-    entries.push(string_entry(allocator, "version", PLACEHOLDER_VERSION));
+    entries.push(string_entry(allocator, "version", version));
     entries.push(LiteralMapEntry::new(Ident::from("type"), meta.r#type.clone_in(allocator), false));
 
     // isStandalone: emit only when not standalone — matches Pipe/Component
     // convention. Linker defaults to true (v19+ runtime default).
-    if !meta.is_standalone {
+    // An older linker defaults to `false`, so it's told `true`.
+    if !meta.is_standalone || !super::standalone_is_default(version) {
         entries.push(LiteralMapEntry::new(
             Ident::from("isStandalone"),
-            bool_lit(allocator, false),
+            bool_lit(allocator, meta.is_standalone),
             false,
         ));
     }
@@ -206,6 +209,7 @@ pub(crate) fn create_directive_definition_map<'a>(
 pub fn compile_declare_factory_for_directive<'a>(
     allocator: &'a Allocator,
     core_namespace: &'a str,
+    version: &'a str,
     meta: &R3DirectiveMetadata<'a>,
 ) -> OutputExpression<'a> {
     let factory_meta = R3FactoryMetadata::Constructor(R3ConstructorFactoryMetadata {
@@ -216,7 +220,7 @@ pub fn compile_declare_factory_for_directive<'a>(
         deps: clone_factory_deps(allocator, &meta.deps, meta.uses_inheritance),
         target: FactoryTarget::Directive,
     });
-    compile_declare_factory_function(allocator, core_namespace, &factory_meta)
+    compile_declare_factory_function(allocator, core_namespace, version, &factory_meta)
 }
 
 /// Public min-version calculator. Exposed so the component emitter (next
@@ -697,7 +701,7 @@ fn string_literal_owned<'a>(allocator: &'a Allocator, value: Ident<'a>) -> Outpu
 fn string_entry<'a>(
     allocator: &'a Allocator,
     key: &'static str,
-    value: &'static str,
+    value: &'a str,
 ) -> LiteralMapEntry<'a> {
     LiteralMapEntry::new(
         Ident::from(key),
