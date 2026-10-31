@@ -40,7 +40,7 @@ use super::signal_debug_name;
 use crate::ast::expression::{BindingType, ParsedEventType};
 use crate::ast::r3::{R3BoundAttribute, R3BoundEvent, SecurityContext};
 use crate::class_metadata::{
-    R3ClassMetadata, R3DeferPerComponentDependency, build_ctor_params_metadata_in,
+    LocalDecls, R3ClassMetadata, R3DeferPerComponentDependency, build_ctor_params_metadata_in,
     build_decorator_metadata_array, build_prop_decorators_metadata_in, compile_class_metadata,
     compile_component_class_metadata,
 };
@@ -754,18 +754,36 @@ fn resolve_factory_dep_namespaces<'a>(
                 Expression::CallExpression(call) if !call.arguments.is_empty()
             )
     };
+    // Collected once, for the first token that is not imported.
+    let mut local_decls = None;
     for (index, dep) in deps.iter_mut().enumerate() {
         let Some(token) = dep.token.as_mut() else { continue };
         let from_inject = params
             .and_then(|params| params.get(index))
             .is_some_and(|param| param.decorators.iter().any(is_inject_with_token));
         let is_member_chain = matches!(token, OutputExpression::ReadProp(_));
+        let path = member_chain_path(token);
         let root = member_chain_root(token);
         // Only process bare variable references (ReadVar)
         let OutputExpression::ReadVar(var) = root else { continue };
         let name = var.name;
         // Look up this identifier in the import map
-        let Some(import_info) = import_map.get(&name) else { continue };
+        let Some(import_info) = import_map.get(&name) else {
+            // An interface or type alias declared in the file is erased too, so
+            // ngtsc has no value for it either (`interface Foo` → `ɵɵinvalidFactory()`).
+            // See issue #653.
+            let decls = local_decls.get_or_insert_with(|| {
+                string_consts.program().map(|program| LocalDecls::collect(&program.body))
+            });
+            if !from_inject
+                && let (Some(decls), Some(path)) = (decls.as_ref(), path)
+                && decls.is_type_only(&path)
+            {
+                dep.token = None;
+                dep.type_only_invalid = true;
+            }
+            continue;
+        };
         if import_info.is_type_only {
             // Type-only imports (`import type { X }` / `import { type X }`) are erased
             // at runtime, so they cannot be used as DI tokens. Flag the dep so the
@@ -806,6 +824,19 @@ fn resolve_factory_dep_namespaces<'a>(
 }
 
 /// The leftmost expression of a property-read chain: `ns` in `ns.one.One`.
+/// The names of a member chain, from its root: `ns.one.One` → `[ns, one, One]`.
+fn member_chain_path<'a>(expr: &OutputExpression<'a>) -> Option<std::vec::Vec<Ident<'a>>> {
+    match expr {
+        OutputExpression::ReadVar(var) => Some(vec![var.name]),
+        OutputExpression::ReadProp(prop) => {
+            let mut path = member_chain_path(&prop.receiver)?;
+            path.push(prop.name);
+            Some(path)
+        }
+        _ => None,
+    }
+}
+
 fn member_chain_root<'b, 'a>(expr: &'b mut OutputExpression<'a>) -> &'b mut OutputExpression<'a> {
     match expr {
         OutputExpression::ReadProp(prop) => member_chain_root(&mut prop.receiver),

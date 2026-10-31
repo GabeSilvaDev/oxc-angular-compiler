@@ -1146,7 +1146,7 @@ pub fn type_param_names_of<'a>(class: &Class<'a>) -> FxHashSet<Ident<'a>> {
 /// `ns.Interface` lookups and for the merged `interface I` + `namespace I`
 /// case — the merged symbol's valueDeclaration is the namespace, so it emits.
 #[derive(Default)]
-struct LocalDecls<'a> {
+pub(crate) struct LocalDecls<'a> {
     type_decls: FxHashSet<&'a str>,
     /// Names with a runtime declaration — classes, enums, functions, vars,
     /// `import X =` aliases. An interface or alias merged with one of these
@@ -1160,7 +1160,7 @@ impl<'a> LocalDecls<'a> {
     /// Collect declarations from a statement list, unwrapping `export` and
     /// hoisting `declare global` bodies to file scope like ngtsc's program
     /// scope — wherever the `declare global` block is nested.
-    fn collect(stmts: &'a [Statement<'a>]) -> Self {
+    pub(crate) fn collect(stmts: &'a [Statement<'a>]) -> Self {
         let mut decls = LocalDecls::default();
         // `declare global` inners bind at file scope, so they are queued and
         // inserted into the root `decls` rather than whichever namespace-level
@@ -1374,7 +1374,7 @@ impl<'a> LocalDecls<'a> {
     /// declaration (interface or type alias) that no same-named namespace
     /// or value declaration merges with. Only that case is `UNAVAILABLE` in
     /// local compilation; everything else emits as written.
-    fn is_type_only(&self, path: &[Ident<'_>]) -> bool {
+    pub(crate) fn is_type_only(&self, path: &[Ident<'_>]) -> bool {
         match path.split_first() {
             None => false,
             // A merged `interface I` + `namespace I` or `interface I` +

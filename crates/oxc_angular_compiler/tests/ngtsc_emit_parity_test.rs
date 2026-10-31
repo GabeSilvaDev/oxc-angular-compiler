@@ -86,7 +86,93 @@ export class D { constructor(s: string) {} }",
 @Component({ selector: 'c', template: '' })
 export class C { constructor(s: string) {} }",
     ),
+    // A type declared in the file has no value to inject (#653).
+    (
+        "same-file interface",
+        "import { Injectable } from '@angular/core';
+interface Foo { a: number }
+@Injectable()
+export class S { constructor(f: Foo) {} }",
+    ),
+    (
+        "same-file type alias",
+        "import { Injectable } from '@angular/core';
+type Foo = { a: number };
+@Injectable()
+export class S { constructor(f: Foo) {} }",
+    ),
+    (
+        "exported interface",
+        "import { Injectable } from '@angular/core';
+export interface Foo { a: number }
+@Injectable()
+export class S { constructor(f: Foo) {} }",
+    ),
+    (
+        "interface in a namespace",
+        "import { Injectable } from '@angular/core';
+namespace ns { export interface Foo { a: number } }
+@Injectable()
+export class S { constructor(f: ns.Foo) {} }",
+    ),
+    (
+        "same-file interface on a directive",
+        "import { Directive } from '@angular/core';
+interface Foo { a: number }
+@Directive({ selector: '[d]' })
+export class D { constructor(f: Foo) {} }",
+    ),
+    (
+        "same-file interface on a pipe",
+        "import { Pipe } from '@angular/core';
+interface Foo { a: number }
+@Pipe({ name: 'p' })
+export class P { constructor(f: Foo) {} transform() {} }",
+    ),
+    (
+        "same-file interface on an NgModule",
+        "import { NgModule } from '@angular/core';
+interface Foo { a: number }
+@NgModule({})
+export class M { constructor(f: Foo) {} }",
+    ),
+    (
+        "same-file interface on a component",
+        "import { Component } from '@angular/core';
+interface Foo { a: number }
+@Component({ selector: 'c', template: '' })
+export class C { constructor(f: Foo) {} }",
+    ),
 ];
+
+/// A name that is a value as well as a type stays the token, as in ngtsc.
+const LOCAL_VALUE_TOKEN_CASES: &[(&str, &str)] = &[
+    (
+        "interface merged with a class",
+        "import { Injectable } from '@angular/core';
+interface Foo { a: number }
+class Foo {}
+@Injectable()
+export class S { constructor(f: Foo) {} }",
+    ),
+    (
+        "enum",
+        "import { Injectable } from '@angular/core';
+enum Foo { A }
+@Injectable()
+export class S { constructor(f: Foo) {} }",
+    ),
+];
+
+#[test]
+fn local_value_ctor_dep_stays_the_token() {
+    for (name, source) in LOCAL_VALUE_TOKEN_CASES {
+        let code = compile(source);
+        assert!(code.contains("new(__ngFactoryType__||S)(i0.ɵɵinject(Foo))"), "{name}:\n{code}");
+        let code = compile_partial(source);
+        assert!(code.contains("deps:[{token:Foo}]"), "{name}:\n{code}");
+    }
+}
 
 #[test]
 fn invalid_ctor_dep_makes_the_full_factory_invalid() {
